@@ -1,0 +1,597 @@
+import {
+  getLedger,
+  dailySpendStatus,
+  loadConfig,
+  saveConfig,
+  saveSecrets,
+  secretsPath,
+  isSlackWebhookUrl,
+} from "@oneshot-gtm/core";
+import {
+  TRIGGERS,
+  checkReadiness,
+  connectLinkedInWithCookie,
+  finishLinkedInLogin,
+  linkedinCookie,
+  linkedinSessionState,
+  startLinkedInLogin,
+} from "@oneshot-gtm/find";
+import { withXEngine, type XEngine } from "@oneshot-gtm/shared-types";
+import prompts from "prompts";
+import { complete, loadPrompt, tryParseJsonObject } from "@oneshot-gtm/intel";
+import { loadVoiceCorpus, voiceCorpusPrompt } from "./_voice-corpus.ts";
+import { c, header, note, ok } from "../output.ts";
+
+export async function configLlm(): Promise<void> {
+  header("Configure LLM provider");
+  const cfg = loadConfig();
+  const answers = await prompts(
+    [
+      {
+        type: "select",
+        name: "llmProvider",
+        message: "Provider",
+        choices: [
+          { title: "OpenRouter", value: "openrouter" },
+          { title: "OpenAI", value: "openai" },
+          { title: "Anthropic", value: "anthropic" },
+        ],
+        initial: cfg.llmProvider === "openai" ? 1 : cfg.llmProvider === "anthropic" ? 2 : 0,
+      },
+      {
+        type: "text",
+        name: "llmModel",
+        message: (_, values) => `Model name for ${values["llmProvider"]}`,
+        initial: cfg.llmModel,
+      },
+    ],
+    { onCancel: () => process.exit(0) },
+  );
+  saveConfig({
+    ...cfg,
+    llmProvider: answers["llmProvider"] ?? cfg.llmProvider,
+    llmModel: answers["llmModel"] ?? cfg.llmModel,
+  });
+  ok(
+    `provider=${c.cyan(answers["llmProvider"] ?? cfg.llmProvider)} model=${c.cyan(answers["llmModel"] ?? cfg.llmModel)}`,
+  );
+}
+
+export async function configFounder(): Promise<void> {
+  header("Configure founder profile");
+  const cfg = loadConfig();
+  const answers = await prompts(
+    [
+      { type: "text", name: "founderName", message: "Your name", initial: cfg.founderName ?? "" },
+      {
+        type: "text",
+        name: "founderEmail",
+        message: "Your email (lead capture on generated pages — not the reply address)",
+        initial: cfg.founderEmail ?? "",
+      },
+      {
+        type: "text",
+        name: "productOneLiner",
+        message: "Product one-liner",
+        initial: cfg.productOneLiner ?? "",
+      },
+      // Optional: press enter to skip. Mirrors the `init` wizard + /setup page.
+      {
+        type: "text",
+        name: "icpOneLiner",
+        message: "ICP one-liner — who you sell to (blank = no filtering)",
+        initial: cfg.icpOneLiner ?? "",
+      },
+      {
+        type: "text",
+        name: "productDomain",
+        message: "Signature domain — bare domain under your name in emails (blank = none)",
+        initial: cfg.productDomain ?? "",
+      },
+      {
+        type: "text",
+        name: "sendingDomain",
+        message: "Sending domain — the domain your wallet owns (blank = SDK default)",
+        initial: cfg.sendingDomain ?? "",
+      },
+      {
+        type: "text",
+        name: "founderCredentials",
+        message: "Founder background — prior roles/companies that build trust (optional)",
+        initial: cfg.founderCredentials ?? "",
+      },
+      {
+        type: "text",
+        name: "productPortfolio",
+        message: "Products you've shipped — comma-separated (optional)",
+        initial: cfg.productPortfolio ?? "",
+      },
+      {
+        type: "text",
+        name: "partners",
+        message: "Notable partners / customers — brand names that open doors (optional)",
+        initial: cfg.partners ?? "",
+      },
+      {
+        type: "text",
+        name: "founderCohort",
+        message:
+          "Your own accelerator batch, e.g. yc-w23 — ONLY if you actually did one; blank is the right answer for most founders (optional)",
+        initial: cfg.founderCohort ?? "",
+      },
+      {
+        type: "text",
+        name: "founderAdmission",
+        message:
+          "One true concession — what you'd rather not say but is true, e.g. 'two people, no enterprise logos yet' (optional)",
+        initial: cfg.founderAdmission ?? "",
+      },
+    ],
+    { onCancel: () => process.exit(0) },
+  );
+  saveConfig({
+    ...cfg,
+    founderName: (answers["founderName"] ?? cfg.founderName) || null,
+    founderEmail: (answers["founderEmail"] ?? cfg.founderEmail) || null,
+    productOneLiner: (answers["productOneLiner"] ?? cfg.productOneLiner) || null,
+    productDomain: (answers["productDomain"] ?? cfg.productDomain) || null,
+    sendingDomain: (answers["sendingDomain"] ?? cfg.sendingDomain) || null,
+    icpOneLiner: (answers["icpOneLiner"] ?? cfg.icpOneLiner) || null,
+    founderCredentials: (answers["founderCredentials"] ?? cfg.founderCredentials) || null,
+    productPortfolio: (answers["productPortfolio"] ?? cfg.productPortfolio) || null,
+    partners: (answers["partners"] ?? cfg.partners) || null,
+    founderCohort: (answers["founderCohort"] ?? cfg.founderCohort) || null,
+    founderAdmission: (answers["founderAdmission"] ?? cfg.founderAdmission) || null,
+  });
+  ok("Saved.");
+}
+
+export async function configTelemetry(state: "on" | "off"): Promise<void> {
+  const cfg = loadConfig();
+  saveConfig({ ...cfg, telemetryEnabled: state === "on" });
+  ok(`telemetry ${state === "on" ? c.green("enabled") : c.dim("disabled")}`);
+}
+
+/**
+ * Show or set the Slack incoming-webhook URL (reply/bounce/daily-summary
+ * notifications, see slack-notify.ts). Blank input clears it. The feature is
+ * off whenever this is unset, mirroring `config x-engine`'s show-then-set shape.
+ */
+export async function configSlackWebhook(url?: string): Promise<void> {
+  header("Slack notifications");
+  const cfg = loadConfig();
+  if (url === undefined) {
+    note(
+      cfg.slackWebhookUrl
+        ? `webhook: ${c.cyan(cfg.slackWebhookUrl)}`
+        : `webhook: ${c.dim("not set — reply/bounce/daily-summary notifications are off")}`,
+    );
+    note(c.dim("set with: oneshot-gtm config slack-webhook <url>"));
+    note(c.dim("clear with: oneshot-gtm config slack-webhook ''"));
+    return;
+  }
+  const trimmed = url.trim();
+  if (trimmed.length > 0 && !isSlackWebhookUrl(trimmed)) {
+    throw new Error(
+      "not a Slack incoming-webhook URL — expected https://hooks.slack.com/services/…",
+    );
+  }
+  saveConfig({ ...cfg, slackWebhookUrl: trimmed.length > 0 ? trimmed : null });
+  ok(
+    trimmed.length > 0
+      ? `webhook saved: ${c.cyan(trimmed)}`
+      : "webhook cleared — notifications off",
+  );
+}
+
+/**
+ * Show or set the install-wide daily USD spend ceiling (issue #481). No
+ * argument prints the current ceiling + today's spend; `off` clears it back
+ * to unlimited (the historical default); any other value must parse as a
+ * positive number.
+ */
+export async function configSpendCeiling(amountArg?: string): Promise<void> {
+  header("Daily spend ceiling");
+  const cfg = loadConfig();
+
+  if (amountArg === undefined) {
+    const status = dailySpendStatus();
+    if (cfg.dailySpendCeilingUsd == null) {
+      note("unlimited (no ceiling set)");
+    } else {
+      note(
+        `$${status.effectiveUsd.toFixed(2)} / $${cfg.dailySpendCeilingUsd.toFixed(2)} spent today${status.ceilingReached ? c.dim(" — ceiling reached, automated paths halted") : ""}`,
+      );
+    }
+    note(c.dim(`set with: oneshot-gtm config spend-ceiling <amount|off>`));
+    return;
+  }
+
+  if (amountArg === "off") {
+    saveConfig({ ...cfg, dailySpendCeilingUsd: null });
+    ok("daily spend ceiling cleared — unlimited");
+    return;
+  }
+
+  // Number(), not Number.parseFloat(): parseFloat parses a numeric PREFIX
+  // and ignores trailing garbage (e.g. "2usd" -> 2), silently persisting a
+  // ceiling the user didn't type. Number() requires the whole string to be
+  // numeric, so "2usd" -> NaN and falls into the rejection below.
+  const amount = Number(amountArg);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error(`invalid amount '${amountArg}' — pass a positive number of USD, or 'off'`);
+  }
+  saveConfig({ ...cfg, dailySpendCeilingUsd: amount });
+  ok(`daily spend ceiling set to $${amount.toFixed(2)}`);
+}
+
+const X_TRIGGER = "x-reposters";
+const set = (k: string) => (process.env[k] ? c.green("set") : c.red("missing"));
+
+/**
+ * Show or switch the x-reposters data provider. Mirrors the /setup card:
+ * switching drops the maxSpendPerRun/knobs overrides (via withXEngine) so the
+ * new engine's defaults re-apply, and never flips the trigger's enablement.
+ */
+export async function configXEngine(engineArg?: string): Promise<void> {
+  header("X data provider (x-reposters)");
+  const ledger = getLedger();
+  const spec = TRIGGERS.find((t) => t.name === X_TRIGGER);
+  if (!spec) throw new Error(`trigger '${X_TRIGGER}' is not registered`);
+  const stored = ledger.getTrigger(X_TRIGGER);
+  let config: Record<string, unknown> = { ...spec.defaultConfig };
+  if (stored?.config_json) {
+    try {
+      config = JSON.parse(stored.config_json) as Record<string, unknown>;
+    } catch {
+      note(c.dim("stored config is unparseable — treating as defaults"));
+    }
+  }
+  const current: XEngine = config["engine"] === "twitterapiio" ? "twitterapiio" : "xapi";
+
+  if (!engineArg) {
+    note(`engine: ${c.cyan(current)} · trigger ${stored?.enabled ? "enabled" : "disabled"}`);
+    note(
+      `  X API (first-party):  X_API_KEY ${set("X_API_KEY")} · X_API_SECRET ${set("X_API_SECRET")} · X_ACCESS_TOKEN ${set("X_ACCESS_TOKEN")} · X_ACCESS_SECRET ${set("X_ACCESS_SECRET")}`,
+    );
+    note(`  twitterapi.io:        TWITTERAPI_IO_KEY ${set("TWITTERAPI_IO_KEY")}`);
+    const ready = checkReadiness(spec, config);
+    note(ready.ready ? c.green("ready") : `not ready — ${ready.reason}`);
+    note(c.dim(`switch with: oneshot-gtm config x-engine <xapi|twitterapiio>`));
+    return;
+  }
+
+  if (engineArg !== "xapi" && engineArg !== "twitterapiio") {
+    throw new Error(`unknown engine '${engineArg}' — use xapi or twitterapiio`);
+  }
+  const next = engineArg as XEngine;
+  if (next === current) {
+    ok(`already on ${c.cyan(next)} — nothing to change`);
+    return;
+  }
+  const merged = withXEngine(config, next);
+  if (stored) {
+    ledger.setTriggerConfig(X_TRIGGER, JSON.stringify(merged));
+  } else {
+    // Never silently enable an opt-in paid finder from a config write.
+    ledger.upsertTrigger({ name: X_TRIGGER, configJson: JSON.stringify(merged), enabled: false });
+  }
+  ok(`engine: ${c.dim(current)} → ${c.cyan(next)}`);
+  note(c.dim("maxSpendPerRun/knobs overrides reset — the new engine's defaults apply"));
+  const ready = checkReadiness(spec, merged);
+  note(ready.ready ? c.green("ready") : `not ready — ${ready.reason}`);
+}
+
+/**
+ * `config linkedin-session`: connect the founder's LinkedIn session to a
+ * OneShot browser profile so person research can read live profiles. With
+ * `LINKEDIN_SESSION_COOKIE` set the cookie is imported into a fresh profile;
+ * otherwise the platform opens a hosted browser on the login page, the
+ * founder logs in there (2FA included) and confirms here, and the session
+ * is saved into the profile. Either way the session is then verified.
+ */
+export async function configLinkedInSession(opts: { login?: boolean } = {}): Promise<void> {
+  header("LinkedIn session (live profile reads)");
+  note(`state: ${c.cyan(linkedinSessionState())}`);
+  const ctx = { playName: "config", memo: "connect linkedin session" };
+  const report = (r: {
+    loggedIn: boolean;
+    name: string | null;
+    profileId: string;
+    costUsd: number;
+    reason?: string;
+  }) => {
+    if (r.loggedIn) {
+      ok(
+        `logged in as ${c.cyan(r.name ?? "(name not shown)")} · profile ${c.dim(r.profileId)} · $${r.costUsd.toFixed(3)}`,
+      );
+    } else {
+      note(
+        `not signed in — ${r.reason ?? "LinkedIn showed no signed-in member"}. Run this again to retry, or ${c.cyan("oneshot-gtm config linkedin-session --login")} to log in through a hosted browser instead. Profile ${c.dim(r.profileId)} · $${r.costUsd.toFixed(3)}`,
+      );
+    }
+  };
+  try {
+    if (linkedinCookie() && !opts.login) {
+      note(
+        c.dim(
+          "importing the stored li_at cookie into a fresh OneShot browser profile, then checking the feed… about a minute",
+        ),
+      );
+      report(await connectLinkedInWithCookie(ctx));
+      return;
+    }
+    note(c.dim("opening a hosted browser on the LinkedIn login page ($0.30 platform allowance)…"));
+    const started = await startLinkedInLogin(ctx);
+    note(
+      `Log in to LinkedIn (2FA included) in this private browser:\n  ${c.cyan(started.liveUrl ?? "")}`,
+    );
+    if (started.expiresAt) note(c.dim(`the login browser closes at ${started.expiresAt}`));
+    // The open login belongs to this profile; a rerun would start another
+    // billed one, so stay here until it is done or given up.
+    for (;;) {
+      const { next } = await prompts({
+        type: "select",
+        name: "next",
+        message: "Finished logging in?",
+        choices: [
+          { title: "Yes — save the session", value: "done" },
+          { title: "Not yet — ask me again", value: "wait" },
+          { title: "Give up this login", value: "abandon" },
+        ],
+        initial: 0,
+      });
+      if (next === "done") break;
+      if (next !== "wait") {
+        note(
+          "login abandoned — the hosted browser closes on its own; run this again to start a new one",
+        );
+        return;
+      }
+    }
+    note(c.dim("saving the session into the profile and checking the feed… about a minute"));
+    report(await finishLinkedInLogin(ctx));
+  } catch (err) {
+    note(
+      c.dim(
+        "run this again; to skip the browser login, paste your li_at with `oneshot-gtm config keys` first",
+      ),
+    );
+    throw new Error(`connect failed: ${(err as Error).message}`, { cause: err });
+  }
+}
+
+const VOICE_CARD_MAX_CHARS = 1500;
+
+/**
+ * `config voice`: show, set, clear, or draft the founder's voice card. With
+ * `--from`, the founder's own writing (local files) goes through the
+ * `voice-derive` prompt on the configured LLM and the proposed card is
+ * shown before it is saved; the /setup Voice card is where it is edited
+ * afterwards. Nothing is saved without a yes.
+ */
+export async function configVoice(opts: {
+  from?: string[];
+  messages?: string[];
+  guide?: string;
+  show?: boolean;
+  clear?: boolean;
+  yes?: boolean;
+}): Promise<void> {
+  header("Founder voice");
+  const cfg = loadConfig();
+  if (opts.clear) {
+    saveConfig({ ...cfg, founderVoice: null });
+    ok("voice card cleared — drafts use the plain register");
+    return;
+  }
+  const hasSources = (opts.from?.length ?? 0) + (opts.messages?.length ?? 0) > 0;
+  if (!hasSources) {
+    if (cfg.founderVoice?.trim()) {
+      note(`card (${cfg.founderVoice.length} chars):\n${c.dim(cfg.founderVoice)}`);
+    } else {
+      note(c.dim("no voice card — drafts use the plain register"));
+    }
+    note(
+      c.dim(
+        "draft one from your writing: oneshot-gtm config voice --from <posts>... [--messages <sent messages>...] [--guide <file>]",
+      ),
+    );
+    note(c.dim("edit it on /setup (Voice); clear with --clear"));
+    return;
+  }
+  const corpus = loadVoiceCorpus(opts.from ?? [], {
+    ...(opts.messages ? { messages: opts.messages } : {}),
+    ...(opts.guide ? { guide: opts.guide } : {}),
+  });
+  const posts = corpus.items.filter((i) => i.kind === "post").length;
+  const dms = corpus.items.filter((i) => i.kind === "dm").length;
+  note(
+    `read ${corpus.files} file${corpus.files === 1 ? "" : "s"} → ${posts} post${posts === 1 ? "" : "s"}, ${dms} approved message${dms === 1 ? "" : "s"}${corpus.guide ? ", plus your guide" : ""}`,
+  );
+  if (corpus.items.length === 0) {
+    throw new Error(
+      "nothing readable under those paths — point --from / --messages at .md or .txt files of your own writing",
+    );
+  }
+  note(c.dim(`asking ${cfg.llmProvider}/${cfg.llmModel} for the card…`));
+  const res = await complete({
+    messages: [
+      { role: "system", content: loadPrompt("voice-derive") },
+      { role: "user", content: voiceCorpusPrompt(corpus) },
+    ],
+    temperature: 0.3,
+    maxTokens: 1200,
+  });
+  const parsed = tryParseJsonObject<{ card?: unknown; thin?: unknown; notes?: unknown }>(
+    res.content,
+    {},
+  );
+  const card = typeof parsed.card === "string" ? parsed.card.trim() : "";
+  if (!card) throw new Error("the model returned no card — try again, or write one on /setup");
+  const thin = parsed.thin === true;
+  const notes = Array.isArray(parsed.notes)
+    ? parsed.notes.filter((n): n is string => typeof n === "string")
+    : [];
+  process.stdout.write(`\n${card}\n\n`);
+  for (const n of notes) note(`note: ${n}`);
+  if (card.length > VOICE_CARD_MAX_CHARS) {
+    note(
+      c.yellow(
+        `card is ${card.length} chars; the drafts read the first ${VOICE_CARD_MAX_CHARS} — trim it on /setup`,
+      ),
+    );
+  }
+  if (thin && !opts.yes) {
+    note(
+      c.yellow(
+        "the samples were thin; this card is a sketch. Pass --yes to save it anyway, or add more of your writing to --from.",
+      ),
+    );
+    return;
+  }
+  const { save } = opts.yes
+    ? { save: true }
+    : await prompts({
+        type: "confirm",
+        name: "save",
+        message: "Save this card? (edit it later on /setup)",
+        initial: true,
+      });
+  if (!save) {
+    note("not saved");
+    return;
+  }
+  saveConfig({ ...loadConfig(), founderVoice: card });
+  ok(`voice card saved (${card.length} chars) — every email draft now carries it`);
+}
+
+export async function configKeys(): Promise<void> {
+  header("Configure API keys");
+  note(`Keys are saved to ${c.cyan(secretsPath())} (chmod 600). Empty input = leave unchanged.\n`);
+  const cfg = loadConfig();
+  const llmEnvName = {
+    openrouter: "OPENROUTER_API_KEY",
+    openai: "OPENAI_API_KEY",
+    anthropic: "ANTHROPIC_API_KEY",
+  }[cfg.llmProvider];
+
+  const answers = await prompts(
+    [
+      {
+        type: "password",
+        name: "llmKey",
+        message: `${llmEnvName} (current provider: ${cfg.llmProvider})`,
+      },
+      {
+        type: "select",
+        name: "walletMode",
+        message: "Update wallet keys?",
+        choices: [
+          { title: "CDP (Coinbase server wallet)", value: "cdp" },
+          { title: "Raw private key", value: "private-key" },
+          { title: "Skip", value: "skip" },
+        ],
+        initial: 2,
+      },
+      {
+        type: (prev) => (prev === "cdp" ? "password" : null),
+        name: "cdpId",
+        message: "CDP_API_KEY_ID",
+      },
+      {
+        type: (_, v) => (v["walletMode"] === "cdp" ? "password" : null),
+        name: "cdpSecret",
+        message: "CDP_API_KEY_SECRET",
+      },
+      {
+        type: (_, v) => (v["walletMode"] === "cdp" ? "password" : null),
+        name: "cdpWallet",
+        message: "CDP_WALLET_SECRET",
+      },
+      {
+        type: (_, v) => (v["walletMode"] === "private-key" ? "password" : null),
+        name: "agentKey",
+        message: "AGENT_PRIVATE_KEY",
+      },
+      {
+        type: "select",
+        name: "xMode",
+        message: "Update X (Twitter) keys? (x-reposters finder)",
+        choices: [
+          { title: "X API (first-party) — 4 OAuth1 user-context keys", value: "xapi" },
+          { title: "twitterapi.io — 1 key (~55x cheaper, third-party)", value: "twitterapiio" },
+          { title: "Skip", value: "skip" },
+        ],
+        initial: 2,
+      },
+      {
+        type: (_, v) => (v["xMode"] === "xapi" ? "password" : null),
+        name: "xApiKey",
+        message: "X_API_KEY",
+      },
+      {
+        type: (_, v) => (v["xMode"] === "xapi" ? "password" : null),
+        name: "xApiSecret",
+        message: "X_API_SECRET",
+      },
+      {
+        type: (_, v) => (v["xMode"] === "xapi" ? "password" : null),
+        name: "xAccessToken",
+        message: "X_ACCESS_TOKEN",
+      },
+      {
+        type: (_, v) => (v["xMode"] === "xapi" ? "password" : null),
+        name: "xAccessSecret",
+        message: "X_ACCESS_SECRET",
+      },
+      {
+        type: (_, v) => (v["xMode"] === "twitterapiio" ? "password" : null),
+        name: "twitterApiIoKey",
+        message: "TWITTERAPI_IO_KEY",
+      },
+      {
+        type: "password",
+        name: "githubToken",
+        message: "GITHUB_TOKEN (GitHub finders; classic token needs no scopes)",
+      },
+      {
+        type: "password",
+        name: "lumaSessionCookie",
+        message: "LUMA_SESSION_COOKIE (optional; hosted-event guest lists)",
+      },
+      {
+        type: "password",
+        name: "linkedinSessionCookie",
+        message:
+          "LINKEDIN_SESSION_COOKIE (optional; live LinkedIn profile reads, your li_at cookie)",
+      },
+    ],
+    { onCancel: () => process.exit(0) },
+  );
+
+  const updates: Record<string, string> = {};
+  if (answers["llmKey"]) updates[llmEnvName] = answers["llmKey"] as string;
+  if (answers["cdpId"]) updates["CDP_API_KEY_ID"] = answers["cdpId"] as string;
+  if (answers["cdpSecret"]) updates["CDP_API_KEY_SECRET"] = answers["cdpSecret"] as string;
+  if (answers["cdpWallet"]) updates["CDP_WALLET_SECRET"] = answers["cdpWallet"] as string;
+  if (answers["agentKey"]) updates["AGENT_PRIVATE_KEY"] = answers["agentKey"] as string;
+  if (answers["xApiKey"]) updates["X_API_KEY"] = answers["xApiKey"] as string;
+  if (answers["xApiSecret"]) updates["X_API_SECRET"] = answers["xApiSecret"] as string;
+  if (answers["xAccessToken"]) updates["X_ACCESS_TOKEN"] = answers["xAccessToken"] as string;
+  if (answers["xAccessSecret"]) updates["X_ACCESS_SECRET"] = answers["xAccessSecret"] as string;
+  if (answers["twitterApiIoKey"])
+    updates["TWITTERAPI_IO_KEY"] = answers["twitterApiIoKey"] as string;
+  if (answers["githubToken"]) updates["GITHUB_TOKEN"] = answers["githubToken"] as string;
+  if (answers["lumaSessionCookie"])
+    updates["LUMA_SESSION_COOKIE"] = answers["lumaSessionCookie"] as string;
+  if (answers["linkedinSessionCookie"])
+    updates["LINKEDIN_SESSION_COOKIE"] = answers["linkedinSessionCookie"] as string;
+
+  if (Object.keys(updates).length === 0) {
+    note("No changes.");
+    return;
+  }
+  saveSecrets(updates);
+  ok(`Saved ${Object.keys(updates).length} key(s) to ${c.dim(secretsPath())}`);
+}

@@ -1,0 +1,376 @@
+import { getLedger, logEvent, parallelMap } from "@oneshot-gtm/core";
+import type { CompetitorSwitchTarget, RepoInterestTarget } from "@oneshot-gtm/plays";
+import { resolveVerifyEnrichQualify, icpFields } from "./_contact.ts";
+import { enqueueScoredTarget } from "./_priority-adapters.ts";
+import { persistRoleRejection } from "./_qualify.ts";
+import { isDuplicate } from "./_dedupe.ts";
+import { icpFilter, resolveIcp } from "./_filter.ts";
+import { buildGitHubEvidence } from "./_github-evidence.ts";
+import { fetchGitHubUser } from "./_github-user.ts";
+import { findLinkedInUrl } from "./_linkedin.ts";
+import { recentStargazers, type Stargazer } from "./_stargazers.ts";
+import type { FinderResult, RunOpts } from "./_types.ts";
+
+const PLAY_NAME = "github-stars";
+
+/** A repo the founder watches, tagged with how it relates to their product. */
+export interface RepoWatch {
+  /** "owner/name". */
+  repo: string;
+  /** `competitor` → competitor-switch pitch; `adjacent` → repo-interest pitch. */
+  rel: "competitor" | "adjacent";
+  /** Display label (e.g. "Apollo"); falls back to the repo's name segment. */
+  label?: string;
+  /**
+   * Optional, per-repo: one true line about why THIS repo is notable plus how
+   * your offer bridges to it respectfully. Surfaced to the email as a
+   * shared-taste nod (never flattery) that also shapes the offer's framing:
+   * e.g. a privacy-first repo's edge leads the pitch with control/auditability
+   * rather than "we do it for you". Adjacent repos only (→ repo-interest).
+   */
+  repoEdge?: string;
+}
+
+export interface GitHubStarsFinderOpts extends RunOpts {
+  repos: RepoWatch[];
+  /** Fed to whichever play a candidate routes to. */
+  yourEdge: string;
+  /** Only consider stars within the last N days. Default 30. */
+  sinceDays?: number;
+  /** Per-candidate pipelines in flight at once. Default 3. */
+  concurrency?: number;
+}
+
+type Candidate = Stargazer & {
+  repo: string;
+  rel: RepoWatch["rel"];
+  label: string;
+  repoEdge?: string;
+};
+
+function deriveLabel(repo: string): string {
+  return repo.split("/")[1]?.trim() || repo;
+}
+
+function sourceFor(repo: string): string {
+  return `find:${PLAY_NAME}:${repo}`;
+}
+
+/**
+ * github-stars finder: recent stargazers of watched repos → prospects, routed
+ * by each repo's founder-tagged `rel`. A `competitor` repo's stargazers become
+ * `competitor-switch` rows ("why teams switch from X"); an `adjacent` repo's
+ * become `repo-interest` rows ("you're into X — my product helps"). Reuses the
+ * shared finder stack (ICP filter, findEmail/verify/enrich, dedupe, prescreen)
+ * and the soft-cap loop pattern from show-hn / accelerator-batch.
+ */
+export async function runGitHubStarsFinder(opts: GitHubStarsFinderOpts): Promise<FinderResult> {
+  const limit = opts.limit ?? 25;
+  const concurrency = Math.max(1, opts.concurrency ?? 3);
+  const sinceDays = opts.sinceDays ?? 30;
+  const sinceIso = new Date(Date.now() - sinceDays * 24 * 3600 * 1000).toISOString();
+  const icp = resolveIcp(opts.icpOverride);
+  const ledger = getLedger();
+
+  const result: FinderResult = {
+    source: `find:${PLAY_NAME}`,
+    candidates: 0,
+    droppedIcp: 0,
+    droppedDuplicate: 0,
+    droppedEnrichment: 0,
+    enqueued: 0,
+    costUsd: 0,
+  };
+
+  logEvent("finder.start", {
+    name: PLAY_NAME,
+    repos: opts.repos.length,
+    since_days: sinceDays,
+    limit,
+  });
+
+  // Step 1: gather recent stargazers across all watched repos, tagged with the
+  // repo's rel/label. Per-repo errors log + continue (handled in _stargazers).
+  const tagged: Candidate[] = [];
+  let firstError: string | null = null;
+  let newestSeen: string | null = null; // newest star across all repos, ignoring the window
+  for (const w of opts.repos) {
+    const {
+      stargazers,
+      error,
+      newestSeen: repoNewest,
+    } = await recentStargazers(w.repo, {
+      sinceIso,
+    });
+    if (error && !firstError) firstError = `${w.repo}: ${error}`;
+    if (repoNewest && (!newestSeen || repoNewest > newestSeen)) newestSeen = repoNewest;
+    const label = w.label?.trim() || deriveLabel(w.repo);
+    const repoEdge = w.repoEdge?.trim();
+    for (const s of stargazers) {
+      tagged.push({ ...s, repo: w.repo, rel: w.rel, label, ...(repoEdge ? { repoEdge } : {}) });
+    }
+  }
+
+  // Cross-repo dedupe by login (someone starring two watched repos surfaces once).
+  const seen = new Set<string>();
+  const candidates = tagged.filter((c) => {
+    const k = c.login.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  result.candidates = candidates.length;
+
+  if (candidates.length === 0) {
+    // Distinguish a fetch failure (usually the unauth rate limit) from an honest
+    // empty window, and when empty, say how stale the newest star is so the
+    // founder knows to widen `sinceDays` rather than wonder what broke.
+    if (firstError) {
+      // Both the stargazers list AND the events-feed fallback failed. That's
+      // a rate limit or outage, not the (handled) July-2026 access restriction.
+      result.halted = `github fetch failed (${firstError}) — set GITHUB_TOKEN for higher rate limits`;
+    } else if (newestSeen) {
+      const ageDays = Math.floor((Date.now() - new Date(newestSeen).getTime()) / 86_400_000);
+      result.halted = `no stars in last ${sinceDays}d — newest was ${ageDays}d ago; widen sinceDays`;
+    } else {
+      result.halted =
+        "no stargazers found (check repo names — third-party repos only surface stars still in the public events feed, ~90d/300 events)";
+    }
+    logEvent("finder.done", { name: PLAY_NAME, candidates: 0, halted: result.halted });
+    return result;
+  }
+
+  // Step 2: per-candidate pipeline (parallel, soft-capped on limit + cost).
+  let halted = false;
+  await parallelMap(candidates, concurrency, async (c) => {
+    if (halted) return;
+    if (result.enqueued >= limit) {
+      halted = true;
+      return;
+    }
+    if (opts.maxCostUsd != null && result.costUsd >= opts.maxCostUsd) {
+      result.halted = `max-cost cap (${opts.maxCostUsd})`;
+      halted = true;
+      return;
+    }
+
+    const playName = c.rel === "competitor" ? "competitor-switch" : "repo-interest";
+    const dedupeKey = `${PLAY_NAME}:${c.repo}:${c.login}`;
+    if (ledger.isQueueDuplicate(playName, dedupeKey)) {
+      result.droppedDuplicate++;
+      return;
+    }
+
+    const user = await fetchGitHubUser(c.login);
+    if (!user) {
+      result.droppedEnrichment++;
+      return;
+    }
+    const fullName = user.name ?? c.login;
+    const profileUrl = `https://github.com/${c.login}`;
+
+    // ICP filter on what GitHub actually says about the person: bio, site,
+    // account maturity, their own repos (README only on a bare profile): plus
+    // the repo they starred. A star alone is not evidence either way.
+    const evidence = await buildGitHubEvidence(user);
+    const filter = await icpFilter({
+      icp,
+      candidate: {
+        title: fullName,
+        url: c.userUrl,
+        summary: `${evidence.text}\nStarred: ${c.repo}`,
+      },
+    });
+    if (filter.match === null) {
+      // Transient classifier failure (Anthropic 5xx, timeout, rate limit):
+      // drop without persisting. A rejection would burn the dedupeKey for
+      // every future watch tick since isQueueDuplicate ignores status.
+      result.droppedEnrichment++;
+      return;
+    }
+    if (!filter.match && evidence.repos === null) {
+      // The repo fetch failed (rate limit / network), so the gate judged on
+      // incomplete evidence. Same rule as a transient classifier failure: drop
+      // without persisting, so the candidate is judged properly on a later tick.
+      result.droppedEnrichment++;
+      return;
+    }
+    if (!filter.match) {
+      result.droppedIcp++;
+      // Persist the auto-rejection for review (skipped on dry-run previews).
+      if (!opts.dryRun) {
+        ledger.enqueueTarget({
+          playName,
+          payload: {
+            name: fullName,
+            company: user.company ?? "",
+            repo: c.repo,
+            candidateLogin: c.login,
+            sourceProfileUrl: profileUrl,
+            githubEvidence: evidence.text,
+          },
+          dedupeKey,
+          source: sourceFor(c.repo),
+          initialStatus: "rejected",
+          notes: `auto: ICP — ${filter.reason}`,
+        });
+      }
+      return;
+    }
+
+    // Dry-run preview: count ICP-passers, skip the paid enrich + enqueue.
+    if (opts.dryRun) {
+      result.enqueued++;
+      return;
+    }
+
+    // Resolve + verify an email: public profile email first, else findEmail via
+    // the blog domain (gated by the prescreen). No domain + no public email → drop.
+    const contact = await resolveVerifyEnrichQualify({
+      playName: PLAY_NAME,
+      fullName,
+      knownEmail: user.email,
+      githubIdentity: user,
+      companyDomain: user.blogDomain,
+      isDuplicate: (email) => isDuplicate({ playName, dedupeKey, prospectEmail: email }),
+      icp,
+      // GitHub's user API carries no title, so stage A has nothing to judge:
+      // the gate decides on the enriched title (stage B), which is free. The
+      // bio rides as evidence, never as roleText: roleText becomes the
+      // prospect's persisted title.
+      person: {
+        name: fullName,
+        company: user.company?.trim() ?? null,
+        evidence: [user.bio ? `bio: ${user.bio}` : null, `starred ${c.repo}`]
+          .filter(Boolean)
+          .join(" · "),
+      },
+      fillGaps: opts.qualifyFillGaps ?? true,
+    });
+    result.costUsd += contact.costUsd;
+    if (!contact.ok) {
+      if (contact.reason === "duplicate") result.droppedDuplicate++;
+      else if (contact.reason === "role") {
+        result.droppedRole = (result.droppedRole ?? 0) + 1;
+        persistRoleRejection({
+          playName,
+          dedupeKey,
+          payload: {
+            name: fullName,
+            company: user.company ?? "",
+            repo: c.repo,
+            candidateLogin: c.login,
+            sourceProfileUrl: profileUrl,
+            githubEvidence: evidence.text,
+            ...(contact.email ? { email: contact.email } : {}),
+            ...(contact.emailSource ? { emailSource: contact.emailSource } : {}),
+          },
+          source: sourceFor(c.repo),
+          reason: contact.detail ?? "off-ICP role",
+          dryRun: opts.dryRun,
+        });
+      } else result.droppedEnrichment++;
+      return;
+    }
+    // "" on a LinkedIn-channel contact: the row's channel decides how it is sent.
+    const email = contact.email ?? "";
+    const enr = { phone: contact.phone, linkedinUrl: contact.linkedinUrl };
+
+    const company = user.company?.trim() || "(unknown)";
+    const repoUrl = `https://github.com/${c.repo}`;
+
+    // Tier 3 of the standard LinkedIn chain (see post-funding.ts for the
+    // canonical shape). GitHub's user API carries no LinkedIn field, so without
+    // this a stargazer the SDK can't enrich by email has no LinkedIn path at
+    // all, which is why this finder produced 17 of 334.
+    // The login is a strong disambiguator: many devs use the same handle on
+    // both platforms.
+    let linkedinUrl: string | null = enr.linkedinUrl;
+    if (!linkedinUrl) {
+      linkedinUrl = await findLinkedInUrl({
+        fullName,
+        disambiguators: [c.login, user.company?.trim() ?? ""].filter((s) => s.length > 0),
+        accumCost: (cost) => {
+          result.costUsd += cost ?? 0;
+        },
+        errKindPrefix: PLAY_NAME,
+      });
+    }
+
+    const contactExtras = {
+      ...(linkedinUrl ? { linkedinUrl } : {}),
+      ...(enr.phone ? { phone: enr.phone } : {}),
+      ...(contact.title ? { title: contact.title } : {}),
+      ...icpFields(contact),
+      sourceProfileUrl: profileUrl,
+      githubEvidence: evidence.text,
+      ...(contact.emailSource ? { emailSource: contact.emailSource } : {}),
+    };
+
+    // repo-interest is a peer-builder pitch: what the candidate ships gives
+    // the LLM concrete shared-taste evidence. competitor-switch is a head-on
+    // pitch where the starred repo IS the signal; candidate's own repos add
+    // noise, so we only pass them on the repo-interest branch. Already fetched
+    // for the evidence block; the draft only needs the three topical fields.
+    const candidateRepos =
+      c.rel === "competitor" || !evidence.repos
+        ? undefined
+        : evidence.repos.map(({ name, description, language }) => ({
+            name,
+            description,
+            language,
+          }));
+
+    const target: CompetitorSwitchTarget | RepoInterestTarget =
+      c.rel === "competitor"
+        ? {
+            name: fullName,
+            email,
+            company,
+            competitor: c.label,
+            evidenceUrl: repoUrl,
+            // Pre-supplied evidence → competitor-switch skips its browser scrape
+            // (a code page has no "pain points" to extract).
+            evidenceText: `Starred ${c.label}'s repo (${c.repo}) on ${c.starredAt.slice(0, 10)} — actively evaluating tools in this space.`,
+            yourEdge: opts.yourEdge,
+            ...contactExtras,
+          }
+        : {
+            name: fullName,
+            email,
+            company,
+            repo: c.repo,
+            repoLabel: c.label,
+            yourEdge: opts.yourEdge,
+            ...(c.repoEdge ? { repoEdge: c.repoEdge } : {}),
+            evidenceUrl: repoUrl,
+            candidateLogin: c.login,
+            ...(candidateRepos ? { candidateRepos } : {}),
+            ...contactExtras,
+          };
+
+    const id = enqueueScoredTarget(ledger, {
+      playName,
+      payload: target,
+      dedupeKey,
+      source: sourceFor(c.repo),
+      fitReason: filter.reason,
+      notes: filter.reason,
+      channel: contact.channel,
+    });
+    if (id != null) result.enqueued++;
+    else result.droppedDuplicate++;
+  });
+
+  logEvent("finder.done", {
+    name: PLAY_NAME,
+    candidates: result.candidates,
+    enqueued: result.enqueued,
+    dropped_icp: result.droppedIcp,
+    dropped_dup: result.droppedDuplicate,
+    dropped_enrich: result.droppedEnrichment,
+    cost_usd: result.costUsd,
+    halted: result.halted ?? null,
+  });
+  return result;
+}

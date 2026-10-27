@@ -1,0 +1,397 @@
+import { replyNeedsAttention } from "../lib/replies.ts";
+import { useQuery } from "@tanstack/react-query";
+import { Outlet, createRootRouteWithContext, Link, useRouterState } from "@tanstack/react-router";
+import type { QueryClient } from "@tanstack/react-query";
+import {
+  Activity,
+  BarChart3,
+  CalendarClock,
+  Feather,
+  Inbox,
+  Layers,
+  Mail,
+  Receipt,
+  Settings,
+  Users,
+} from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from "react";
+import { Toaster } from "sonner";
+import { api } from "../api/client.ts";
+import { IS_DEMO } from "../api/demo.ts";
+import { DemoFrame } from "../components/shell/DemoFrame.tsx";
+import { CommandPalette } from "../components/shell/CommandPalette.tsx";
+import { PrivacyToggle } from "../components/shell/PrivacyToggle.tsx";
+import { StatusBar } from "../components/shell/StatusBar.tsx";
+import { WorkspaceSwitcher } from "../components/shell/WorkspaceSwitcher.tsx";
+import { StrategistDock } from "../components/shell/StrategistDock.tsx";
+import { useKeyboard } from "../components/shell/useKeyboard.ts";
+import { cn } from "../lib/cn.ts";
+import { useDocumentTitle } from "../lib/documentTitle.ts";
+import { applyWorkspaceFavicon } from "../lib/favicon.ts";
+import { PrivacyProvider } from "../lib/privacy.tsx";
+
+interface RootContext {
+  queryClient: QueryClient;
+}
+
+export const Route = createRootRouteWithContext<RootContext>()({
+  component: RootLayout,
+});
+
+interface NavItem {
+  to:
+    | "/"
+    | "/queue"
+    | "/prospects"
+    | "/inbox"
+    | "/cadences"
+    | "/meetings"
+    | "/receipts"
+    | "/measure"
+    | "/plays"
+    | "/setup";
+  label: string;
+  icon: ComponentType<{ size?: number; className?: string }>;
+  /** Which alert-data key, if any, lights a dot next to this nav item. */
+  alert?: "queue-pending" | "doctor-fail" | "inbox-positive" | "meetings-pending";
+}
+
+const NAV: NavItem[] = [
+  { to: "/", label: "Today", icon: Activity },
+  { to: "/queue", label: "Queue", icon: Inbox, alert: "queue-pending" },
+  { to: "/prospects", label: "Prospects", icon: Users },
+  { to: "/inbox", label: "Replies", icon: Mail, alert: "inbox-positive" },
+  { to: "/cadences", label: "Cadences", icon: Layers },
+  { to: "/meetings", label: "Meetings", icon: CalendarClock, alert: "meetings-pending" },
+  { to: "/receipts", label: "Receipts", icon: Receipt },
+  { to: "/measure", label: "Measure", icon: BarChart3 },
+  { to: "/plays", label: "Plays", icon: Feather },
+  { to: "/setup", label: "Setup", icon: Settings, alert: "doctor-fail" },
+];
+
+function RootLayout() {
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const menuRef = useRef<HTMLButtonElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const closeMobileNav = useCallback(() => {
+    setMobileNavOpen(false);
+    menuRef.current?.focus();
+  }, []);
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    closeRef.current?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeMobileNav();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [mobileNavOpen, closeMobileNav]);
+  useKeyboard({
+    paletteOpen,
+    openPalette: () => setPaletteOpen(true),
+    closePalette: () => setPaletteOpen(false),
+  });
+
+  // Alert signals: cheap queries, polled at a slower cadence than the
+  // primary route data. These let the nav show a red dot without asking
+  // the user to open the route.
+  const queueQuery = useQuery({
+    queryKey: ["queue", "pending", "all"],
+    queryFn: () => api.queue({ status: "pending", limit: 1 }),
+    refetchInterval: 60_000,
+  });
+  const doctor = useQuery({
+    queryKey: ["doctor"],
+    queryFn: api.doctor,
+    refetchInterval: 60_000,
+  });
+  // A positive reply is the highest-value event in the product and the one
+  // thing that never announced itself (issue #480): polled at the same
+  // cadence /inbox itself uses, so the dot and the page never disagree.
+  const inboxAlertQuery = useQuery({
+    queryKey: ["replies"],
+    queryFn: () => api.replies(),
+    refetchInterval: 60_000,
+  });
+  // A past meeting with no outcome logged (issue #577): same idea as the
+  // inbox dot: the founder should never have to open /meetings to notice one
+  // is waiting.
+  const meetingsAlertQuery = useQuery({
+    queryKey: ["meetings"],
+    queryFn: api.meetings,
+    refetchInterval: 60_000,
+  });
+
+  // <main> is the scroll container and it persists across routes, so without
+  // this a navigation inherits the previous page's scroll offset: scroll down
+  // the Home feed, click Queue, and Queue opens 1000px in. The top of the
+  // list (and the triggers card) are above the fold, which reads as "only
+  // some of the prospects show until I refresh". Every route change starts
+  // at the top, the way a full page load does.
+  const mainRef = useRef<HTMLElement | null>(null);
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const isRepliesPage = useRouterState({
+    select: (s) => s.matches.some((match) => match.routeId === "/inbox"),
+  });
+  useEffect(() => {
+    mainRef.current?.scrollTo({ top: 0 });
+  }, [pathname]);
+
+  // Structured identity from /api/workspace (replaces the old string-split of
+  // the doctor check's message, which also hid the name for "default").
+  const workspaceQuery = useQuery({
+    queryKey: ["workspace"],
+    queryFn: api.workspace,
+    refetchInterval: 60_000,
+  });
+  const workspace = workspaceQuery.data?.current ?? null;
+
+  // Several workspaces run at once, each its own server on its own port. Name
+  // the tab and tint its icon, or they are indistinguishable in the tab strip.
+  useDocumentTitle(workspace?.name ?? null);
+  useEffect(() => {
+    void applyWorkspaceFavicon(workspace?.name ?? null);
+  }, [workspace?.name]);
+
+  const alerts: Record<NonNullable<NavItem["alert"]>, boolean> = {
+    "queue-pending": (queueQuery.data?.counts.pending ?? 0) > 0,
+    "doctor-fail": (doctor.data?.checks ?? []).some((c) => c.severity === "fail"),
+    // `awaitingReply` clears when the founder replies or records a deal outcome.
+    // A bare intent check would keep the alert lit after the reply was handled.
+    "inbox-positive": (inboxAlertQuery.data?.threads ?? []).some(replyNeedsAttention),
+    "meetings-pending": (meetingsAlertQuery.data?.awaitingOutcome.length ?? 0) > 0,
+  };
+
+  return (
+    <PrivacyProvider>
+      <Frame>
+        <div className="grid h-full min-w-0 grid-cols-[minmax(0,1fr)] md:grid-cols-[224px_minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)_auto] bg-ink-bg text-ink-cream">
+          {mobileNavOpen && (
+            <button
+              type="button"
+              aria-label="Close navigation"
+              className="fixed inset-0 z-40 bg-black/50 md:hidden"
+              onClick={closeMobileNav}
+            />
+          )}
+          <aside
+            aria-label="Navigation"
+            className={cn(
+              "row-span-3 flex-col border-r border-ink-rule bg-ink-bg px-3 py-5 md:static md:flex md:w-auto md:bg-ink-bg/60",
+              mobileNavOpen ? "fixed inset-y-0 left-0 z-50 flex w-56" : "hidden",
+            )}
+          >
+            {mobileNavOpen && (
+              <button
+                type="button"
+                ref={closeRef}
+                className="mb-3 self-end text-[12px] md:hidden"
+                onClick={closeMobileNav}
+              >
+                Close
+              </button>
+            )}
+            <div className="mb-7 px-2">
+              <div
+                className="text-ink-cream"
+                style={{
+                  fontFamily: "var(--font-display)",
+                  fontSize: 19,
+                  letterSpacing: "-0.01em",
+                  lineHeight: 1.1,
+                }}
+              >
+                oneshot
+                <span className="text-[color:var(--ink-spend-2)]">·</span>gtm
+              </div>
+              <div className="mt-0.5 text-[10.5px] uppercase tracking-[0.14em] text-ink-faint">
+                Founder's ledger
+              </div>
+              {/* A vendored demo is one ledger and cannot start a second
+                server, so the switcher would offer a door onto nothing. */}
+              {!IS_DEMO && <WorkspaceSwitcher />}
+            </div>
+
+            <nav className="flex flex-col gap-0.5" aria-label="primary">
+              {NAV.map(({ to, label, icon: Icon, alert }) => {
+                const hasAlert = alert ? alerts[alert] : false;
+                return (
+                  <Link
+                    key={to}
+                    to={to}
+                    onClick={closeMobileNav}
+                    activeOptions={{ exact: to === "/" }}
+                    className={cn(
+                      "group relative flex items-center gap-2.5 rounded-[var(--radius-sm)] px-2.5 py-1.5",
+                      "font-sans text-[13px] text-ink-cream-2",
+                      "transition-colors duration-[var(--dur-stamp)]",
+                      "hover:bg-ink-surface hover:text-ink-cream",
+                    )}
+                    activeProps={{
+                      className: "bg-ink-surface text-ink-cream",
+                      "data-active": "true",
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className={cn(
+                        "pointer-events-none absolute bottom-1 left-0 top-1 w-[2px] rounded-full",
+                        "bg-[color:var(--ink-signal)]",
+                        "opacity-0 transition-opacity duration-[var(--dur-stamp)]",
+                        "group-data-[active=true]:opacity-100",
+                      )}
+                    />
+                    <Icon
+                      size={14}
+                      className={cn(
+                        "text-ink-muted transition-colors",
+                        "group-hover:text-ink-cream-2",
+                        "group-data-[active=true]:text-[color:var(--ink-signal-2)]",
+                      )}
+                    />
+                    <span className="flex-1">{label}</span>
+                    {hasAlert && (
+                      <span
+                        aria-label={alertLabel(alert)}
+                        title={alertLabel(alert)}
+                        className={cn(
+                          "h-[6px] w-[6px] shrink-0 rounded-full",
+                          alert === "doctor-fail"
+                            ? "bg-[color:var(--ink-blocked)]"
+                            : "bg-[color:var(--ink-spend)]",
+                          "shadow-[0_0_0_2px_color-mix(in_oklch,currentColor_0%,var(--ink-bg)_100%)]",
+                        )}
+                      />
+                    )}
+                  </Link>
+                );
+              })}
+            </nav>
+
+            <div className="mt-auto border-t border-ink-rule pt-4 px-2">
+              <div className="ln-eyebrow mb-2" style={{ fontSize: 10 }}>
+                Keys
+              </div>
+              <div className="space-y-1 font-mono text-[11px] text-ink-faint">
+                <button
+                  type="button"
+                  onClick={() => setPaletteOpen(true)}
+                  className="group flex w-full items-center justify-between rounded-[var(--radius-xs)] px-1 py-0.5 text-left transition-colors hover:bg-ink-surface/80"
+                  aria-label="open command palette"
+                >
+                  <span className="group-hover:text-ink-cream-2">palette</span>
+                  <kbd className="rounded border border-ink-rule px-1 text-ink-cream-2">⌘K</kbd>
+                </button>
+                <div className="flex justify-between px-1">
+                  <span>queue</span>
+                  <kbd className="rounded border border-ink-rule px-1 text-ink-cream-2">g q</kbd>
+                </div>
+                <div className="flex justify-between px-1">
+                  <span>home</span>
+                  <kbd className="rounded border border-ink-rule px-1 text-ink-cream-2">g h</kbd>
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          <header className="flex min-w-0 items-center justify-between border-b border-ink-rule bg-ink-bg/70 px-6 py-2.5 backdrop-blur-[2px]">
+            <button
+              type="button"
+              aria-label="Open navigation"
+              aria-expanded={mobileNavOpen}
+              ref={menuRef}
+              onClick={() => setMobileNavOpen(true)}
+              className="text-[12px] text-ink-cream md:hidden"
+            >
+              Menu · {workspace?.name ?? "oneshot"}
+            </button>
+            <div className="hidden text-[11.5px] text-ink-faint ln-mono md:block">
+              workspace <span className="text-ink-cream">{workspace?.name ?? "…"}</span>
+              {workspace ? <span className="text-ink-muted"> :{workspace.port}</span> : null} ·
+              local-first · bound to <span className="text-ink-muted">127.0.0.1</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <PrivacyToggle />
+              <div className="hidden sm:block">
+                <StatusBar />
+              </div>
+            </div>
+          </header>
+
+          {/*
+            The bottom gutter is NOT padding here. `sticky bottom-0` resolves
+            against this scroller's content box, so padding-bottom lifts the
+            queue's selection bar and the setup and run action bars off the
+            footer at every scroll position, not just at the end. The gutter is
+            a margin on the page's last in-flow block instead: see
+            `--ledger-gutter` in styles.css.
+          */}
+          <main
+            ref={mainRef}
+            className={cn(
+              "min-h-0 min-w-0",
+              isRepliesPage ? "replies-main overflow-hidden" : "overflow-y-auto px-6 py-6",
+            )}
+          >
+            <Outlet />
+          </main>
+
+          <footer className="border-t border-ink-rule bg-ink-bg/70 px-6 py-2 text-[11px] text-ink-faint backdrop-blur-[2px]">
+            Built on OneShot · Read every prompt · Fork every play ·{" "}
+            <span className="text-ink-muted">MIT</span>
+          </footer>
+
+          <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
+          {/* The strategist streams from an LLM endpoint no static build has,
+            and it is a 174 KB chunk. Demo mode drops both. */}
+          {!IS_DEMO && <StrategistDock />}
+
+          <Toaster
+            position="bottom-right"
+            theme="dark"
+            richColors={false}
+            toastOptions={{
+              className: [
+                "!bg-[color:var(--ink-surface)]",
+                "!text-[color:var(--ink-cream)]",
+                "!border-[color:var(--ink-rule)]",
+                "!font-sans",
+                "!shadow-[var(--shadow-ink-bleed)]",
+              ].join(" "),
+              style: {
+                borderRadius: "var(--radius-md)",
+              },
+            }}
+          />
+        </div>
+      </Frame>
+    </PrivacyProvider>
+  );
+}
+
+/**
+ * Demo chrome, or nothing at all. Written as a component rather than inline so
+ * the real dashboard's DOM is exactly what it always was.
+ */
+function Frame({ children }: { children: ReactNode }) {
+  return IS_DEMO ? <DemoFrame>{children}</DemoFrame> : <>{children}</>;
+}
+
+function alertLabel(alert: NavItem["alert"]): string {
+  if (alert === "queue-pending") return "pending candidates waiting for review";
+  if (alert === "doctor-fail") return "doctor has a failing check";
+  if (alert === "inbox-positive") return "a positive reply is waiting for a decision";
+  if (alert === "meetings-pending") return "a past meeting is waiting for an outcome";
+  return "";
+}

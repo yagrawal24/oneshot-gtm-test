@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["bun"],
+    "paths": {
+      "@oneshot-gtm/core": ["./packages/core/src/index.ts"],
+      "@oneshot-gtm/intel": ["./packages/intel/src/index.ts"],
+      "@oneshot-gtm/plays": ["./packages/plays/src/index.ts"],
+      "@oneshot-gtm/doctor": ["./packages/doctor/src/index.ts"],
+      "@oneshot-gtm/find": ["./packages/find/src/index.ts"],
+      "@oneshot-gtm/shared-types": ["./packages/shared-types/src/index.ts"],
+      "@/*": ["./apps/web/src/*"]
+    }
+  },
+  "include": [
+    "apps/cli/src/**/*.ts",
+    "apps/server/src/**/*.ts",
+    "apps/web/src/**/*.ts",
+    "apps/web/src/**/*.tsx",
+    "apps/*/__tests__/**/*.ts",
+    "packages/*/src/**/*.ts",
+    "packages/*/__tests__/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

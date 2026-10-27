@@ -1,0 +1,314 @@
+import { getLedger, loadConfig, type TriggerRow } from "@oneshot-gtm/core";
+import {
+  checkReadiness,
+  DEFAULT_APPROVAL_RATE_MIN_SAMPLES,
+  DEFAULT_APPROVAL_RATE_THRESHOLD,
+  effectiveIntervalMs,
+  fireTriggerNow,
+  finderApprovalHealth,
+  getTriggerRunningSince,
+  isTriggerRunning,
+  storedTriggerConfig,
+  TRIGGERS,
+  type Readiness,
+  type TriggerSpec,
+} from "@oneshot-gtm/find";
+import {
+  describeEdgeWarning,
+  factTermsFrom,
+  isAllowedDesignPartnerLoiBuyerType,
+  lintEdge,
+  splitEdgeAngles,
+  type EdgeLintContext,
+} from "@oneshot-gtm/plays";
+import type { RunTriggerResult, TriggerView } from "@oneshot-gtm/shared-types";
+import { jsonResponse } from "../server.ts";
+import {
+  angleUsageForEdge,
+  draftUsageView,
+  voiceUsageView,
+  formatUsageView,
+  playUsageLoader,
+  type PlayUsage,
+} from "./_draft-versions.ts";
+
+export function toView(
+  name: string,
+  defaultIntervalMs: number,
+  row: TriggerRow | null,
+  spec: TriggerSpec | null,
+  usage?: PlayUsage,
+): TriggerView {
+  let lastSummary: unknown = null;
+  if (row?.last_run_summary) {
+    try {
+      lastSummary = JSON.parse(row.last_run_summary);
+    } catch {
+      lastSummary = row.last_run_summary;
+    }
+  }
+  let config: Record<string, unknown> | null = null;
+  if (row?.config_json) {
+    try {
+      const parsed = JSON.parse(row.config_json) as unknown;
+      if (parsed && typeof parsed === "object") config = parsed as Record<string, unknown>;
+    } catch {
+      config = null;
+    }
+  }
+  const defaultEnabled = spec ? spec.enabledByDefault !== false : true;
+  const intervalMs = spec ? effectiveIntervalMs(spec, config) : defaultIntervalMs;
+  const runningSinceMs = getTriggerRunningSince(name);
+  // Explicit annotation keeps the discriminated-union narrowing intact
+  // (the literal { ready: true } branch would otherwise widen the union).
+  const readiness: Readiness = spec
+    ? checkReadiness(spec, config ?? spec.defaultConfig)
+    : { ready: true };
+  const approval = spec
+    ? finderApprovalHealth(name, config ?? spec.defaultConfig)
+    : {
+        rate: null,
+        reviewed: 0,
+        minSamples: DEFAULT_APPROVAL_RATE_MIN_SAMPLES,
+        threshold: DEFAULT_APPROVAL_RATE_THRESHOLD,
+        windowDays: 30,
+        deprioritized: false,
+        reason: null,
+      };
+  return {
+    name,
+    enabled: row ? Boolean(row.enabled) : defaultEnabled,
+    defaultIntervalMs,
+    intervalMs,
+    config,
+    defaultConfig: spec ? spec.defaultConfig : null,
+    lastPolledAt: row?.last_polled_at ?? null,
+    lastRunSummary: lastSummary,
+    running: isTriggerRunning(name),
+    runningSince: runningSinceMs != null ? new Date(runningSinceMs).toISOString() : null,
+    ready: readiness.ready,
+    notReadyReason: readiness.ready ? null : readiness.reason,
+    approvalRate: approval.rate,
+    approvalReviewed: approval.reviewed,
+    approvalMinSamples: approval.minSamples,
+    approvalRateThreshold: approval.threshold,
+    approvalRateWindowDays: approval.windowDays,
+    deprioritized: approval.deprioritized,
+    deprioritizedReason: approval.reason,
+    angleUsage: angleUsageForEdge(config ?? spec?.defaultConfig ?? null, usage?.angles ?? []),
+    draftUsage: draftUsageView(usage?.drafts),
+    voiceUsage: voiceUsageView(usage?.voice),
+    formatUsage: formatUsageView(usage?.format),
+  };
+}
+
+export function listTriggersRoute(req: Request): Response {
+  const ledger = getLedger();
+  const rows = ledger.listTriggers();
+  const byName = new Map(rows.map((r) => [r.name, r]));
+  const seen = new Set<string>();
+  const views: TriggerView[] = [];
+  // One pair of aggregate reads for the whole list; a trigger's name is its
+  // play name, which is what draft versions are keyed by.
+  const usage = playUsageLoader(ledger);
+  for (const spec of TRIGGERS) {
+    seen.add(spec.name);
+    views.push(
+      toView(
+        spec.name,
+        spec.defaultIntervalMs,
+        byName.get(spec.name) ?? null,
+        spec,
+        usage(spec.name),
+      ),
+    );
+  }
+  // Surface any historical triggers stored in the ledger that no longer exist
+  // in the registry (e.g. a deprecated cohort) so the founder can disable them.
+  for (const row of rows) {
+    if (seen.has(row.name)) continue;
+    views.push(toView(row.name, 24 * 3600 * 1000, row, null, usage(row.name)));
+  }
+  return jsonResponse({ triggers: views }, 200, req);
+}
+
+export async function setTriggerEnabledRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const name = params["name"];
+  if (!name) return jsonResponse({ error: "name required" }, 400, req);
+  let body: { enabled?: boolean } = {};
+  try {
+    body = (await req.json()) as { enabled?: boolean };
+  } catch {
+    return jsonResponse({ error: "invalid JSON body" }, 400, req);
+  }
+  if (typeof body.enabled !== "boolean") {
+    return jsonResponse({ error: "enabled (boolean) required" }, 400, req);
+  }
+  const ledger = getLedger();
+  const stored = ledger.getTrigger(name);
+  const spec = TRIGGERS.find((t) => t.name === name) ?? null;
+  // Readiness gate: block *enabling* an unready trigger so the scheduler
+  // doesn't sit in a loop skipping it every tick. Disabling is always allowed.
+  if (body.enabled && spec) {
+    const config = storedTriggerConfig(stored, spec);
+    const readiness = checkReadiness(spec, config);
+    if (!readiness.ready) {
+      return jsonResponse(
+        {
+          error: `trigger '${name}' not ready: ${readiness.reason}`,
+          name,
+          reason: readiness.reason,
+        },
+        409,
+        req,
+      );
+    }
+  }
+  if (!stored) {
+    if (!spec) return jsonResponse({ error: `unknown trigger '${name}'` }, 404, req);
+    ledger.upsertTrigger({
+      name,
+      configJson: JSON.stringify(spec.defaultConfig),
+      enabled: body.enabled,
+    });
+  } else {
+    ledger.setTriggerEnabled(name, body.enabled);
+  }
+  return jsonResponse({ ok: true, name, enabled: body.enabled }, 200, req);
+}
+
+export async function setTriggerConfigRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const name = params["name"];
+  if (!name) return jsonResponse({ error: "name required" }, 400, req);
+  let body: { config?: unknown } = {};
+  try {
+    body = (await req.json()) as { config?: unknown };
+  } catch {
+    return jsonResponse({ error: "invalid JSON body" }, 400, req);
+  }
+  if (!body.config || typeof body.config !== "object") {
+    return jsonResponse({ error: "config (object) required" }, 400, req);
+  }
+  // A refusal, unlike the warn-tier checks below: `angleAssignment` switches a
+  // measurement on, and a misspelled value would silently keep the fit
+  // classifier, so the founder would read a comparison that never ran.
+  const assignment = (body.config as Record<string, unknown>)["angleAssignment"];
+  if (assignment !== undefined && assignment !== "fit" && assignment !== "arm") {
+    return jsonResponse(
+      { error: "angleAssignment must be 'fit' (default) or 'arm' (even split across angles)" },
+      400,
+      req,
+    );
+  }
+  const ledger = getLedger();
+  const stored = ledger.getTrigger(name);
+  if (!stored) {
+    const spec = TRIGGERS.find((t) => t.name === name);
+    if (!spec) return jsonResponse({ error: `unknown trigger '${name}'` }, 404, req);
+    // A config write must never flip enablement: seeding an opt-in trigger's
+    // row here (e.g. the /setup X card saving an engine choice before the
+    // trigger was ever enabled) keeps the spec's default enablement.
+    ledger.upsertTrigger({
+      name,
+      configJson: JSON.stringify(body.config),
+      enabled: spec.enabledByDefault !== false,
+    });
+  } else {
+    ledger.setTriggerConfig(name, JSON.stringify(body.config));
+  }
+  // Warn-tier edge lint (issue #585): this route is the one place both the
+  // strategist's apply-config chip and the /queue JSON editor write through,
+  // so it is where a founder learns their edge is a single flat pitch. Never
+  // a refusal. The save above already happened; readiness stays a non-empty
+  // check and `yourEdge: "x"` stays a valid fixture.
+  const cfg = body.config as Record<string, unknown>;
+  const edge =
+    typeof cfg["yourEdge"] === "string"
+      ? cfg["yourEdge"]
+      : typeof cfg["yourClaim"] === "string"
+        ? cfg["yourClaim"]
+        : null;
+  const warnings = edge ? lintEdge(edge, edgeLintContext()).map(describeEdgeWarning) : [];
+  if (assignment === "arm" && splitEdgeAngles(edge ?? "").length < 2) {
+    warnings.push(
+      "angleAssignment 'arm' splits prospects across the edge's angles — add at least two `//`-separated angles, or nothing is compared",
+    );
+  }
+  // Warn-tier `play`/`buyerType` validation never refuses the request:
+  // the save above already happened, but a founder routing rows to
+  // design-partner-loi with a missing/invalid buyerType should learn that
+  // immediately rather than discover it only when the trigger silently
+  // reports "not ready" later.
+  if (cfg["play"] === "design-partner-loi") {
+    const buyerType = cfg["buyerType"];
+    if (typeof buyerType !== "string" || !isAllowedDesignPartnerLoiBuyerType(buyerType)) {
+      warnings.push(
+        "buyerType must be 'enterprise', 'government', or 'hardware' to route to design-partner-loi — this trigger will not run until it's set",
+      );
+    }
+    // The routed edge field is a separate readiness gate from buyerType (see
+    // `checkPlayRouteReadiness` in @oneshot-gtm/find): hiring-signal reads
+    // `yourClaim`, every other routable finder reads `yourEdge`. Without this
+    // warning a blank edge saved fine here but silently failed registry
+    // readiness later, with no warning at save time (finding
+    // PRRT_kwDOSKzrBs6mB73_, issue #705 round 1).
+    const routeEdgeKey = name === "hiring-signal" ? "yourClaim" : "yourEdge";
+    const routeEdge = cfg[routeEdgeKey];
+    if (typeof routeEdge !== "string" || routeEdge.trim().length === 0) {
+      warnings.push(
+        `${routeEdgeKey} is required to route to design-partner-loi — this trigger will not run until it's set`,
+      );
+    }
+  }
+  return jsonResponse({ ok: true, name, warnings }, 200, req);
+}
+
+/**
+ * What an opportunity angle may lean on as its fact: the product's own
+ * description. A config read failure only weakens the check (numbers still
+ * count). The lint is guidance and must never fail a save.
+ */
+function edgeLintContext(): EdgeLintContext {
+  try {
+    const cfg = loadConfig();
+    return { factTerms: factTermsFrom(cfg.productOneLiner, cfg.productBrief) };
+  } catch {
+    return {};
+  }
+}
+
+/** Fire-and-forget: 202 on kick-off, 409 if already running. UI polls `GET /api/triggers`. */
+export function runTriggerRoute(req: Request, params: Record<string, string>): Response {
+  const name = params["name"];
+  if (!name) return jsonResponse({ error: "name required" }, 400, req);
+  if (!TRIGGERS.some((t) => t.name === name)) {
+    return jsonResponse({ error: `unknown trigger '${name}'` }, 404, req);
+  }
+  try {
+    fireTriggerNow(name);
+  } catch (err) {
+    const message = (err as Error).message ?? "failed to fire";
+    if (message.includes("already running")) {
+      return jsonResponse({ error: message, name, running: true }, 409, req);
+    }
+    if (message.startsWith("not ready:")) {
+      const reason = message.slice("not ready:".length).trim();
+      return jsonResponse({ error: message, name, reason, ready: false }, 409, req);
+    }
+    return jsonResponse({ error: message }, 500, req);
+  }
+  const view: RunTriggerResult = {
+    name,
+    fired: true,
+    pending: true,
+    result: null,
+    error: null,
+  };
+  return jsonResponse(view, 202, req);
+}

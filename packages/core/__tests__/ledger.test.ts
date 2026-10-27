@@ -1,0 +1,1816 @@
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { Database } from "bun:sqlite";
+import { Ledger } from "../src/ledger.ts";
+import { LEDGER_SCHEMA_VERSION } from "../src/ledger-schema.ts";
+
+let dbPath: string;
+let ledger: Ledger;
+
+beforeEach(() => {
+  dbPath = join(
+    tmpdir(),
+    `oneshot-gtm-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
+  );
+  ledger = new Ledger(dbPath);
+});
+
+afterEach(() => {
+  ledger.close();
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      rmSync(`${dbPath}${suffix}`);
+    } catch {
+      // ignore
+    }
+  }
+});
+
+describe("Ledger schema migration", () => {
+  it("creates an empty ledger with no receipts", () => {
+    expect(ledger.listReceipts()).toEqual([]);
+  });
+
+  it("addColumnIfMissing is idempotent (re-opening doesn't duplicate the phone column)", () => {
+    ledger.close();
+    const second = new Ledger(dbPath);
+    expect(() => second.upsertProspect({ name: "x", email: "x@y.com", source: "t" })).not.toThrow();
+    second.close();
+  });
+
+  it("stores product research cache entries and expires old reads", () => {
+    ledger.setProductResearchCache("https://acme.dev", '{"version":1}');
+    expect(ledger.getProductResearchCache("https://acme.dev", 60_000)).toBe('{"version":1}');
+    expect(ledger.getProductResearchCache("https://acme.dev", -1)).toBeNull();
+  });
+
+  it("persists webhook replay keys across ledger instances and expires them", () => {
+    expect(ledger.consumeWebhookReplay("signed-event", 2_000, 1_000)).toBe(true);
+    ledger.close();
+    ledger = new Ledger(dbPath);
+    expect(ledger.consumeWebhookReplay("signed-event", 2_000, 1_500)).toBe(false);
+    expect(ledger.consumeWebhookReplay("signed-event", 3_000, 2_001)).toBe(true);
+  });
+
+  it("releases a consumed webhook replay key so it can be consumed again", () => {
+    expect(ledger.consumeWebhookReplay("signed-event", 2_000, 1_000)).toBe(true);
+    expect(ledger.consumeWebhookReplay("signed-event", 2_000, 1_100)).toBe(false);
+    ledger.releaseWebhookReplay("signed-event");
+    expect(ledger.consumeWebhookReplay("signed-event", 2_000, 1_200)).toBe(true);
+  });
+
+  it("releasing an unknown webhook replay key is a no-op", () => {
+    expect(() => ledger.releaseWebhookReplay("never-consumed")).not.toThrow();
+  });
+
+  it("lists only new pending queue rows after a queue watermark", () => {
+    const before = ledger.latestQueueId();
+    ledger.enqueueTarget({
+      playName: "x",
+      payload: { email: "a@x.dev" },
+      dedupeKey: "a",
+      source: "t",
+    });
+    ledger.enqueueTarget({
+      playName: "x",
+      payload: { email: "b@x.dev" },
+      dedupeKey: "b",
+      source: "t",
+      initialStatus: "rejected",
+    });
+    expect(ledger.listPendingQueueAfterId(before).map((row) => row.dedupe_key)).toEqual(["a"]);
+  });
+
+  it("fresh-install schema (tables, columns, indexes, triggers, schema_version) matches the snapshot", () => {
+    // Deterministic proof that extracting the migration DDL into
+    // ledger-schema.ts (issue #452) didn't change what a fresh install
+    // produces. sqlite_master carries every table/index/trigger's exact
+    // CREATE statement; schema_version is the migration's own version
+    // marker. If this snapshot ever needs updating, confirm the DDL change
+    // was intentional before accepting the new baseline.
+    const db = (ledger as unknown as { db: Database }).db;
+    const objects = db
+      .query(
+        `SELECT type, name, tbl_name, sql FROM sqlite_master
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+         ORDER BY type, name`,
+      )
+      .all() as Array<{ type: string; name: string; tbl_name: string; sql: string }>;
+    const version = db.query("SELECT version FROM schema_version").all() as Array<{
+      version: number;
+    }>;
+    expect({ objects, version }).toMatchSnapshot();
+    // The real schema version; sqlite_master doesn't record it.
+    expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: LEDGER_SCHEMA_VERSION });
+  });
+});
+
+describe("Ledger receipts + prospects + spend rollups", () => {
+  it("records and reads a receipt", () => {
+    const id = ledger.recordReceipt({
+      playName: "show-hn",
+      callType: "email.send",
+      costUsd: 0.05,
+      signedReceipt: { email: { id: "abc-123" } },
+      oneshotRequestId: "abc-123",
+    });
+    expect(id).toBeGreaterThan(0);
+    const r = ledger.getReceipt(id);
+    expect(r?.play_name).toBe("show-hn");
+    expect(r?.cost_usd).toBe(0.05);
+    expect(r?.oneshot_request_id).toBe("abc-123");
+  });
+
+  it("recordReceipt is idempotent on a non-null oneshot_request_id (SDK replay / double-fire)", () => {
+    const first = ledger.recordReceipt({
+      playName: "inbox-reply",
+      callType: "email.reply",
+      costUsd: 0.01,
+      oneshotRequestId: "job-xyz",
+    });
+    // A retry of the same send (idempotency replay returns the original job id)
+    // must NOT create a second receipt or double-count spend.
+    const replay = ledger.recordReceipt({
+      playName: "inbox-reply",
+      callType: "email.reply",
+      costUsd: 0.01,
+      oneshotRequestId: "job-xyz",
+    });
+    expect(replay).toBe(first);
+    const spend = ledger.spendByPlay().find((r) => r.play_name === "inbox-reply");
+    expect(spend?.calls).toBe(1);
+    expect(spend?.total_usd).toBeCloseTo(0.01);
+  });
+
+  it("recordReceipt does NOT collapse receipts with a null request_id", () => {
+    const a = ledger.recordReceipt({ playName: "p", callType: "email.send", costUsd: 0.02 });
+    const b = ledger.recordReceipt({ playName: "p", callType: "email.send", costUsd: 0.02 });
+    expect(b).not.toBe(a);
+  });
+
+  it("upsertProspect dedupes by email", () => {
+    const a = ledger.upsertProspect({
+      name: "Sam",
+      email: "sam@x.dev",
+      company: "X",
+      source: "show-hn",
+    });
+    const b = ledger.upsertProspect({
+      name: "Sam",
+      email: "sam@x.dev",
+      company: "X",
+      source: "show-hn",
+    });
+    expect(a).toBe(b);
+  });
+
+  it("normalizes prospect email on store + lookup (reply matching is case-insensitive)", () => {
+    // A prospect created from a mixed-case address must still be found when a
+    // reply comes in normalized to lowercase (cadence inbox poll), and we must
+    // not create a duplicate row for the same address in a different case.
+    const id = ledger.upsertProspect({
+      name: "Sophia",
+      email: "Sophia@AgenticArchitect.AI",
+      source: "t",
+    });
+    expect(ledger.findProspectByEmail("sophia@agenticarchitect.ai")?.id).toBe(id);
+    expect(ledger.findProspectByEmail("SOPHIA@AGENTICARCHITECT.AI")?.id).toBe(id);
+    expect(ledger.getProspectByEmail("sophia@agenticarchitect.ai")?.id).toBe(id);
+    // Re-upsert under yet another casing → same row, no duplicate.
+    const again = ledger.upsertProspect({
+      name: "Sophia",
+      email: "sophia@AGENTICARCHITECT.ai",
+      source: "t",
+    });
+    expect(again).toBe(id);
+  });
+
+  it("spendByPlay groups receipts and sums cost", () => {
+    ledger.recordReceipt({ playName: "show-hn", callType: "email.send", costUsd: 0.1 });
+    ledger.recordReceipt({ playName: "show-hn", callType: "research.deep", costUsd: 0.4 });
+    ledger.recordReceipt({ playName: "job-change", callType: "enrich.profile", costUsd: 0.2 });
+    const out = ledger.spendByPlay();
+    const showHn = out.find((r) => r.play_name === "show-hn");
+    const jc = out.find((r) => r.play_name === "job-change");
+    expect(showHn?.calls).toBe(2);
+    expect(showHn?.total_usd).toBeCloseTo(0.5);
+    expect(jc?.calls).toBe(1);
+    expect(jc?.total_usd).toBeCloseTo(0.2);
+  });
+
+  it("listSequenceEventsForProspectPlay filters by prospect+play+status and orders by step", () => {
+    const pidA = ledger.upsertProspect({ name: "A", email: "a@x.com", source: "t" });
+    const pidB = ledger.upsertProspect({ name: "B", email: "b@x.com", source: "t" });
+    ledger.recordSequenceEvent({
+      prospectId: pidA,
+      playName: "stack-consolidation",
+      stepIndex: 1,
+      channel: "email",
+      status: "sent",
+      metadata: { subject: "s1", body: "b1" },
+    });
+    ledger.recordSequenceEvent({
+      prospectId: pidA,
+      playName: "stack-consolidation",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+      metadata: { subject: "s0", body: "b0" },
+    });
+    // Wrong play: should be excluded.
+    ledger.recordSequenceEvent({
+      prospectId: pidA,
+      playName: "show-hn",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    // Non-final status: should be excluded.
+    ledger.recordSequenceEvent({
+      prospectId: pidA,
+      playName: "stack-consolidation",
+      stepIndex: 2,
+      channel: "email",
+      status: "queued",
+    });
+    // Wrong prospect: should be excluded.
+    ledger.recordSequenceEvent({
+      prospectId: pidB,
+      playName: "stack-consolidation",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    const rows = ledger.listSequenceEventsForProspectPlay(pidA, "stack-consolidation");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.step_index).toBe(0);
+    expect(rows[1]?.step_index).toBe(1);
+  });
+
+  it("listSequenceEventsForCadences batches many pairs in one query, preserving per-key order", () => {
+    const pidA = ledger.upsertProspect({ name: "A", email: "ba@x.com", source: "t" });
+    const pidB = ledger.upsertProspect({ name: "B", email: "bb@x.com", source: "t" });
+    // pidA · stack-consolidation: steps 1 then 0 inserted → expect (0, 1) on read.
+    ledger.recordSequenceEvent({
+      prospectId: pidA,
+      playName: "stack-consolidation",
+      stepIndex: 1,
+      channel: "email",
+      status: "sent",
+    });
+    ledger.recordSequenceEvent({
+      prospectId: pidA,
+      playName: "stack-consolidation",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    // pidA · show-hn: should land in its own bucket, not mixed with stack-consolidation.
+    ledger.recordSequenceEvent({
+      prospectId: pidA,
+      playName: "show-hn",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    // pidB · stack-consolidation: separate bucket again.
+    ledger.recordSequenceEvent({
+      prospectId: pidB,
+      playName: "stack-consolidation",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    // queued status: should be filtered out everywhere.
+    ledger.recordSequenceEvent({
+      prospectId: pidA,
+      playName: "stack-consolidation",
+      stepIndex: 2,
+      channel: "email",
+      status: "queued",
+    });
+
+    const map = ledger.listSequenceEventsForCadences([
+      { prospectId: pidA, playName: "stack-consolidation" },
+      { prospectId: pidA, playName: "show-hn" },
+      { prospectId: pidB, playName: "stack-consolidation" },
+    ]);
+    expect(map.size).toBe(3);
+    expect(map.get(`${pidA}|stack-consolidation`)?.map((r) => r.step_index)).toEqual([0, 1]);
+    expect(map.get(`${pidA}|show-hn`)?.map((r) => r.step_index)).toEqual([0]);
+    expect(map.get(`${pidB}|stack-consolidation`)?.map((r) => r.step_index)).toEqual([0]);
+  });
+
+  it("listSequenceEventsForCadences returns empty map on empty input", () => {
+    const map = ledger.listSequenceEventsForCadences([]);
+    expect(map.size).toBe(0);
+  });
+
+  it("listSequenceEventsForCadences omits pairs with no matching rows", () => {
+    const pid = ledger.upsertProspect({ name: "P", email: "p@x.com", source: "t" });
+    ledger.recordSequenceEvent({
+      prospectId: pid,
+      playName: "show-hn",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    const map = ledger.listSequenceEventsForCadences([
+      { prospectId: pid, playName: "show-hn" },
+      { prospectId: pid, playName: "no-such-play" },
+      { prospectId: 999999, playName: "show-hn" },
+    ]);
+    expect(map.size).toBe(1);
+    expect(map.has(`${pid}|show-hn`)).toBe(true);
+  });
+
+  it("eventsByPlay aggregates sequence statuses", () => {
+    const id = ledger.upsertProspect({ name: "A", email: "a@x.com", source: "t" });
+    ledger.recordSequenceEvent({
+      prospectId: id,
+      playName: "show-hn",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    ledger.recordSequenceEvent({
+      prospectId: id,
+      playName: "show-hn",
+      stepIndex: 0,
+      channel: "email",
+      status: "replied",
+    });
+    const out = ledger.eventsByPlay();
+    const show = out.find((r) => r.play_name === "show-hn");
+    expect(show?.sent).toBe(2);
+    expect(show?.replied).toBe(1);
+  });
+
+  it("eventsByPlay respects an untilIso upper bound", () => {
+    const id = ledger.upsertProspect({ name: "UB", email: "ub@x.com", source: "t" });
+    const db = (
+      ledger as unknown as {
+        db: { query(s: string): { run(...a: unknown[]): unknown } };
+      }
+    ).db;
+    db.query(
+      `INSERT INTO sequence_events (prospect_id, play_name, step_index, channel, status, created_at)
+       VALUES (?, ?, 0, 'email', 'sent', '2026-08-27 12:00:00')`,
+    ).run(id, "show-hn");
+    db.query(
+      `INSERT INTO sequence_events (prospect_id, play_name, step_index, channel, status, created_at)
+       VALUES (?, ?, 0, 'email', 'sent', '2026-08-28 12:00:00')`,
+    ).run(id, "show-hn");
+    const bounded = ledger
+      .eventsByPlay({ sinceIso: "2026-08-27 00:00:00", untilIso: "2026-08-28 00:00:00" })
+      .find((r) => r.play_name === "show-hn");
+    expect(bounded?.sent).toBe(1);
+
+    const unbounded = ledger
+      .eventsByPlay({ sinceIso: "2026-08-27 00:00:00" })
+      .find((r) => r.play_name === "show-hn");
+    expect(unbounded?.sent).toBe(2);
+  });
+
+  it("eventsByPlay windows a reply by its OWN occurrence day, not the day it was sent, when occurrenceWindow is requested", () => {
+    // markLatestStepReplied flips the sent row in place, so created_at stays
+    // pinned to the send date. A date-windowed rollup (the Slack daily
+    // summary) opts into occurrenceWindow so it must not drop the reply just
+    // because it landed after the send day's window. It should show up on
+    // the day it actually happened. Without occurrenceWindow (the default,
+    // relied on by home.ts/measure.ts/weekly-review.ts), the reply stays
+    // windowed on created_at like everything else, preserving replied<=sent.
+    const id = ledger.upsertProspect({ name: "RW", email: "rw@x.com", source: "t" });
+    ledger.recordSequenceEvent({
+      prospectId: id,
+      playName: "repo-interest",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    const db = (
+      ledger as unknown as {
+        db: { query(s: string): { run(...a: unknown[]): unknown } };
+      }
+    ).db;
+    // Back-date the send far outside the window we'll query below.
+    db.query(
+      `UPDATE sequence_events SET created_at = '2026-08-20 09:00:00' WHERE prospect_id = ?`,
+    ).run(id);
+    // The reply itself happens on 2026-08-28: inside the window we query.
+    db.query(
+      `UPDATE sequence_events SET status = 'replied', replied_at = '2026-08-28 10:00:00' WHERE prospect_id = ?`,
+    ).run(id);
+
+    // A window covering only the REPLY day, nowhere near the send day.
+    // occurrenceWindow: true credits the reply here, but that also means
+    // `sent` for this window is 0 (the send row's created_at doesn't fall
+    // inside it), which is the intentional, documented replied>sent tradeoff
+    // of this mode; asserting it here pins that tradeoff so a future change
+    // can't silently widen occurrenceWindow's blast radius without a test
+    // noticing.
+    const windowed = ledger
+      .eventsByPlay({
+        sinceIso: "2026-08-28 00:00:00",
+        untilIso: "2026-08-29 00:00:00",
+        occurrenceWindow: true,
+      })
+      .find((r) => r.play_name === "repo-interest");
+    expect(windowed?.replied).toBe(1);
+    expect(windowed?.sent ?? 0).toBe(0);
+
+    // The default (no occurrenceWindow) call windows replied on created_at
+    // like every other column, so the reply-day window sees nothing at all:
+    // this is the behaviour home.ts/measure.ts/weekly-review.ts depend on.
+    const defaultWindowed = ledger
+      .eventsByPlay({ sinceIso: "2026-08-28 00:00:00", untilIso: "2026-08-29 00:00:00" })
+      .find((r) => r.play_name === "repo-interest");
+    expect(defaultWindowed).toBeUndefined();
+
+    // A window covering only the SEND day must NOT double-count the reply:
+    // the old created_at-only windowing would have credited it here instead.
+    const sendDayWindow = ledger
+      .eventsByPlay({
+        sinceIso: "2026-08-20 00:00:00",
+        untilIso: "2026-08-21 00:00:00",
+        occurrenceWindow: true,
+      })
+      .find((r) => r.play_name === "repo-interest");
+    expect(sendDayWindow?.sent).toBe(1);
+    expect(sendDayWindow?.replied ?? 0).toBe(0);
+  });
+
+  it("eventsByPlay windows a bounce by its OWN occurrence day, not the poll/detection day, when occurrenceWindow is requested", () => {
+    // recordSequenceEvent always inserts a FRESH row for a bounce (unlike the
+    // reply flip-in-place), so created_at looks like occurrence time, but
+    // it's actually the time pollInboxBounces detected the DSN, which can lag
+    // the provider's own bounce timestamp (bounced_at) by however long the
+    // mailbox went unpolled. A date-windowed rollup (the Slack daily summary)
+    // opts into occurrenceWindow so it must not attribute the bounce to the
+    // detection day instead of the day it actually happened.
+    const id = ledger.upsertProspect({ name: "BW", email: "bw@x.com", source: "t" });
+    ledger.recordSequenceEvent({
+      prospectId: id,
+      playName: "post-funding",
+      stepIndex: 0,
+      channel: "email",
+      status: "bounced",
+      bouncedAt: "2026-08-20 09:00:00",
+    });
+    const db = (
+      ledger as unknown as {
+        db: { query(s: string): { run(...a: unknown[]): unknown } };
+      }
+    ).db;
+    // Back-date created_at to the (late) POLL day, far outside the window
+    // we'll query below: bounced_at (set above, at insert time) stays put.
+    db.query(
+      `UPDATE sequence_events SET created_at = '2026-08-28 10:00:00' WHERE prospect_id = ?`,
+    ).run(id);
+
+    // A window covering only the real BOUNCE day, nowhere near the poll day.
+    const windowed = ledger
+      .eventsByPlay({
+        sinceIso: "2026-08-20 00:00:00",
+        untilIso: "2026-08-21 00:00:00",
+        occurrenceWindow: true,
+      })
+      .find((r) => r.play_name === "post-funding");
+    expect(windowed?.bounced).toBe(1);
+
+    // The default (no occurrenceWindow) call windows bounced on created_at
+    // like every other column, so the bounce-day window sees nothing at all.
+    const defaultWindowed = ledger
+      .eventsByPlay({ sinceIso: "2026-08-20 00:00:00", untilIso: "2026-08-21 00:00:00" })
+      .find((r) => r.play_name === "post-funding");
+    expect(defaultWindowed).toBeUndefined();
+
+    // A window covering only the POLL day must NOT count the bounce there:
+    // the old created_at-only windowing would have credited it here instead.
+    const pollDayWindow = ledger
+      .eventsByPlay({
+        sinceIso: "2026-08-28 00:00:00",
+        untilIso: "2026-08-29 00:00:00",
+        occurrenceWindow: true,
+      })
+      .find((r) => r.play_name === "post-funding");
+    expect(pollDayWindow?.bounced ?? 0).toBe(0);
+  });
+});
+
+describe("Ledger cadence state", () => {
+  it("enroll + advance + setStatus round-trip", () => {
+    const pid = ledger.upsertProspect({ name: "B", email: "b@x.com", source: "t" });
+    const due = new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString();
+    ledger.enrollCadence({ prospectId: pid, playName: "job-change", nextDueAt: due });
+
+    const active = ledger.listAllCadences();
+    expect(active).toHaveLength(1);
+    expect(active[0]?.status).toBe("active");
+    expect(active[0]?.current_step).toBe(0);
+
+    ledger.advanceCadence({
+      prospectId: pid,
+      playName: "job-change",
+      newStep: 1,
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.setCadenceStatus({ prospectId: pid, playName: "job-change", status: "replied" });
+
+    const after = ledger.listAllCadences();
+    expect(after[0]?.current_step).toBe(1);
+    expect(after[0]?.status).toBe("replied");
+  });
+
+  it("records a send error and clears it on advance / status change", () => {
+    const pid = ledger.upsertProspect({ name: "E", email: "e@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "repo-interest",
+      nextDueAt: new Date().toISOString(),
+    });
+    // Fresh enroll: no error.
+    expect(ledger.getCadence(pid, "repo-interest")?.last_send_error).toBeNull();
+
+    ledger.recordCadenceSendError({
+      prospectId: pid,
+      playName: "repo-interest",
+      error: "Job failed: Tool execution failed. (ref: abc)",
+    });
+    const failed = ledger.getCadence(pid, "repo-interest");
+    expect(failed?.last_send_error).toContain("Tool execution failed");
+    expect(failed?.last_send_error_at).not.toBeNull();
+
+    // A successful advance clears it.
+    ledger.advanceCadence({
+      prospectId: pid,
+      playName: "repo-interest",
+      newStep: 1,
+      nextDueAt: new Date().toISOString(),
+    });
+    expect(ledger.getCadence(pid, "repo-interest")?.last_send_error).toBeNull();
+
+    // Re-fail, then a status change (e.g. replied) also clears it.
+    ledger.recordCadenceSendError({ prospectId: pid, playName: "repo-interest", error: "again" });
+    expect(ledger.getCadence(pid, "repo-interest")?.last_send_error).toBe("again");
+    ledger.setCadenceStatus({ prospectId: pid, playName: "repo-interest", status: "replied" });
+    expect(ledger.getCadence(pid, "repo-interest")?.last_send_error).toBeNull();
+
+    // Re-enrolling the same prospect (play re-run) must clear a stale error:
+    // a re-activated cadence shouldn't show a failure from a prior cycle.
+    ledger.recordCadenceSendError({ prospectId: pid, playName: "repo-interest", error: "stale" });
+    expect(ledger.getCadence(pid, "repo-interest")?.last_send_error).toBe("stale");
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "repo-interest",
+      nextDueAt: new Date().toISOString(),
+    });
+    expect(ledger.getCadence(pid, "repo-interest")?.last_send_error).toBeNull();
+  });
+
+  it("getCadence + listCadencesForProspect + getProspectById are index-seek single lookups", () => {
+    const pid = ledger.upsertProspect({ name: "Q", email: "q@x.com", company: "QCo", source: "t" });
+    const due = new Date().toISOString();
+    ledger.enrollCadence({ prospectId: pid, playName: "job-change", nextDueAt: due });
+    ledger.enrollCadence({ prospectId: pid, playName: "show-hn", nextDueAt: due });
+
+    // getCadence: exact (prospect, play) seek, joined with prospect fields.
+    const c = ledger.getCadence(pid, "job-change");
+    expect(c?.play_name).toBe("job-change");
+    expect(c?.prospect_email).toBe("q@x.com");
+    expect(c?.prospect_company).toBe("QCo");
+    expect(ledger.getCadence(pid, "no-such-play")).toBeNull();
+    expect(ledger.getCadence(999999, "job-change")).toBeNull();
+
+    // listCadencesForProspect: all cadences for one prospect.
+    const list = ledger.listCadencesForProspect(pid);
+    expect(list.map((r) => r.play_name).toSorted()).toEqual(["job-change", "show-hn"]);
+    expect(ledger.listCadencesForProspect(999999)).toEqual([]);
+
+    // getProspectById: PK seek.
+    expect(ledger.getProspectById(pid)?.email).toBe("q@x.com");
+    expect(ledger.getProspectById(999999)).toBeNull();
+  });
+
+  it("listActiveCadences filters by due date", () => {
+    const p1 = ledger.upsertProspect({ name: "P1", email: "p1@x.com", source: "t" });
+    const p2 = ledger.upsertProspect({ name: "P2", email: "p2@x.com", source: "t" });
+    const past = new Date(Date.now() - 1000).toISOString();
+    const future = new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString();
+    ledger.enrollCadence({ prospectId: p1, playName: "show-hn", nextDueAt: past });
+    ledger.enrollCadence({ prospectId: p2, playName: "show-hn", nextDueAt: future });
+
+    const due = ledger.listActiveCadences({ dueByIso: new Date().toISOString() });
+    expect(due).toHaveLength(1);
+    expect(due[0]?.prospect_email).toBe("p1@x.com");
+  });
+
+  it("skip transition: recordSequenceEvent('skipped') + advanceCadence moves the step and leaves the skip in history", () => {
+    const pid = ledger.upsertProspect({ name: "SK", email: "sk@x.com", source: "t" });
+    const firstDue = new Date().toISOString();
+    ledger.enrollCadence({ prospectId: pid, playName: "job-change", nextDueAt: firstDue });
+    expect(ledger.getCadence(pid, "job-change")?.current_step).toBe(0);
+
+    // Founder skips step 0 (e.g. a direct-mail step with nothing to send):
+    // the skip is recorded as history at the step it replaces, then the
+    // cadence advances past it exactly as a real send would.
+    ledger.recordSequenceEvent({
+      prospectId: pid,
+      playName: "job-change",
+      stepIndex: 0,
+      channel: "email",
+      status: "skipped",
+      metadata: { reason: "skipped by founder" },
+    });
+    const nextDue = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+    ledger.advanceCadence({
+      prospectId: pid,
+      playName: "job-change",
+      newStep: 1,
+      nextDueAt: nextDue,
+    });
+
+    const cadence = ledger.getCadence(pid, "job-change");
+    expect(cadence?.current_step).toBe(1);
+    expect(cadence?.status).toBe("active");
+    expect(cadence?.next_due_at).toBe(nextDue);
+
+    // The skip survives in the play's history for this exact step index:
+    // listSequenceEventsForProspectPlay explicitly includes 'skipped' rows
+    // (unlike raw send counters) so the timeline can show why step 0 never went out.
+    const history = ledger.listSequenceEventsForProspectPlay(pid, "job-change");
+    expect(history).toHaveLength(1);
+    expect(history[0]?.status).toBe("skipped");
+    expect(history[0]?.step_index).toBe(0);
+  });
+
+  it("stop transition: stopCadence sets terminal state, clears in-flight fields, and expires a queued breakup-revive row", () => {
+    const pid = ledger.upsertProspect({ name: "ST", email: "st@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "job-change",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.setCadenceDraft({
+      prospectId: pid,
+      playName: "job-change",
+      draft: { subject: "s", body: "b", flags: [], payload: null },
+    });
+    expect(ledger.getCadenceDraft({ prospectId: pid, playName: "job-change" })).not.toBeNull();
+
+    // A queued breakup-revive row for this prospect should be expired the
+    // moment the live cadence stops (it's the same signal: don't re-engage).
+    const queueId = ledger.enqueueTarget({
+      playName: "breakup-revive",
+      payload: { prospectId: pid },
+      dedupeKey: `prospect:${pid}`,
+      source: "t",
+    });
+    expect(queueId).not.toBeNull();
+    ledger.setQueueProspectId(queueId!, pid);
+
+    const changed = ledger.stopCadence({
+      prospectId: pid,
+      playName: "job-change",
+      reason: "not_a_fit",
+      note: "wrong stage",
+    });
+    expect(changed).toBe(true);
+
+    const cadence = ledger.getCadence(pid, "job-change");
+    expect(cadence?.status).toBe("stopped");
+    expect(cadence?.stop_reason).toBe("not_a_fit");
+    expect(cadence?.next_due_at).toBeNull();
+    // The draft is cleared as part of the same stop. A stopped cadence
+    // shouldn't leave a sendable preview hanging around.
+    expect(ledger.getCadenceDraft({ prospectId: pid, playName: "job-change" })).toBeNull();
+
+    // The breakup-revive backstop reads this exact hold via breakupReviveHoldFor.
+    const hold = ledger.breakupReviveHoldFor("st@x.com");
+    expect(hold?.reason).toBe("not_a_fit");
+    expect(hold?.stopped_at).toBeTruthy();
+
+    const queueRow = ledger.getQueueRow(queueId!);
+    expect(queueRow?.status).toBe("expired");
+
+    // A second stop call is a no-op (already-terminal cadence): no row to update.
+    expect(ledger.stopCadence({ prospectId: pid, playName: "job-change", reason: "other" })).toBe(
+      false,
+    );
+  });
+});
+
+describe("Ledger cadence sending marker", () => {
+  it("claim succeeds when marker is NULL; second claim fails (atomic CAS)", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "s@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    const first = ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date().toISOString(),
+    });
+    expect(first).toBe(true);
+    const second = ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date().toISOString(),
+    });
+    expect(second).toBe(false);
+  });
+
+  it("claim succeeds when previous marker is older than the stale cutoff", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "s2@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    const oldIso = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // 10 min ago
+    ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: oldIso,
+    });
+    const reclaim = ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date().toISOString(),
+      staleCutoffIso: new Date(Date.now() - 5 * 60 * 1000).toISOString(), // 5 min cutoff
+    });
+    expect(reclaim).toBe(true);
+  });
+
+  it("clearCadenceSendingMarker sets the marker back to NULL", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "s3@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date().toISOString(),
+    });
+    expect(ledger.getCadence(pid, "show-hn")?.sending_started_at).not.toBeNull();
+    ledger.clearCadenceSendingMarker({ prospectId: pid, playName: "show-hn" });
+    expect(ledger.getCadence(pid, "show-hn")?.sending_started_at).toBeNull();
+  });
+
+  it("advanceCadence also clears sending_started_at as part of the same UPDATE", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "s4@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date().toISOString(),
+    });
+    ledger.advanceCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      newStep: 1,
+      nextDueAt: null,
+    });
+    expect(ledger.getCadence(pid, "show-hn")?.sending_started_at).toBeNull();
+  });
+
+  it("setCadenceStatus to non-active terminal state clears the marker", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "s5@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date().toISOString(),
+    });
+    ledger.setCadenceStatus({ prospectId: pid, playName: "show-hn", status: "replied" });
+    expect(ledger.getCadence(pid, "show-hn")?.sending_started_at).toBeNull();
+  });
+});
+
+describe("Ledger sweepStaleCadenceSends", () => {
+  it("maxAgeMs:0 (cold-boot semantics) sweeps every existing marker", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "sa@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date(Date.now() - 1000).toISOString(),
+    });
+    const swept = ledger.sweepStaleCadenceSends({ now: new Date(), maxAgeMs: 0 });
+    expect(swept).toHaveLength(1);
+    expect(swept[0]?.actuallySent).toBe(false);
+    expect(ledger.getCadence(pid, "show-hn")?.sending_started_at).toBeNull();
+  });
+
+  it("classifies as actuallySent when a sequence_event for current_step exists", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "sb@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.recordSequenceEvent({
+      prospectId: pid,
+      playName: "show-hn",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date(Date.now() - 1000).toISOString(),
+    });
+    const swept = ledger.sweepStaleCadenceSends({ now: new Date(), maxAgeMs: 0 });
+    expect(swept[0]?.actuallySent).toBe(true);
+  });
+
+  it("leaves fresh markers untouched (maxAgeMs > 0)", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "sc@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date().toISOString(),
+    });
+    const swept = ledger.sweepStaleCadenceSends({
+      now: new Date(),
+      maxAgeMs: 5 * 60 * 1000,
+    });
+    expect(swept).toHaveLength(0);
+    expect(ledger.getCadence(pid, "show-hn")?.sending_started_at).not.toBeNull();
+  });
+
+  it("classifies as actuallySent when the in-flight step (current_step + 1) has an event", () => {
+    // The real crash case: marker claimed while current_step still 0, the send
+    // recorded at nextIndex = 1, then the process died before advanceCadence.
+    // The sweep must look at current_step + 1, not current_step.
+    const pid = ledger.upsertProspect({ name: "S", email: "sd@x.com", source: "t" });
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "show-hn",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.recordSequenceEvent({
+      prospectId: pid,
+      playName: "show-hn",
+      stepIndex: 1,
+      channel: "email",
+      status: "sent",
+    });
+    ledger.claimCadenceSendingMarker({
+      prospectId: pid,
+      playName: "show-hn",
+      startedAtIso: new Date(Date.now() - 1000).toISOString(),
+    });
+    const swept = ledger.sweepStaleCadenceSends({ now: new Date(), maxAgeMs: 0 });
+    expect(swept[0]?.actuallySent).toBe(true);
+  });
+});
+
+describe("Ledger hasSentSequenceEvent", () => {
+  it("is false with no event, true once a terminal-sent event exists at that step", () => {
+    const pid = ledger.upsertProspect({ name: "S", email: "se@x.com", source: "t" });
+    expect(ledger.hasSentSequenceEvent(pid, "show-hn", 1)).toBe(false);
+    ledger.recordSequenceEvent({
+      prospectId: pid,
+      playName: "show-hn",
+      stepIndex: 1,
+      channel: "email",
+      status: "sent",
+    });
+    expect(ledger.hasSentSequenceEvent(pid, "show-hn", 1)).toBe(true);
+    // Scoped to the exact (play, step). A different step / play is still unsent.
+    expect(ledger.hasSentSequenceEvent(pid, "show-hn", 2)).toBe(false);
+    expect(ledger.hasSentSequenceEvent(pid, "job-change", 1)).toBe(false);
+  });
+});
+
+describe("Ledger queue sending marker", () => {
+  function enqueue(): number {
+    const id = ledger.enqueueTarget({
+      playName: "show-hn",
+      payload: { email: "x@y.dev" },
+      dedupeKey: `key-${Math.random()}`,
+      source: "test",
+      initialStatus: "approved",
+    });
+    if (id == null) throw new Error("enqueue failed");
+    return id;
+  }
+
+  it("claim succeeds when marker is NULL; second claim fails", () => {
+    const id = enqueue();
+    expect(ledger.claimQueueSendingMarker({ id, startedAtIso: new Date().toISOString() })).toBe(
+      true,
+    );
+    expect(ledger.claimQueueSendingMarker({ id, startedAtIso: new Date().toISOString() })).toBe(
+      false,
+    );
+  });
+
+  it("claim fails after the row leaves approved status", () => {
+    const id = enqueue();
+    ledger.setQueueStatus({ id, status: "expired" });
+    expect(ledger.claimQueueSendingMarker({ id, startedAtIso: new Date().toISOString() })).toBe(
+      false,
+    );
+  });
+
+  it("reclaim succeeds when previous marker is older than the stale cutoff", () => {
+    const id = enqueue();
+    ledger.claimQueueSendingMarker({
+      id,
+      startedAtIso: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    });
+    expect(
+      ledger.claimQueueSendingMarker({
+        id,
+        startedAtIso: new Date().toISOString(),
+        staleCutoffIso: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      }),
+    ).toBe(true);
+  });
+
+  it("clearQueueSendingMarker sets the marker back to NULL", () => {
+    const id = enqueue();
+    ledger.claimQueueSendingMarker({ id, startedAtIso: new Date().toISOString() });
+    expect(ledger.getQueueRow(id)?.send_started_at).not.toBeNull();
+    ledger.clearQueueSendingMarker(id);
+    expect(ledger.getQueueRow(id)?.send_started_at).toBeNull();
+  });
+
+  it("setQueueStatus(sent/rejected/expired) auto-clears the marker", () => {
+    for (const status of ["sent", "rejected", "expired"] as const) {
+      const id = enqueue();
+      ledger.claimQueueSendingMarker({ id, startedAtIso: new Date().toISOString() });
+      ledger.setQueueStatus({ id, status });
+      expect(ledger.getQueueRow(id)?.send_started_at).toBeNull();
+    }
+  });
+
+  it("sweepStaleQueueSends classifies a stranded (non-sent) marker as actuallySent: false", () => {
+    const id = enqueue();
+    ledger.claimQueueSendingMarker({
+      id,
+      startedAtIso: new Date(Date.now() - 1000).toISOString(),
+    });
+    const swept = ledger.sweepStaleQueueSends({ now: new Date(), maxAgeMs: 0 });
+    expect(swept).toHaveLength(1);
+    expect(swept[0]?.actuallySent).toBe(false);
+    expect(ledger.getQueueRow(id)?.send_started_at).toBeNull();
+  });
+
+  it("sweepStaleQueueSends classifies a sent row's stale marker as actuallySent: true", () => {
+    // Race scenario: SDK send completed AND setQueueStatus('sent') landed, then
+    // the process died before some other path could clear send_started_at.
+    // Simulate by writing the marker AFTER the status flip.
+    const id = enqueue();
+    ledger.setQueueStatus({ id, status: "sent" });
+    // The public claim now refuses terminal rows; write the legacy/crash state directly.
+    const db = new Database(dbPath);
+    db.prepare("UPDATE target_queue SET send_started_at = ? WHERE id = ?").run(
+      new Date(Date.now() - 1000).toISOString(),
+      id,
+    );
+    db.close();
+    const swept = ledger.sweepStaleQueueSends({ now: new Date(), maxAgeMs: 0 });
+    expect(swept).toHaveLength(1);
+    expect(swept[0]?.actuallySent).toBe(true);
+    expect(ledger.getQueueRow(id)?.send_started_at).toBeNull();
+  });
+
+  it("sweep with maxAgeMs > 0 leaves fresh markers untouched", () => {
+    const id = enqueue();
+    ledger.claimQueueSendingMarker({ id, startedAtIso: new Date().toISOString() });
+    const swept = ledger.sweepStaleQueueSends({
+      now: new Date(),
+      maxAgeMs: 5 * 60 * 1000,
+    });
+    expect(swept).toHaveLength(0);
+    expect(ledger.getQueueRow(id)?.send_started_at).not.toBeNull();
+  });
+});
+
+describe("Ledger runs", () => {
+  it("createRun inserts a 'running' row with the right counters", () => {
+    const { runId, startedAt } = ledger.createRun({
+      playName: "repo-interest",
+      dryRun: false,
+      targets: [
+        { email: "a@x.dev", name: "A" },
+        { email: "b@x.dev", name: "B" },
+      ],
+      dedupeKeys: ["queue-a", null],
+    });
+    expect(runId).toBeGreaterThan(0);
+    expect(startedAt).toMatch(/^\d{4}-/);
+    const run = ledger.getRun(runId);
+    expect(run).toMatchObject({
+      playName: "repo-interest",
+      dryRun: false,
+      status: "running",
+      targetCount: 2,
+      draftedCount: 0,
+      sentCount: 0,
+      errorCount: 0,
+      dedupeKeys: ["queue-a", null],
+      completedAt: null,
+    });
+    expect(run?.targets).toHaveLength(2);
+    expect(run?.events).toEqual([]);
+  });
+
+  it("appendRunEvent bumps the right counter per event kind", () => {
+    const { runId } = ledger.createRun({
+      playName: "show-hn",
+      dryRun: false,
+      targets: [{ email: "a@x.dev" }, { email: "b@x.dev" }, { email: "c@x.dev" }],
+    });
+    ledger.appendRunEvent({ runId, event: { kind: "draft", index: 0, subject: "s" } });
+    ledger.appendRunEvent({ runId, event: { kind: "draft", index: 1, subject: "s" } });
+    ledger.appendRunEvent({ runId, event: { kind: "send", index: 0, receiptIds: [1] } });
+    ledger.appendRunEvent({ runId, event: { kind: "error", index: 2, message: "boom" } });
+    ledger.appendRunEvent({ runId, event: { kind: "stage", stage: "done" } });
+    const run = ledger.getRun(runId)!;
+    expect(run.draftedCount).toBe(2);
+    expect(run.sentCount).toBe(1);
+    expect(run.errorCount).toBe(1);
+    expect(run.events).toHaveLength(5);
+  });
+
+  it("appendRunEvent is a no-op for an unknown runId (doesn't throw)", () => {
+    expect(() => ledger.appendRunEvent({ runId: 999999, event: { kind: "draft" } })).not.toThrow();
+  });
+
+  it("markRunComplete flips status + stamps completedAt + records sent emails", () => {
+    const { runId } = ledger.createRun({
+      playName: "show-hn",
+      dryRun: false,
+      targets: [{ email: "a@x.dev" }],
+    });
+    ledger.markRunComplete({
+      runId,
+      status: "done",
+      sentEmails: ["a@x.dev"],
+    });
+    const run = ledger.getRun(runId)!;
+    expect(run.status).toBe("done");
+    expect(run.completedAt).toMatch(/^\d{4}-/);
+    expect(run.prospectEmails).toEqual(["a@x.dev"]);
+  });
+
+  it("markRunComplete on an already-completed row is a no-op (won't overwrite)", () => {
+    const { runId } = ledger.createRun({
+      playName: "show-hn",
+      dryRun: false,
+      targets: [{ email: "a@x.dev" }],
+    });
+    ledger.markRunComplete({ runId, status: "done", sentEmails: ["a@x.dev"] });
+    const firstCompletedAt = ledger.getRun(runId)?.completedAt;
+    ledger.markRunComplete({ runId, status: "interrupted", sentEmails: [] });
+    expect(ledger.getRun(runId)?.status).toBe("done"); // unchanged
+    expect(ledger.getRun(runId)?.completedAt).toBe(firstCompletedAt);
+  });
+
+  it("sweepStaleRuns flips all running rows to interrupted on cold boot (maxAgeMs: 0)", () => {
+    ledger.createRun({ playName: "a", dryRun: false, targets: [{}] });
+    ledger.createRun({ playName: "b", dryRun: true, targets: [{}] });
+    const swept = ledger.sweepStaleRuns({ now: new Date(), maxAgeMs: 0 });
+    expect(swept).toHaveLength(2);
+    for (const s of swept) {
+      expect(ledger.getRun(s.id)?.status).toBe("interrupted");
+      expect(ledger.getRun(s.id)?.completedAt).not.toBeNull();
+    }
+  });
+
+  it("sweepStaleRuns leaves fresh runs alone when maxAgeMs > 0", () => {
+    const { runId } = ledger.createRun({ playName: "a", dryRun: false, targets: [{}] });
+    const swept = ledger.sweepStaleRuns({
+      now: new Date(),
+      maxAgeMs: 5 * 60 * 1000,
+    });
+    expect(swept).toHaveLength(0);
+    expect(ledger.getRun(runId)?.status).toBe("running");
+  });
+
+  it("run.prospectEmails round-trips intact for the /cadences ?sinceRun filter", () => {
+    const { runId } = ledger.createRun({
+      playName: "show-hn",
+      dryRun: false,
+      targets: [{ email: "a@x.dev" }, { email: "b@x.dev" }],
+    });
+    ledger.markRunComplete({
+      runId,
+      status: "done",
+      sentEmails: ["A@X.DEV", "b@x.dev"],
+    });
+    const run = ledger.getRun(runId)!;
+    expect(run.prospectEmails).toEqual(["A@X.DEV", "b@x.dev"]);
+    // Downstream filter (in /api/cadences) lowercases before set-lookup; the
+    // ledger stores verbatim. Verifying the stored shape so we don't regress
+    // case-handling expectations on consumer side.
+  });
+
+  it("appendRunEvent leaves counters alone for non-counter events", () => {
+    const { runId } = ledger.createRun({
+      playName: "show-hn",
+      dryRun: false,
+      targets: [{}],
+    });
+    // verify / stage / runStarted / done / unknown: none of these should
+    // touch drafted/sent/error counters.
+    ledger.appendRunEvent({ runId, event: { kind: "verify", total: 1, verified: 1, dropped: [] } });
+    ledger.appendRunEvent({ runId, event: { kind: "stage", stage: "drafting" } });
+    ledger.appendRunEvent({ runId, event: { kind: "runStarted", runId, startedAt: "now" } });
+    ledger.appendRunEvent({ runId, event: { kind: "done", total: 1, sent: 1 } });
+    ledger.appendRunEvent({ runId, event: { kind: "mystery", foo: "bar" } });
+    const run = ledger.getRun(runId)!;
+    expect(run.draftedCount).toBe(0);
+    expect(run.sentCount).toBe(0);
+    expect(run.errorCount).toBe(0);
+    expect(run.events).toHaveLength(5);
+  });
+
+  it("appendRunEvent recovers when events_json is corrupt (starts a fresh array)", async () => {
+    const { runId } = ledger.createRun({
+      playName: "show-hn",
+      dryRun: false,
+      targets: [{}],
+    });
+    // Stomp events_json with garbage to simulate a partial-write corruption.
+    // We open a parallel Database connection (same file) to issue raw SQL:
+    // ledger.ts intentionally keeps its `db` field private.
+    const { Database } = await import("bun:sqlite");
+    const raw = new Database(dbPath);
+    raw.prepare("UPDATE runs SET events_json = 'not-json' WHERE id = ?").run(runId);
+    raw.close();
+    // appendRunEvent silently parses garbage as [] and appends the new event.
+    ledger.appendRunEvent({ runId, event: { kind: "draft", index: 0 } });
+    const run = ledger.getRun(runId)!;
+    expect(run.events).toHaveLength(1);
+    expect(run.draftedCount).toBe(1);
+  });
+
+  it("listRuns returns empty array when no rows exist", () => {
+    expect(ledger.listRuns()).toEqual([]);
+  });
+
+  it("listRuns filters by status and orders newest-first", async () => {
+    const { runId: a } = ledger.createRun({ playName: "a", dryRun: false, targets: [{}] });
+    // Ensure b's started_at is strictly later than a's.
+    await new Promise<void>((r) => {
+      setTimeout(r, 10);
+    });
+    const { runId: b } = ledger.createRun({ playName: "b", dryRun: false, targets: [{}] });
+    ledger.markRunComplete({ runId: a, status: "done" });
+    const running = ledger.listRuns({ status: "running" });
+    expect(running.map((r) => r.id)).toEqual([b]); // a is done; only b matches
+    const all = ledger.listRuns({});
+    expect(all.map((r) => r.id)).toEqual([b, a]); // newest first
+  });
+
+  it("listRuns returns the slim shape only — no targets/events leakage to the home dashboard", () => {
+    ledger.createRun({
+      playName: "p",
+      dryRun: false,
+      targets: [
+        { email: "a@x.dev", padding: "x".repeat(500) },
+        { email: "b@x.dev", padding: "y".repeat(500) },
+      ],
+    });
+    const rows = ledger.listRuns();
+    expect(rows).toHaveLength(1);
+    // Lock in the slim projection: only these 9 keys come back.
+    expect(Object.keys(rows[0]!).toSorted()).toEqual([
+      "completedAt",
+      "draftedCount",
+      "errorCount",
+      "id",
+      "playName",
+      "sentCount",
+      "startedAt",
+      "status",
+      "targetCount",
+    ]);
+    // Negative assertion: heavy fields stay on the by-id endpoint (getRun).
+    const row = rows[0] as Record<string, unknown>;
+    expect(row["targets"]).toBeUndefined();
+    expect(row["events"]).toBeUndefined();
+    expect(row["prospectEmails"]).toBeUndefined();
+    expect(row["targets_json"]).toBeUndefined();
+    expect(row["events_json"]).toBeUndefined();
+  });
+
+  it("listRuns respects the limit cap", () => {
+    for (let i = 0; i < 7; i++) {
+      ledger.createRun({ playName: `p${i}`, dryRun: false, targets: [{}] });
+    }
+    expect(ledger.listRuns({ limit: 3 })).toHaveLength(3);
+    // Out-of-range limits clamp to [1, 50].
+    expect(ledger.listRuns({ limit: 0 })).toHaveLength(1);
+    expect(ledger.listRuns({ limit: 9999 })).toHaveLength(7);
+  });
+
+  it("sweepStaleRuns skips runs that are already done/interrupted", () => {
+    const { runId: a } = ledger.createRun({ playName: "p", dryRun: false, targets: [{}] });
+    const { runId: b } = ledger.createRun({ playName: "p", dryRun: false, targets: [{}] });
+    ledger.markRunComplete({ runId: a, status: "done" });
+    ledger.markRunComplete({ runId: b, status: "interrupted" });
+    const swept = ledger.sweepStaleRuns({ now: new Date(), maxAgeMs: 0 });
+    expect(swept).toHaveLength(0);
+    expect(ledger.getRun(a)?.status).toBe("done");
+    expect(ledger.getRun(b)?.status).toBe("interrupted");
+  });
+});
+
+describe("Ledger outcomes + cold prospects", () => {
+  it("bulk-reads the latest outcome timestamp per prospect", () => {
+    const first = ledger.upsertProspect({ name: "A", email: "a@x.com", source: "t" });
+    const second = ledger.upsertProspect({ name: "B", email: "b@x.com", source: "t" });
+    ledger.upsertProspect({ name: "C", email: "c@x.com", source: "t" });
+    expect(ledger.listLatestOutcomeRecordedAtByProspect()).toEqual(new Map());
+    const db = new Database(dbPath);
+    try {
+      const insert = db.prepare(
+        "INSERT INTO deal_outcomes(prospect_id, outcome, recorded_at) VALUES (?, 'meeting_booked', ?)",
+      );
+      insert.run(first, "2026-09-07 10:00:00");
+      insert.run(first, "2026-09-06 10:00:00");
+      insert.run(second, "2026-09-05 10:00:00");
+    } finally {
+      db.close();
+    }
+    expect(ledger.listLatestOutcomeRecordedAtByProspect()).toEqual(
+      new Map([
+        [first, "2026-09-07 10:00:00"],
+        [second, "2026-09-05 10:00:00"],
+      ]),
+    );
+  });
+
+  it("recordOutcome + outcomesByPlay", () => {
+    const pid = ledger.upsertProspect({ name: "C", email: "c@x.com", source: "t" });
+    ledger.recordOutcome({ prospectId: pid, playName: "show-hn", outcome: "meeting_booked" });
+    ledger.recordOutcome({
+      prospectId: pid,
+      playName: "show-hn",
+      outcome: "deal_won",
+      amountUsd: 5000,
+    });
+    const out = ledger.outcomesByPlay();
+    const show = out.find((r) => r.play_name === "show-hn");
+    expect(show?.meetings).toBe(1);
+    expect(show?.won).toBe(1);
+    expect(show?.lost).toBe(0);
+  });
+
+  it("never selects an unsubscribed prospect for revival", () => {
+    const pid = ledger.upsertProspect({
+      name: "Opt Out",
+      email: "optout@example.com",
+      source: "test",
+    });
+    ledger.recordSequenceEvent({
+      prospectId: pid,
+      playName: "test",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    const window = { minDaysSinceLastEvent: 0, maxDaysSinceLastEvent: 90 };
+    expect(ledger.listColdProspects(window).map((p) => p.id)).toContain(pid);
+    ledger.enrollCadence({
+      prospectId: pid,
+      playName: "test",
+      nextDueAt: new Date().toISOString(),
+    });
+    ledger.setCadenceStatus({ prospectId: pid, playName: "test", status: "unsubscribed" });
+    expect(ledger.listColdProspects(window).map((p) => p.id)).not.toContain(pid);
+    ledger.setCadenceStatus({ prospectId: pid, playName: "test", status: "active" });
+
+    ledger.recordInboxReply({
+      id: "optout-revival",
+      threadKey: "optout-revival",
+      prospectId: pid,
+      playName: "test",
+      fromEmail: "alternate@example.com",
+      subject: "stop",
+      body: "Don't email me again",
+      receivedAt: new Date().toISOString(),
+      kind: "unsubscribe",
+    });
+    expect(ledger.listColdProspects(window).map((p) => p.id)).not.toContain(pid);
+  });
+
+  it("listColdProspects respects the day window", () => {
+    const pid = ledger.upsertProspect({ name: "D", email: "d@x.com", source: "t" });
+    // Manually backdate a sequence event to 75 days ago by inserting one then UPDATE.
+    ledger.recordSequenceEvent({
+      prospectId: pid,
+      playName: "show-hn",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    // poke the row's timestamp via raw SQL accessor (the ledger doesn't expose one: bypass via internal db)
+    // Since we don't have a setter, just verify the in-window filter excludes this fresh event.
+    const fresh = ledger.listColdProspects({
+      minDaysSinceLastEvent: 60,
+      maxDaysSinceLastEvent: 90,
+    });
+    expect(fresh).toHaveLength(0);
+  });
+});
+
+describe("enrichment cache — negative entries", () => {
+  it("failure write is readable with status 'failed' and the message payload", () => {
+    ledger.setCachedEnrichmentFailure("bad@x.dev", "Job failed: Tool execution failed");
+    const row = ledger.getCachedEnrichment("bad@x.dev");
+    expect(row?.status).toBe("failed");
+    expect(JSON.parse(row!.result_json)).toEqual({
+      failed: true,
+      message: "Job failed: Tool execution failed",
+    });
+  });
+
+  it("a later success upsert clears the failed status", () => {
+    ledger.setCachedEnrichmentFailure("flaky@x.dev", "timeout");
+    ledger.setCachedEnrichment("flaky@x.dev", JSON.stringify({ profile: { phone: "+1 555" } }));
+    const row = ledger.getCachedEnrichment("flaky@x.dev");
+    expect(row?.status).toBeNull();
+    expect(JSON.parse(row!.result_json).profile.phone).toBe("+1 555");
+  });
+
+  it("a later failure overwrites a success entry", () => {
+    ledger.setCachedEnrichment("was-ok@x.dev", JSON.stringify({ profile: {} }));
+    ledger.setCachedEnrichmentFailure("was-ok@x.dev", "revoked");
+    expect(ledger.getCachedEnrichment("was-ok@x.dev")?.status).toBe("failed");
+  });
+});
+
+describe("Ledger recordCadenceReply — atomic control + analytics write", () => {
+  function enrollWithSentStep(): number {
+    const id = ledger.upsertProspect({ name: "Pat", email: "pat@co.com", source: "repo-interest" });
+    ledger.enrollCadence({
+      prospectId: id,
+      playName: "repo-interest",
+      nextDueAt: "2026-01-01T00:00:00Z",
+    });
+    ledger.recordSequenceEvent({
+      prospectId: id,
+      playName: "repo-interest",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    return id;
+  }
+
+  it("flips the cadence to replied AND marks the sent step replied in one call", () => {
+    const id = enrollWithSentStep();
+
+    const { newlyReplied } = ledger.recordCadenceReply({
+      prospectId: id,
+      playName: "repo-interest",
+    });
+
+    expect(newlyReplied).toBe(true);
+    expect(ledger.getCadence(id, "repo-interest")?.status).toBe("replied");
+    const events = ledger.listSequenceEventsForProspectPlay(id, "repo-interest");
+    expect(events.map((e) => e.status)).toEqual(["replied"]);
+    // Reply rate stays sane: the replied step is still counted as sent.
+    const ev = ledger.eventsByPlay().find((e) => e.play_name === "repo-interest");
+    expect(ev).toMatchObject({ sent: 1, replied: 1 });
+  });
+
+  it("stamps replied_at with a caller-supplied repliedAt, not the call time", () => {
+    // Regression test for round-2 review finding: markLatestStepReplied must
+    // accept the inbound email's own timestamp so the background inbox poll
+    // (packages/plays/src/_cadence.ts walkInboxWindow) can credit a backlog
+    // reply to the day it actually arrived, not the day the poll ran.
+    const id = enrollWithSentStep();
+
+    const { newlyReplied } = ledger.recordCadenceReply({
+      prospectId: id,
+      playName: "repo-interest",
+      repliedAt: "2026-08-20T09:00:00.000Z",
+    });
+
+    expect(newlyReplied).toBe(true);
+    const [ev] = ledger.listSequenceEventsForProspectPlay(id, "repo-interest");
+    // datetime() normalizes the stored ISO input to SQLite's space-separated
+    // form so it sorts consistently against created_at / sinceIso / untilIso.
+    expect(ev?.replied_at).toBe("2026-08-20 09:00:00");
+  });
+
+  it("is idempotent — a second call doesn't re-count or mark a second step", () => {
+    const id = enrollWithSentStep();
+    // A second sent step (e.g. a follow-up) before the reply lands.
+    ledger.recordSequenceEvent({
+      prospectId: id,
+      playName: "repo-interest",
+      stepIndex: 1,
+      channel: "email",
+      status: "sent",
+    });
+
+    expect(
+      ledger.recordCadenceReply({ prospectId: id, playName: "repo-interest" }).newlyReplied,
+    ).toBe(true);
+    // Re-running (the every-5-min poll) must not flip a second step to replied.
+    expect(
+      ledger.recordCadenceReply({ prospectId: id, playName: "repo-interest" }).newlyReplied,
+    ).toBe(false);
+
+    const ev = ledger.eventsByPlay().find((e) => e.play_name === "repo-interest");
+    expect(ev).toMatchObject({ sent: 2, replied: 1 });
+  });
+
+  it("backfills the analytics event for a cadence already marked replied", () => {
+    const id = enrollWithSentStep();
+    // Simulate the pre-existing-data case: control plane already replied, but no
+    // sequence_events row was ever marked (the old detection path).
+    ledger.setCadenceStatus({ prospectId: id, playName: "repo-interest", status: "replied" });
+    expect(
+      ledger.listSequenceEventsForProspectPlay(id, "repo-interest").map((e) => e.status),
+    ).toEqual(["sent"]);
+
+    const { newlyReplied } = ledger.recordCadenceReply({
+      prospectId: id,
+      playName: "repo-interest",
+    });
+
+    expect(newlyReplied).toBe(false); // not a new reply: don't recount
+    expect(
+      ledger.listSequenceEventsForProspectPlay(id, "repo-interest").map((e) => e.status),
+    ).toEqual(["replied"]); // but the event is backfilled
+  });
+
+  it("records the reply for a terminal (breakup) cadence without resurrecting it", () => {
+    // The common case in practice: most sequences have finished by the time a
+    // reply lands. The cadence must stay stopped (control plane), but the reply
+    // is still a fact about the outbound (analytics plane): dropping it is how
+    // 424 of 457 cadences became invisible to the reply rate.
+    const id = enrollWithSentStep();
+    ledger.setCadenceStatus({ prospectId: id, playName: "repo-interest", status: "breakup" });
+
+    const { newlyReplied, eventRecorded } = ledger.recordCadenceReply({
+      prospectId: id,
+      playName: "repo-interest",
+    });
+
+    expect(newlyReplied).toBe(false); // not an active→replied transition
+    expect(eventRecorded).toBe(true); // but the reply is on the record
+    expect(ledger.getCadence(id, "repo-interest")?.status).toBe("breakup");
+    expect(
+      ledger.listSequenceEventsForProspectPlay(id, "repo-interest").map((e) => e.status),
+    ).toEqual(["replied"]);
+    // And a second poll is a no-op on both planes.
+    expect(ledger.recordCadenceReply({ prospectId: id, playName: "repo-interest" })).toEqual({
+      newlyReplied: false,
+      eventRecorded: false,
+    });
+  });
+
+  it("does the same for a completed cadence (the Stop button's terminal state)", () => {
+    const id = enrollWithSentStep();
+    ledger.setCadenceStatus({ prospectId: id, playName: "repo-interest", status: "completed" });
+
+    const r = ledger.recordCadenceReply({ prospectId: id, playName: "repo-interest" });
+
+    expect(r).toEqual({ newlyReplied: false, eventRecorded: true });
+    expect(ledger.getCadence(id, "repo-interest")?.status).toBe("completed");
+  });
+});
+
+describe("Ledger recordProspectReply — which plays a reply belongs to", () => {
+  function twoPlays(): number {
+    const id = ledger.upsertProspect({ name: "Pat", email: "pat@co.com", source: "repo-interest" });
+    for (const [play, status, subject] of [
+      ["repo-interest", "completed", "nanoclaw isolation"],
+      ["stack-consolidation", "active", "your api stack"],
+    ] as const) {
+      ledger.enrollCadence({ prospectId: id, playName: play, nextDueAt: "2026-01-01T00:00:00Z" });
+      ledger.recordSequenceEvent({
+        prospectId: id,
+        playName: play,
+        stepIndex: 0,
+        channel: "email",
+        status: "sent",
+        metadata: { subject },
+      });
+      ledger.setCadenceStatus({ prospectId: id, playName: play, status });
+    }
+    return id;
+  }
+
+  it("stops every live cadence but credits the reply to ONE play — the latest sent", () => {
+    const id = twoPlays();
+
+    const results = ledger.recordProspectReply(id);
+
+    expect(results).toEqual(
+      expect.arrayContaining([
+        { playName: "repo-interest", newlyReplied: false, eventRecorded: false },
+        { playName: "stack-consolidation", newlyReplied: true, eventRecorded: true },
+      ]),
+    );
+    expect(ledger.getCadence(id, "stack-consolidation")?.status).toBe("replied");
+    expect(ledger.getCadence(id, "repo-interest")?.status).toBe("completed");
+    // One reply, one replied row, not one per play.
+    const replied = ledger.eventsByPlay().filter((e) => e.replied > 0);
+    expect(replied.map((e) => e.play_name)).toEqual(["stack-consolidation"]);
+  });
+
+  it("credits the play whose subject the reply threads on, even if it is not the latest", () => {
+    const id = twoPlays();
+
+    const results = ledger.recordProspectReply(id, { subject: "RE: Nanoclaw   isolation" });
+
+    expect(results).toEqual(
+      expect.arrayContaining([
+        { playName: "repo-interest", newlyReplied: false, eventRecorded: true },
+        { playName: "stack-consolidation", newlyReplied: true, eventRecorded: false },
+      ]),
+    );
+  });
+
+  it("falls back to the latest sent play when the subject matches nothing", () => {
+    const id = twoPlays();
+    const results = ledger.recordProspectReply(id, { subject: "Re: something else entirely" });
+    expect(results.find((r) => r.eventRecorded)?.playName).toBe("stack-consolidation");
+  });
+
+  it("strips stacked and localised reply prefixes before matching", () => {
+    const id = twoPlays();
+    const results = ledger.recordProspectReply(id, { subject: "AW: Re: Fwd: nanoclaw isolation" });
+    expect(results.find((r) => r.eventRecorded)?.playName).toBe("repo-interest");
+  });
+
+  it("also stops a paused cadence — a pause that resumes must not email someone who answered", () => {
+    const id = ledger.upsertProspect({ name: "Pau", email: "pau@co.com", source: "repo-interest" });
+    ledger.enrollCadence({
+      prospectId: id,
+      playName: "repo-interest",
+      nextDueAt: "2026-01-01T00:00:00Z",
+    });
+    ledger.recordSequenceEvent({
+      prospectId: id,
+      playName: "repo-interest",
+      stepIndex: 0,
+      channel: "email",
+      status: "sent",
+    });
+    ledger.setCadenceStatus({
+      prospectId: id,
+      playName: "repo-interest",
+      status: "paused" as never,
+    });
+
+    expect(ledger.recordProspectReply(id)).toEqual([
+      { playName: "repo-interest", newlyReplied: true, eventRecorded: true },
+    ]);
+    expect(ledger.getCadence(id, "repo-interest")?.status).toBe("replied");
+  });
+
+  it("falls back to the latest sent play when the prospect has no cadence row (one-touch plays)", () => {
+    // luma-events never enrolls a cadence; before the fallback its replies had
+    // nowhere to land and were dropped on the floor.
+    const id = ledger.upsertProspect({ name: "Lu", email: "lu@co.com", source: "luma-events" });
+    // Two plays, inserted in order: same-second timestamps are tie-broken by id,
+    // so the later insert is the latest send.
+    for (const play of ["show-hn", "luma-events"]) {
+      ledger.recordSequenceEvent({
+        prospectId: id,
+        playName: play,
+        stepIndex: 0,
+        channel: "email",
+        status: "sent",
+      });
+    }
+
+    expect(ledger.latestSentPlayForProspect(id)).toBe("luma-events");
+    expect(ledger.recordProspectReply(id)).toEqual([
+      { playName: "luma-events", newlyReplied: false, eventRecorded: true },
+    ]);
+    expect(ledger.eventsByPlay().find((e) => e.play_name === "luma-events")).toMatchObject({
+      sent: 1,
+      replied: 1,
+    });
+  });
+
+  it("records nothing for a prospect that was never emailed", () => {
+    const id = ledger.upsertProspect({ name: "Nu", email: "nu@co.com", source: "add-prospect" });
+    expect(ledger.latestSentPlayForProspect(id)).toBeNull();
+    expect(ledger.recordProspectReply(id)).toEqual([]);
+  });
+});
+
+describe("Ledger poll watermark", () => {
+  it("round-trips and overwrites a key; unknown keys are null", () => {
+    expect(ledger.getPollWatermark("inbox_replies")).toBeNull();
+    ledger.setPollWatermark("inbox_replies", "2026-08-01T00:00:00.000Z");
+    expect(ledger.getPollWatermark("inbox_replies")).toBe("2026-08-01T00:00:00.000Z");
+    ledger.setPollWatermark("inbox_replies", "2026-08-02T00:00:00.000Z");
+    expect(ledger.getPollWatermark("inbox_replies")).toBe("2026-08-02T00:00:00.000Z");
+  });
+});
+
+describe("Ledger inbox drafts + sent replies", () => {
+  const draft = {
+    threadKey: "thread-1",
+    inboundEmailId: "msg-1",
+    toEmail: "founder@acme.com",
+    subject: "Re: hello",
+    identityId: "gmail:me@x.com",
+    body: "first pass",
+  };
+
+  it("saves and reads back a draft via getInboxThreads", () => {
+    ledger.upsertInboxDraft(draft);
+    const t = ledger.getInboxThreads().get("thread-1");
+    expect(t?.draftBody).toBe("first pass");
+    expect(t?.sent).toEqual([]);
+  });
+
+  it("upsert overwrites the existing draft (one row per thread)", () => {
+    ledger.upsertInboxDraft(draft);
+    ledger.upsertInboxDraft({ ...draft, body: "second pass" });
+    expect(ledger.getInboxThreads().get("thread-1")?.draftBody).toBe("second pass");
+  });
+
+  it("clearInboxDraft removes the draft", () => {
+    ledger.upsertInboxDraft(draft);
+    ledger.clearInboxDraft("thread-1");
+    expect(ledger.getInboxThreads().get("thread-1")).toBeUndefined();
+  });
+
+  it("recordInboxSent appends to history and clears the draft", () => {
+    ledger.upsertInboxDraft(draft);
+    ledger.recordInboxSent({
+      threadKey: "thread-1",
+      toEmail: draft.toEmail,
+      subject: draft.subject,
+      body: "the reply we sent",
+      identityId: draft.identityId,
+      requestId: "req-1",
+    });
+    const t = ledger.getInboxThreads().get("thread-1");
+    expect(t?.draftBody).toBeNull();
+    expect(t?.sent.map((s) => s.body)).toEqual(["the reply we sent"]);
+  });
+
+  it("accumulates multiple sent replies (reply-again) in chronological order", () => {
+    ledger.recordInboxSent({
+      threadKey: "thread-1",
+      toEmail: draft.toEmail,
+      subject: draft.subject,
+      body: "first reply",
+      identityId: draft.identityId,
+      requestId: "req-1",
+    });
+    ledger.recordInboxSent({
+      threadKey: "thread-1",
+      toEmail: draft.toEmail,
+      subject: draft.subject,
+      body: "second reply",
+      identityId: draft.identityId,
+      requestId: "req-2",
+    });
+    const sent = ledger.getInboxThreads().get("thread-1")?.sent ?? [];
+    expect(sent.map((s) => s.body)).toEqual(["first reply", "second reply"]);
+    expect(sent.every((s) => typeof s.sentAt === "string" && s.sentAt.length > 0)).toBe(true);
+  });
+
+  it("persists the commits-terms status on the draft (issue #480)", () => {
+    ledger.upsertInboxDraft({ ...draft, status: "needs_decision" });
+    expect(ledger.getInboxThreads().get("thread-1")?.status).toBe("needs_decision");
+    ledger.upsertInboxDraft({ ...draft, status: null });
+    expect(ledger.getInboxThreads().get("thread-1")?.status).toBeNull();
+  });
+
+  it("setInboxDraftSteer persists a founder redraft instruction (issue #480)", () => {
+    ledger.upsertInboxDraft(draft);
+    expect(ledger.getInboxThreads().get("thread-1")?.steer).toBeNull();
+    ledger.setInboxDraftSteer("thread-1", "docs listing only, no exclusivity");
+    expect(ledger.getInboxThreads().get("thread-1")?.steer).toBe(
+      "docs listing only, no exclusivity",
+    );
+  });
+});
+
+describe("Ledger pending_resolution (outage retry queue)", () => {
+  it("upsert is idempotent, listable, and dedup-checkable", () => {
+    ledger.upsertPendingResolution({
+      playName: "luma-events",
+      dedupeKey: "evt:1:host",
+      source: "luma:sf",
+      raw: { name: "Ada", domain: "acme.dev" },
+    });
+    // Re-discovery upserts the same row (no duplicate, raw refreshed).
+    ledger.upsertPendingResolution({
+      playName: "luma-events",
+      dedupeKey: "evt:1:host",
+      source: "luma:sf",
+      raw: { name: "Ada Lovelace", domain: "acme.dev" },
+    });
+    const rows = ledger.listPendingResolution({ playName: "luma-events" });
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.raw_json)).toEqual({ name: "Ada Lovelace", domain: "acme.dev" });
+    expect(rows[0]!.attempts).toBe(0);
+    expect(ledger.isPendingResolution("luma-events", "evt:1:host")).toBe(true);
+    expect(ledger.isPendingResolution("luma-events", "nope")).toBe(false);
+  });
+
+  it("markAttempted bumps the counter; delete removes the row", () => {
+    ledger.upsertPendingResolution({
+      playName: "show-hn",
+      dedupeKey: "post:9",
+      source: "hn",
+      raw: {},
+    });
+    ledger.markPendingResolutionAttempted("show-hn", "post:9");
+    ledger.markPendingResolutionAttempted("show-hn", "post:9");
+    expect(ledger.listPendingResolution({ playName: "show-hn" })[0]!.attempts).toBe(2);
+    ledger.deletePendingResolution("show-hn", "post:9");
+    expect(ledger.isPendingResolution("show-hn", "post:9")).toBe(false);
+  });
+
+  it("sweepStale purges only rows older than the cutoff", () => {
+    ledger.upsertPendingResolution({ playName: "p", dedupeKey: "fresh", source: "s", raw: {} });
+    // Backdate one row to 8 days ago.
+    (ledger as unknown as { db: { prepare(s: string): { run(...a: unknown[]): unknown } } }).db
+      .prepare("UPDATE pending_resolution SET first_seen_at = ? WHERE dedupe_key = 'fresh'")
+      .run(new Date(Date.now() - 8 * 24 * 3600 * 1000).toISOString());
+    ledger.upsertPendingResolution({ playName: "p", dedupeKey: "new", source: "s", raw: {} });
+    const removed = ledger.sweepStalePendingResolution(7 * 24 * 3600 * 1000);
+    expect(removed).toBe(1);
+    expect(ledger.isPendingResolution("p", "fresh")).toBe(false);
+    expect(ledger.isPendingResolution("p", "new")).toBe(true);
+  });
+});
+
+describe("applyTriggerConfigs", () => {
+  it("writes every entry in one batch — insert for a fresh trigger, update+enable for an existing one", () => {
+    ledger.upsertTrigger({
+      name: "show-hn",
+      configJson: JSON.stringify({ sinceDays: 1 }),
+      enabled: false,
+    });
+    ledger.applyTriggerConfigs([
+      { name: "show-hn", configJson: JSON.stringify({ sinceDays: 1, minPoints: 50 }) },
+      { name: "hiring-signal", configJson: JSON.stringify({ keywords: ["engineer"] }) },
+    ]);
+    const showHn = ledger.getTrigger("show-hn");
+    expect(showHn?.enabled).toBe(1);
+    expect(JSON.parse(showHn!.config_json!)).toEqual({ sinceDays: 1, minPoints: 50 });
+    const hiring = ledger.getTrigger("hiring-signal");
+    expect(hiring?.enabled).toBe(1);
+    expect(JSON.parse(hiring!.config_json!)).toEqual({ keywords: ["engineer"] });
+  });
+
+  it("rolls back the WHOLE batch when one entry's write throws — no half-applied pack (finding PRRT_kwDOSKzrBs6fCBct)", () => {
+    ledger.upsertTrigger({
+      name: "show-hn",
+      configJson: JSON.stringify({ sinceDays: 1 }),
+      enabled: true,
+    });
+    // bun:sqlite's bind() throws for an unsupported JS value: force that on
+    // the SECOND entry so the transaction has already run the first
+    // statement before the throw, exercising the rollback.
+    expect(() =>
+      ledger.applyTriggerConfigs([
+        { name: "show-hn", configJson: JSON.stringify({ sinceDays: 2 }) },
+        // @ts-expect-error — deliberately unsupported bind type to force the statement to throw mid-batch
+        { name: "hiring-signal", configJson: { bad: true } },
+      ]),
+    ).toThrow();
+    // The first entry's write must NOT have persisted. The transaction
+    // rolled back the whole batch, not just the failing statement.
+    const showHn = ledger.getTrigger("show-hn");
+    expect(JSON.parse(showHn!.config_json!)).toEqual({ sinceDays: 1 });
+  });
+});

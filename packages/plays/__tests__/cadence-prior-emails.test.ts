@@ -1,0 +1,423 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProspectRecord } from "@oneshot-gtm/core";
+
+const llmCalls: Array<{ user: string; system: string }> = [];
+
+vi.mock("@oneshot-gtm/core", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/core")>("@oneshot-gtm/core");
+  return {
+    ...actual,
+    loadConfig: () => ({
+      walletMode: "cdp",
+      llmProvider: "anthropic",
+      llmModel: "test",
+      telemetryEnabled: false,
+      founderName: "J",
+      founderEmail: "j@x.dev",
+      productOneLiner: "TestProduct",
+      productDomain: null,
+      sendingDomain: null,
+      emailProvider: "oneshot" as const,
+      emailIdentities: null,
+      icpOneLiner: null,
+      cadenceOverrides: null,
+      founderCredentials: "Previously built a million-user app",
+      productPortfolio: null,
+      partners: null,
+      founderAdmission: null,
+      productBrief: null,
+      mobileSignature: false,
+      slackWebhookUrl: null,
+      timezone: null,
+      clientId: null,
+      dailySpendCeilingUsd: null,
+      calendarIdentityId: null,
+      calendarId: "primary",
+    }),
+    getLedger: () => ({
+      findDirectMail: () => null,
+      // Opener-frequency cap: no send history in these fakes, so nothing is worn out.
+      recentSentEmailBodies: () => [],
+      getCadence: () => ({ current_step: 0, status: "active" }),
+      listSequenceEventsForProspectPlay: (_pid: number, _play: string) => storedRows,
+      // The intro's sent queue row, which the follow-up edge angle is chosen from.
+      latestSentQueuePayload: () => sentPayload,
+      getProductResearchCache: () => null,
+      setProductResearchCache: () => {},
+    }),
+    receiptUrlForId: (id: number) => `local://receipt/${id}`,
+  };
+});
+
+vi.mock("@oneshot-gtm/intel", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/intel")>("@oneshot-gtm/intel");
+  return {
+    ...actual,
+    loadPrompt: () => "system-prompt",
+    complete: async (input: { messages: Array<{ role: string; content: string }> }) => {
+      llmCalls.push({
+        system: input.messages.find((m) => m.role === "system")?.content ?? "",
+        user: input.messages.find((m) => m.role === "user")?.content ?? "",
+      });
+      const user = input.messages.find((m) => m.role === "user")?.content ?? "";
+      // The angle classifier (packages/plays/src/_angles.ts): pick the second angle.
+      if (user.startsWith("ANGLES:")) {
+        return { content: JSON.stringify({ index: 2 }), provider: "test", model: "test" };
+      }
+      return {
+        content: nextLlmContent ?? JSON.stringify({ subject: "ok", body: "ok body" }),
+        provider: "test",
+        model: "test",
+      };
+    },
+  };
+});
+
+/** Per-test override of the LLM response. null = default clean JSON. */
+let nextLlmContent: string | null = null;
+/** The intro's sent queue payload (issue #584); null = no multi-angle edge to draw on. */
+let sentPayload: Record<string, unknown> | null = null;
+
+let storedRows: Array<{
+  step_index: number;
+  metadata_json: string | null;
+  status?: string;
+  created_at?: string;
+}> = [];
+
+const { buildFollowUpEmail, getPriorStepsForProspect } = await import("../src/_cadence.ts");
+
+function ctx(prospectId = 42, angleJson: string | null = null) {
+  const prospect: ProspectRecord = {
+    id: prospectId,
+    name: "Sam",
+    email: "sam@acme.dev",
+    company: "Acme",
+    linkedin_url: null,
+    dossier_json: null,
+    angle_json: angleJson,
+    source: "test",
+    created_at: new Date().toISOString(),
+  } as ProspectRecord;
+  return {
+    prospect,
+    cfg: {
+      walletMode: "cdp" as const,
+      llmProvider: "anthropic" as const,
+      llmModel: "test",
+      telemetryEnabled: false,
+      founderName: "J",
+      founderEmail: "j@x.dev",
+      productOneLiner: "TestProduct",
+      productDomain: null,
+      sendingDomain: null,
+      emailProvider: "oneshot" as const,
+      emailIdentities: null,
+      icpOneLiner: null,
+      cadenceOverrides: null,
+      founderCredentials: null,
+      productPortfolio: null,
+      partners: null,
+      founderAdmission: null,
+      productBrief: null,
+      mobileSignature: false,
+      slackWebhookUrl: null,
+      timezone: null,
+      clientId: null,
+      dailySpendCeilingUsd: null,
+      calendarIdentityId: null,
+      calendarId: "primary",
+    },
+    metadata: {},
+  };
+}
+
+beforeEach(() => {
+  llmCalls.length = 0;
+  nextLlmContent = null;
+  storedRows = [];
+  sentPayload = null;
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
+
+describe("buildFollowUpEmail — PRIOR EMAILS injection", () => {
+  it("emits prior subjects + bodies in the order the ledger returns them, with labels", async () => {
+    // The ledger's ORDER BY guarantees ascending step order; the builder must
+    // not re-sort. We feed rows in reverse to prove the builder preserves the
+    // ledger's order rather than imposing its own. A regression catch for
+    // anyone adding a defensive .sort() to the block.
+    storedRows = [
+      {
+        step_index: 1,
+        metadata_json: JSON.stringify({
+          subject: "second subject",
+          body: "second body content",
+          label: "value follow-up",
+        }),
+      },
+      {
+        step_index: 0,
+        metadata_json: JSON.stringify({
+          subject: "first subject",
+          body: "first body content",
+        }),
+      },
+    ];
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: ["PLAY: stack-consolidation. Day-3 value follow-up."],
+    });
+    const out = await builder(ctx());
+    expect(out).toEqual({ kind: "email", subject: "ok", body: "ok body" });
+    expect(llmCalls).toHaveLength(1);
+    const userMsg = llmCalls[0]!.user;
+    expect(userMsg).toContain("PRIOR EMAILS");
+    expect(userMsg).not.toContain("SOCIAL PROOF");
+    expect(userMsg).not.toContain("Previously built a million-user app");
+    const firstIdx = userMsg.indexOf("step 1");
+    const zeroIdx = userMsg.indexOf("step 0");
+    expect(firstIdx).toBeGreaterThan(-1);
+    expect(zeroIdx).toBeGreaterThan(-1);
+    expect(firstIdx).toBeLessThan(zeroIdx);
+    expect(userMsg).toContain("first subject");
+    expect(userMsg).toContain("first body content");
+    expect(userMsg).toContain("second subject");
+    expect(userMsg).toContain("second body content");
+    // Labels: explicit "value follow-up" for the labeled row, fallback
+    // "initial send" for the step-0 row with no label.
+    expect(userMsg).toContain("value follow-up");
+    expect(userMsg).toContain("initial send");
+  });
+
+  it("omits the PRIOR EMAILS block when there are no usable prior rows", async () => {
+    storedRows = [];
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: ["PLAY: x"],
+    });
+    await builder(ctx());
+    expect(llmCalls[0]!.user).not.toContain("PRIOR EMAILS");
+  });
+
+  it("buildFollowUpEmail applies the humanizer autofix to the LLM output (em-dash → ', ', curly quotes → straight)", async () => {
+    // Regression: cadence follow-ups used to skip humanizeDraft, so em-dashes
+    // returned by the LLM would ship raw (lint flagged them but the body
+    // still contained `layer—still`). Now buildFollowUpEmail runs the same
+    // deterministic autofix that initial-send plays get via
+    // draftEmailFromPrompt.
+    nextLlmContent = JSON.stringify({
+      subject: "stack thing",
+      body: "the migration sketch for the action layer—still want it? “yes” works.",
+    });
+    storedRows = [];
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: [],
+    });
+    const out = await builder(ctx());
+    expect(out).not.toBeNull();
+    expect(out!.kind).toBe("email");
+    if (out!.kind !== "email") throw new Error("expected email payload");
+    // Em-dash → ", " (autofixer's deterministic rule).
+    expect(out!.body).not.toContain("—");
+    expect(out!.body).toContain("layer, still");
+    // Curly quotes → straight ASCII.
+    expect(out!.body).not.toContain("“");
+    expect(out!.body).not.toContain("”");
+    expect(out!.body).toContain('"yes"');
+  });
+
+  it("skips ledger rows whose metadata has no body (graceful pre-change degrade)", async () => {
+    storedRows = [
+      {
+        step_index: 0,
+        metadata_json: JSON.stringify({ subject: "only subject, no body" }),
+      },
+    ];
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: [],
+    });
+    await builder(ctx());
+    expect(llmCalls[0]!.user).not.toContain("PRIOR EMAILS");
+  });
+});
+
+describe("buildFollowUpEmail — ANGLE injection (issue #356)", () => {
+  it("omits the ANGLE block when the prospect has no angle_json", async () => {
+    storedRows = [];
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: [],
+    });
+    await builder(ctx(42, null));
+    expect(llmCalls[0]!.user).not.toContain("ANGLE");
+  });
+
+  it("omits the ANGLE block for blank/unparsable angle_json — must not throw", async () => {
+    storedRows = [];
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: [],
+    });
+    await builder(ctx(42, "  "));
+    expect(llmCalls[0]!.user).not.toContain("ANGLE");
+    llmCalls.length = 0;
+    await builder(ctx(42, "not json"));
+    expect(llmCalls[0]!.user).not.toContain("ANGLE");
+  });
+
+  it("injects hook and doNotSay from angle_json into the user block", async () => {
+    storedRows = [];
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: [],
+    });
+    const angle = JSON.stringify({
+      hook: "Shipped the v2 migration last week.",
+      doNotSay: ["not evaluating vendors right now"],
+    });
+    await builder(ctx(42, angle));
+    const userMsg = llmCalls[0]!.user;
+    expect(userMsg).toContain("ANGLE");
+    expect(userMsg).toContain("Hook: Shipped the v2 migration last week.");
+    expect(userMsg).toContain("Do NOT say");
+    expect(userMsg).toContain("not evaluating vendors right now");
+  });
+});
+
+describe("buildFollowUpEmail — follow-up edge angle (issue #584)", () => {
+  const A1 = "For a founder selling to clinics — the stack breaks";
+  const A2 = "For a CTO shipping agents — egress is the hole";
+
+  it("carries the selected angle on the payload and in the YOUR EDGE block", async () => {
+    sentPayload = { email: "p42@example.com", yourEdge: `${A1} // ${A2}` };
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: [],
+    });
+    const out = await builder(ctx(42, null));
+    expect(out).toMatchObject({
+      kind: "email",
+      angle: { text: A2, origin: "configured", index: 1, count: 2 },
+    });
+    // The writer call is the last one; the classifier call came first.
+    const writer = llmCalls.find((c) => !c.user.startsWith("ANGLES:"))!;
+    expect(writer.user).toContain("YOUR EDGE (a different angle from the first email");
+    expect(writer.user).toContain(A2);
+    expect(writer.user).not.toContain(A1);
+  });
+
+  it("has no angle when the intro's row carries a one-angle edge or none", async () => {
+    sentPayload = { email: "p42@example.com", yourEdge: A1 };
+    const builder = buildFollowUpEmail({
+      playName: "stack-consolidation",
+      promptName: "stack-consolidation-followup",
+      contextLines: [],
+    });
+    const one = await builder(ctx(42, null));
+    expect(one).not.toHaveProperty("angle");
+    sentPayload = null;
+    const none = await builder(ctx(42, null));
+    expect(none).not.toHaveProperty("angle");
+  });
+});
+
+describe("getPriorStepsForProspect — shared helper", () => {
+  it("returns all rows with body:null on legacy (LLM filters; API surfaces with placeholder)", () => {
+    storedRows = [
+      {
+        step_index: 0,
+        metadata_json: JSON.stringify({ subject: "legacy, no body persisted" }),
+        status: "sent",
+        created_at: "2026-05-01T10:00:00Z",
+      },
+      {
+        step_index: 1,
+        metadata_json: JSON.stringify({
+          subject: "modern row",
+          body: "modern body",
+          label: "value follow-up",
+        }),
+        status: "sent",
+        created_at: "2026-05-04T10:00:00Z",
+      },
+    ];
+    const out = getPriorStepsForProspect(42, "stack-consolidation");
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({
+      stepIndex: 0,
+      subject: "legacy, no body persisted",
+      body: null,
+      label: "initial send",
+      sentAt: "2026-05-01T10:00:00Z",
+    });
+    expect(out[1]).toMatchObject({
+      stepIndex: 1,
+      subject: "modern row",
+      body: "modern body",
+      label: "value follow-up",
+      sentAt: "2026-05-04T10:00:00Z",
+    });
+  });
+
+  it("returns empty array when prospectId is 0/falsy", () => {
+    storedRows = [
+      {
+        step_index: 0,
+        metadata_json: JSON.stringify({ subject: "x", body: "y" }),
+        status: "sent",
+        created_at: "2026-05-01T10:00:00Z",
+      },
+    ];
+    expect(getPriorStepsForProspect(0, "stack-consolidation")).toEqual([]);
+  });
+
+  it("returns empty array when the ledger has no rows for this prospect+play", () => {
+    storedRows = [];
+    expect(getPriorStepsForProspect(42, "stack-consolidation")).toEqual([]);
+  });
+
+  it("treats null metadata_json as missing subject/body — row keeps step + sentAt", () => {
+    storedRows = [
+      {
+        step_index: 0,
+        metadata_json: null,
+        status: "sent",
+        created_at: "2026-05-01T10:00:00Z",
+      },
+    ];
+    const out = getPriorStepsForProspect(42, "stack-consolidation");
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      stepIndex: 0,
+      subject: "(no subject)",
+      body: null,
+      label: "initial send",
+      sentAt: "2026-05-01T10:00:00Z",
+    });
+  });
+
+  it("falls back to 'follow-up' label for non-step-0 rows whose metadata lacks an explicit label", () => {
+    storedRows = [
+      {
+        step_index: 1,
+        metadata_json: JSON.stringify({ subject: "s", body: "b" }),
+        status: "sent",
+        created_at: "2026-05-04T10:00:00Z",
+      },
+    ];
+    expect(getPriorStepsForProspect(42, "stack-consolidation")[0]?.label).toBe("follow-up");
+  });
+});

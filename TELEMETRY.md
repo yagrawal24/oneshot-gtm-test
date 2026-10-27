@@ -1,0 +1,57 @@
+# Telemetry
+
+`oneshot-gtm` ships with anonymous, opt-out telemetry. The intent is narrow: learn which plays land so the next phase ships the right plays. Nothing about your customers, prospects, prompts, or content is collected.
+
+## How to disable
+
+```bash
+oneshot-gtm config telemetry off
+```
+
+Or set `ONESHOT_GTM_TELEMETRY=0` in your environment (`false`, `off`, and `no` work too). That's a hard kill at the call site — no payload is even constructed, and it overrides the persisted flag for that shell session.
+
+To point the CLI at a different ingest endpoint (e.g. a local receiver while developing), set `ONESHOT_GTM_TELEMETRY_URL`.
+
+## What is collected (when telemetry is on)
+
+| Field                  | Example                         | Why                                                                          |
+| ---------------------- | ------------------------------- | ---------------------------------------------------------------------------- |
+| `command`              | `motion.show-hn`                | Learn which plays are used.                                                  |
+| `flags`                | `["dry-run"]`                   | Flag names only, never values.                                               |
+| `outcome`              | `ok` / `error` / `lint-blocked` | Aggregate failure rate.                                                      |
+| `duration_ms`          | `2840`                          | Find slow plays.                                                             |
+| `version`              | `0.7.0`                         | Catch regressions on a release.                                              |
+| `os`                   | `darwin` / `linux` / `win32`    | Reproducibility for bug reports.                                             |
+| `bun_version`          | `1.3.13`                        | Same.                                                                        |
+| `anonymous_machine_id` | `9f3a…` (random UUID)           | Distinguish unique installs. This is the per-install `clientId` — see below. |
+| `llm_provider`         | `openrouter`                    | Learn which providers founders pick.                                         |
+
+## What is NEVER collected
+
+- Email content, subject lines, prospect data.
+- LLM prompts or responses.
+- API keys, wallet credentials, or environment variable values.
+- Receipt contents or amounts.
+- File paths, project names, repo names.
+- Customer names or any PII.
+- Stack traces with file paths (only error class names).
+
+## Where it goes
+
+Sent to a single first-party endpoint owned by OneShot (`telemetry.oneshotagent.com`), which validates the payload against the whitelist above and stores one row per event. No third-party analytics SDK is bundled in the CLI — it's a plain `fetch` POST, so there's no vendor phoning home from your machine. Aggregated and used to prioritize the public roadmap. Never sold, never shared with third parties.
+
+`oneshot-gtm measure benchmark` reads those aggregates only when telemetry sharing is enabled. It sends the existing anonymous install UUID as a query parameter so the service can return that install's command count, success rate, and median duration beside the opt-in cohort. No additional telemetry fields are collected. Set `ONESHOT_GTM_BENCHMARK_URL` to override the aggregate endpoint in development.
+
+This file is the authoritative spec. If telemetry is ever extended, this file is updated in the same PR — the client (`packages/core/src/telemetry.ts`) and the first-party receiver carry the same field whitelist deliberately, and must move together. (This is a maintainer convention; it is not yet enforced by CI.)
+
+## Local development log (separate from telemetry)
+
+Independent of the opt-out flag above, every install writes a structured event log to `~/.oneshot-gtm/events.jsonl`, which is **never transmitted off-device**. Recipes for tailing it are in the README under [Watching what's happening](./README.md#watching-whats-happening).
+
+The same privacy boundary applies to event `ctx` payloads — primitives, counters, durations, category labels, hostnames only. No user-typed values, no prospect data, no LLM completions verbatim. That keeps the local log shape forward-compatible with any future opt-in distribution telemetry: the producer stays put, only the sink changes (file vs HTTP).
+
+Delete it any time with `rm ~/.oneshot-gtm/events.jsonl`. The file is written whether or not `DEBUG` is set; `DEBUG` only adds the stderr mirror.
+
+## Anonymous `clientId`
+
+A UUID is generated on first run and persisted to `~/.oneshot-gtm/config.json`. It is never exposed to the web layer (filtered out of `/api/setup` responses). It is the `anonymous_machine_id` sent with each distribution telemetry event (above) — the only thing that distinguishes one install's events from another's, with nothing traceable back to a person or machine. Distribution telemetry is **opt-out** (on by default, disclosed on first run); disabling it leaves the UUID on disk but blocks any transmission.

@@ -1,0 +1,53 @@
+{
+  "name": "oneshot-gtm",
+  "version": "0.10.0",
+  "description": "Open-source GTM workspace for founders across industries. Pay-per-result, signed receipts.",
+  "keywords": [
+    "ai-agent",
+    "bun",
+    "cli",
+    "cold-email",
+    "go-to-market",
+    "gtm",
+    "lead-generation",
+    "outreach",
+    "prospecting",
+    "sales-automation",
+    "signed-receipts",
+    "sqlite",
+    "usdc",
+    "x402"
+  ],
+  "homepage": "https://oneshot-gtm.com",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oneshot-agent/oneshot-gtm",
+    "directory": "apps/cli"
+  },
+  "bin": {
+    "oneshot-gtm": "./src/main.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@oneshot-gtm/core": "workspace:*",
+    "@oneshot-gtm/doctor": "workspace:*",
+    "@oneshot-gtm/find": "workspace:*",
+    "@oneshot-gtm/intel": "workspace:*",
+    "@oneshot-gtm/plays": "workspace:*",
+    "@oneshot-gtm/shared-types": "workspace:*",
+    "commander": "^14.0.3",
+    "kleur": "^4.1.5",
+    "prompts": "^2.4.2"
+  },
+  "devDependencies": {
+    "@types/prompts": "^2.4.0"
+  }
+}

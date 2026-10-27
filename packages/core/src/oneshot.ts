@@ -1,0 +1,2395 @@
+import { captureSdkBusinessAddress } from "./mail-enrichment.ts";
+import {
+  OneShot,
+  ValidationError,
+  type BrowserCookie as SdkBrowserCookie,
+  type BrowserProfileSetup,
+  type BrowserResult,
+  type CompanySearchResult,
+  type DeepResearchPersonResult,
+  type DomainPoolEntry,
+  type DomainPoolStatusResult,
+  type EmailResult,
+  type EnrichCompanyResult,
+  type EnrichProfileResult,
+  type FindEmailResult,
+  type GovNoticeTypeCode,
+  type GovSolicitationsResult,
+  type LocalResolveResult,
+  type LocalSearchResult,
+  type InboxEmail,
+  type InboxListResult,
+  type PeopleSearchResult,
+  type PersonNewsfeedResult,
+  type ResearchResult,
+  type SmsSendResult,
+  type VerifyEmailResult,
+  type VoiceCallResult,
+  type WebReadResult,
+  type WebSearchResult,
+} from "@oneshot-agent/sdk";
+import { createHash } from "node:crypto";
+import { getLedger } from "./ledger.ts";
+import { triggerAngleRefresh } from "./angle.ts";
+import { loadConfig, oneshotEnvReady } from "./config.ts";
+import { demoFixture, demoMode } from "./demo.ts";
+import {
+  claimContactTouch,
+  currentWorkspaceName,
+  describeTouch,
+  recordContactTouch,
+} from "./shared-db.ts";
+import { htmlToText } from "./html-text.ts";
+import { logEvent } from "./events.ts";
+import {
+  type GmailBounce,
+  getGmailProfile,
+  listGmailBounces,
+  listGmailReplies,
+  sendGmailMessage,
+} from "./gmail.ts";
+import { gmailAccountFor, resolveIdentities } from "./identities.ts";
+import { validateSendVia } from "./identity-send-via.ts";
+import { outboundMessageId, type OutboundStatus } from "./ledger-outbound.ts";
+import {
+  listMailboxInbox,
+  listMailboxBounces,
+  MailboxSubmitError,
+  replySendKey,
+  sendMailboxInitial,
+  sendMailboxReply,
+  serverKeepsSentCopy,
+} from "./mailbox.ts";
+import { mailboxConnection } from "./mailbox-config.ts";
+import { sendViaSmartlead, smartleadApiKey } from "./smartlead.ts";
+import { parallelMap, withDeadline } from "./parallel.ts";
+import {
+  isTransientToolError,
+  RecentlyContactedError,
+  resolveSenderIdentity,
+  SuppressedRecipientError,
+} from "./send-routing.ts";
+import type { EmailIdentity } from "./types.ts";
+
+/** Re-exported so callers don't reach into the SDK for the domain-pool shape. */
+export type { DomainPoolEntry, DomainPoolStatusResult } from "@oneshot-agent/sdk";
+
+/** Re-exported so callers don't reach into the SDK for the prospecting result shapes. */
+export type {
+  CompanyResult,
+  CompanySearchResult,
+  EnrichCompanyResult,
+  PeopleSearchResult,
+  PersonResult,
+} from "@oneshot-agent/sdk";
+
+export interface SendEmailInput {
+  to: string;
+  subject: string;
+  body: string;
+  /** OneShot provider only: ignored when config.emailProvider is "gmail" (Gmail always sends from the authenticated account). */
+  fromDomain?: string;
+  /**
+   * Send even if ANOTHER workspace emailed this recipient inside the hold
+   * window. Only the manual queue send sets this. The founder has seen the
+   * `contacted-elsewhere` flag and is choosing to send anyway.
+   */
+  allowContactedElsewhere?: boolean;
+  /**
+   * One key per INTENDED email, derived from what the email is (workspace,
+   * play, recipient or prospect, step), never from its text, so a re-draft of
+   * the same email keeps the same key. Claimed in `outbound_sends` before any
+   * transport is called: a key that was already sent is replayed, not resent.
+   * Omitted: falls back to a content hash (`contentSendKey`).
+   */
+  idempotencyKey?: string;
+}
+
+export interface ResearchInput {
+  topic: string;
+  depth?: "quick" | "deep";
+}
+
+export interface EnrichInput {
+  email?: string;
+  linkedinUrl?: string;
+  name?: string;
+  companyDomain?: string;
+}
+
+export interface CallContext {
+  playName: string;
+  /**
+   * Short human-readable reason for this tool call. Lands on the signed
+   * receipt's `memo` field via SDK 0.16.2+. SDK truncates at 1000 chars and
+   * warns (not errors) when omitted on a paid call. Defaults to
+   * `"{playName} {callType}"` when unset.
+   */
+  memo?: string;
+  /**
+   * Machine-readable decision rationale. Merged with `{playName, callType}`
+   * defaults; caller-supplied keys win. Lands on the receipt's
+   * `decisionContext` for supervisor-agent / external auditor consumption.
+   */
+  decisionContext?: Record<string, unknown>;
+}
+
+/**
+ * Build the `{memo, decisionContext}` audit blob the SDK 0.16.2+ accepts as
+ * top-level fields on every paid tool's option bag. Sensible defaults (playName
+ * + callType) so even call sites that don't enrich still emit a usable audit
+ * trail; callers that DO enrich override / extend via `ctx.decisionContext`.
+ */
+export function buildAuditOpts(
+  ctx: CallContext,
+  callType: string,
+): { memo: string; decisionContext: Record<string, unknown> } {
+  return {
+    memo: ctx.memo ?? `${ctx.playName} ${callType}`,
+    decisionContext: { playName: ctx.playName, callType, ...ctx.decisionContext },
+  };
+}
+
+/**
+ * Record a receipt for a billable call, persisting the SAME memo/decisionContext
+ * we send to OneShot (buildAuditOpts) so the local row matches the platform
+ * receipt. Every wrapper below funnels through this instead of calling
+ * `getLedger().recordReceipt` directly.
+ */
+function recordCallReceipt(args: {
+  ctx: CallContext;
+  callType: string;
+  signedReceipt?: unknown;
+  costUsd?: number;
+  oneshotRequestId?: string;
+  senderIdentity?: string;
+}): number {
+  const audit = buildAuditOpts(args.ctx, args.callType);
+  return getLedger().recordReceipt({
+    playName: args.ctx.playName,
+    callType: args.callType,
+    signedReceipt: args.signedReceipt,
+    costUsd: args.costUsd,
+    oneshotRequestId: args.oneshotRequestId,
+    senderIdentity: args.senderIdentity,
+    memo: audit.memo,
+    decisionContext: audit.decisionContext,
+  });
+}
+
+/**
+ * Stable correlation key for a (prospect, play) cadence. Set as
+ * `decisionContext.goalId` on every send so OneShot groups the whole sequence's
+ * spend, and tagged once on outcome via `tagReceiptValue({ goalId })`. Hashed so
+ * no raw email leaks into the id; deterministic so the same cadence always maps
+ * to the same goal.
+ */
+export function cadenceGoalId(playName: string, email: string): string {
+  const canon = email.trim().toLowerCase();
+  return `goal_${createHash("sha256").update(`${playName}:${canon}`).digest("hex").slice(0, 24)}`;
+}
+
+let agentSingleton: OneShot | null = null;
+
+async function initAgent(): Promise<OneShot> {
+  if (!oneshotEnvReady()) {
+    throw new Error(
+      "Agent wallet credentials missing. Set CDP_API_KEY_ID + CDP_API_KEY_SECRET + CDP_WALLET_SECRET, or AGENT_PRIVATE_KEY. Run `oneshot-gtm doctor` for details.",
+    );
+  }
+  if (process.env["AGENT_PRIVATE_KEY"]) {
+    return new OneShot({ privateKey: process.env["AGENT_PRIVATE_KEY"] });
+  }
+  return await OneShot.create({ cdp: true });
+}
+
+export async function getAgent(): Promise<OneShot> {
+  if (!agentSingleton) agentSingleton = await initAgent();
+  return agentSingleton;
+}
+
+/**
+ * The wallet's provisioned sending-domain pool: validates a `sendingDomain`
+ * is wallet-owned before a live send 403s. Transient outages return `[]`:
+ * callers must treat an empty list as "unknown", not "no domains owned".
+ * Genuine auth failures DO propagate (a real config error).
+ */
+export async function listSendingDomains(): Promise<DomainPoolEntry[]> {
+  // Demo mode: read-only fixture, before any agent construction (see demo.ts).
+  if (demoMode()) {
+    const fixture = demoFixture<DomainPoolEntry[]>("domains.json");
+    if (fixture) return fixture;
+  }
+  try {
+    const agent = await getAgent();
+    const result = await agent.listDomains();
+    return result.domains ?? [];
+  } catch (err) {
+    if (isTransientToolError(err)) {
+      logEvent(
+        "domains.list_transient_failure",
+        { message_120: ((err as Error).message ?? "").slice(0, 120) },
+        "warn",
+      );
+      return [];
+    }
+    throw err;
+  }
+}
+
+/**
+ * Resume a paused sending domain in the wallet's pool (SDK `resumeDomain`).
+ * Unlike `listSendingDomains`, errors PROPAGATE. This is an explicit operator
+ * action, so a transient/auth failure must be surfaced (and retried), never
+ * swallowed into a false "done". Returns the domain's new pool status.
+ */
+export async function resumeSendingDomain(domain: string): Promise<DomainPoolStatusResult> {
+  const agent = await getAgent();
+  const result = await agent.resumeDomain(domain.trim().toLowerCase());
+  logEvent("domains.resume", { domain: domain.trim().toLowerCase(), status: result.pool_status });
+  return result;
+}
+
+/** Pause a sending domain in the wallet's pool (SDK `pauseDomain`). Errors propagate (see resumeSendingDomain). */
+export async function pauseSendingDomain(domain: string): Promise<DomainPoolStatusResult> {
+  const agent = await getAgent();
+  const result = await agent.pauseDomain(domain.trim().toLowerCase());
+  logEvent("domains.pause", { domain: domain.trim().toLowerCase(), status: result.pool_status });
+  return result;
+}
+
+/**
+ * Derive the From localpart from the founder's name (first token, lowercased,
+ * non-alphanumerics stripped) so sends read e.g. `jerry@yourdomain`. Falls back
+ * to `agent` when the name yields nothing usable. ("Jane Doe" → "jane".)
+ */
+export function fromLocalpart(name: string | null): string {
+  const first = (name ?? "").trim().split(/\s+/)[0] ?? "";
+  const clean = first.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return clean.length > 0 ? clean : "agent";
+}
+
+/**
+ * Stable Idempotency-Key for a OneShot email send (24h replay window),
+ * derived from content: a retry of the SAME logical email returns the
+ * original job instead of charging + sending twice; a different body/subject
+ * hashes to its own key (the server 422s same-key-different-body).
+ */
+function emailIdempotencyKey(parts: Array<string>): string {
+  // NUL separator: it can't appear in an email address, identity id, subject,
+  // or body, so distinct field splits can't realign to the same joined string
+  // (e.g. ["a","b c"] vs ["a b","c"] both → "a b c" under a space separator).
+  return createHash("sha256")
+    .update(parts.join(String.fromCharCode(0)))
+    .digest("hex")
+    .slice(0, 40);
+}
+
+/**
+ * OneShot renders the email `body` as HTML, so plain-text newlines collapse
+ * into one run-on paragraph. Escape HTML metacharacters and turn newlines into
+ * <br> so paragraphs + the signature lines render the way the draft intended.
+ */
+export function toHtmlBody(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\r\n/g, "\n")
+    .replace(/\n/g, "<br>\n");
+}
+
+/**
+ * The email's outcome is unknown: it may already be out. Never resend on this
+ * error. The confirm sweep looks for the email's Message-ID in the mailbox's
+ * Sent folder and settles the key as confirmed (it went out) or failed (a
+ * retry under the same Message-ID is safe).
+ */
+export class UncertainSendError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UncertainSendError";
+  }
+}
+
+/**
+ * The semantic idempotency key for one intended email: what it is, never what
+ * it says. `who` is the recipient email or a stable prospect handle; `step` is
+ * the cadence step index or a short label for one-off sends. Scoped to the
+ * active workspace, so two workspaces' sends never share a key.
+ */
+export function outboundSendKey(parts: {
+  play: string;
+  who: string | number;
+  step: string | number;
+}): string {
+  const who = String(parts.who).trim().toLowerCase();
+  return `gtm:${currentWorkspaceName()}:email:${parts.play}:${who}:${parts.step}`;
+}
+
+/**
+ * Fallback key when a caller passes none: today's content hash, namespaced so
+ * it can never collide with a semantic key. Keyed callers never use it.
+ */
+export function contentSendKey(identityId: string, input: SendEmailInput): string {
+  return `content:${emailIdempotencyKey([identityId, input.to, input.subject, input.body])}`;
+}
+
+/** A Gmail API failure the server answered (or auth/config) never sent anything. */
+function gmailFailureIsDefinite(err: unknown): boolean {
+  const msg = (err as Error)?.message ?? "";
+  return /Gmail (API failed|auth rejected|credentials missing|token (exchange|refresh) failed)|no Gmail refresh token/i.test(
+    msg,
+  );
+}
+
+/**
+ * A OneShot failure the platform answered before dispatch: a validation
+ * error, an explicit 4xx, or the payment rail refusing the call (billing runs
+ * before dispatch). Timeouts, worker crashes and network errors are unknown:
+ * the platform may have sent (the 2026-06 hang-but-sends incident).
+ */
+function oneshotFailureIsDefinite(err: unknown): boolean {
+  if (err instanceof ValidationError) return true;
+  const msg = (err as Error)?.message ?? "";
+  if (/payment rejected|insufficient (funds|balance)/i.test(msg)) return true;
+  return !isTransientToolError(err) && /\b4\d\d\b/.test(msg);
+}
+
+type SendOut = { result: EmailResult; receiptId: number };
+/** What a keyed attempt sends: the stored content after an unknown outcome, else the caller's. */
+type SendContent = { subject: string; body: string };
+
+/**
+ * Run one transport send under an `outbound_sends` claim. `send` performs the
+ * actual submission and records the receipt. Verdicts:
+ * - `send`: submit; on success mark submitted (or confirmed, for a transport
+ *   that owns delivery); on a definite failure mark failed and rethrow; on an
+ *   unknown outcome mark uncertain and throw `UncertainSendError`.
+ * - `already_sent`: replay the earlier outcome instead of sending again.
+ * - `in_flight` / `uncertain`: refuse with `UncertainSendError`.
+ */
+async function keyedSend(args: {
+  key: string;
+  identity: EmailIdentity;
+  transport: string;
+  input: SendEmailInput;
+  ctx: CallContext;
+  messageId: string | null;
+  /** See `OutboundSend.sentEvidence`. */
+  sentEvidence: boolean;
+  isDefinite: (err: unknown) => boolean;
+  settledStatus: "submitted" | "confirmed";
+  send: (
+    messageId: string | null,
+    content: SendContent,
+  ) => Promise<SendOut & { messageId: string | null }>;
+}): Promise<SendOut> {
+  const store = getLedger().outboundSends;
+  const claim = store.claim({
+    key: args.key,
+    identityId: args.identity.id,
+    transport: args.transport,
+    recipient: args.input.to.trim().toLowerCase(),
+    subject: args.input.subject,
+    body: args.input.body,
+    messageId: args.messageId,
+    sentEvidence: args.sentEvidence,
+  });
+  if (claim.verdict === "already_sent") {
+    const prior = claim.send;
+    logEvent("send.keyed.replayed", { key_hash: hashKey(args.key), status: prior.status });
+    const id = prior.messageId ?? args.key;
+    let receiptId = prior.receiptId;
+    if (receiptId == null) {
+      // Sent, but the process died before the receipt: record it now, once.
+      receiptId = recordCallReceipt({
+        ctx: args.ctx,
+        callType: "email.send",
+        signedReceipt: {
+          provider: args.identity.provider,
+          transport: args.transport,
+          message_id: id,
+          to: args.input.to,
+          subject: prior.subject,
+          replayed: true,
+        },
+        costUsd: 0,
+        oneshotRequestId: id,
+        senderIdentity: args.identity.id,
+      });
+      store.mark(args.key, prior.status, { receiptId });
+    }
+    return {
+      result: {
+        status: "sent",
+        request_id: id,
+        cost: 0,
+        email: { id, provider_message_id: id, status: "sent" },
+      } as EmailResult,
+      receiptId,
+    };
+  }
+  if (claim.verdict !== "send") {
+    logEvent("send.keyed.blocked", { key_hash: hashKey(args.key), verdict: claim.verdict });
+    throw new UncertainSendError(
+      claim.verdict === "in_flight"
+        ? `an earlier attempt of this email to ${args.input.to} is still in flight — not sending again`
+        : `an earlier attempt of this email to ${args.input.to} has an unknown outcome — checking Sent before any retry`,
+    );
+  }
+  try {
+    // The row holds this attempt's content: the caller's draft, or after an
+    // unknown outcome the first attempt's, resent unchanged.
+    const out = await args.send(claim.send.messageId, {
+      subject: claim.send.subject,
+      body: claim.send.body,
+    });
+    store.mark(args.key, args.settledStatus, {
+      messageId: out.messageId,
+      receiptId: out.receiptId,
+    });
+    return { result: out.result, receiptId: out.receiptId };
+  } catch (err) {
+    if (args.isDefinite(err)) {
+      store.mark(args.key, "failed", { error: ((err as Error).message ?? "").slice(0, 200) });
+      throw err;
+    }
+    store.mark(args.key, "uncertain", {
+      error: "send outcome unknown; checking Sent before any retry",
+    });
+    logEvent("send.keyed.uncertain", { key_hash: hashKey(args.key), transport: args.transport });
+    throw new UncertainSendError(
+      `the send to ${args.input.to} may have gone out — checking Sent before any retry`,
+    );
+  }
+}
+
+function hashKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 12);
+}
+
+/**
+ * Direct-SMTP send through a Smartlead mailbox (`sendVia: "smtp"`): the
+ * mailbox's own SMTP, a deterministic Message-ID, and the `outbound_sends`
+ * claim, so a provider-side retry can no longer turn one send into several.
+ * Same receipt contract as the other mailbox transports (cost 0).
+ */
+async function sendEmailViaMailboxSmtp(
+  input: SendEmailInput,
+  ctx: CallContext,
+  identity: EmailIdentity,
+  key: string,
+) {
+  const cfg = loadConfig();
+  const fromEmail = identity.address?.trim().toLowerCase();
+  if (!fromEmail) {
+    throw new Error(`no address on sender identity '${identity.id}' — re-add it`);
+  }
+  // Resolved before the claim: no credentials means nothing is attempted, and
+  // the server decides whether Sent can prove an interrupted send went out.
+  const connection = await mailboxConnection(identity.id);
+  // Once the server has accepted the message, nothing after it (the receipt
+  // write) can make the failure definite: a retry would be a second email.
+  let accepted = false;
+  return keyedSend({
+    key,
+    identity,
+    transport: "smtp",
+    input,
+    ctx,
+    messageId: outboundMessageId(key, fromEmail),
+    sentEvidence: serverKeepsSentCopy(connection),
+    isDefinite: (err) => !accepted && (err instanceof MailboxSubmitError ? err.definite : true),
+    settledStatus: "submitted",
+    send: async (messageId, content) => {
+      const sent = await sendMailboxInitial({
+        identityId: identity.id,
+        connection,
+        to: input.to,
+        subject: content.subject,
+        text: content.body,
+        html: toHtmlBody(content.body),
+        fromName: cfg.founderName,
+        messageId: messageId ?? outboundMessageId(key, fromEmail),
+      });
+      accepted = true;
+      const result: EmailResult = {
+        status: "sent",
+        request_id: sent.messageId,
+        cost: 0,
+        email: { id: sent.messageId, provider_message_id: sent.messageId, status: "sent" },
+      };
+      const receiptId = recordCallReceipt({
+        ctx,
+        callType: "email.send",
+        signedReceipt: {
+          provider: "smartlead",
+          transport: "smtp",
+          message_id: sent.messageId,
+          from: sent.from,
+          to: input.to,
+          subject: content.subject,
+          memo: ctx.memo ?? `${ctx.playName} email.send`,
+        },
+        costUsd: 0,
+        oneshotRequestId: sent.messageId,
+        senderIdentity: identity.id,
+      });
+      return { result, receiptId, messageId: sent.messageId };
+    },
+  });
+}
+
+export interface TestSendInput {
+  /** A Smartlead mailbox identity; its direct SMTP is used whatever its `sendVia`. */
+  identityId: string;
+  to: string;
+  /** Key step label. Defaults to today (`test:YYYY-MM-DD`): a second run that day replays. */
+  step?: string;
+  dryRun?: boolean;
+}
+
+export interface TestSendPlan {
+  key: string;
+  messageId: string;
+  identityId: string;
+  from: string;
+  to: string;
+  subject: string;
+  smtpHost: string | null;
+  /** Status of an earlier attempt under this key, if any (sent ones replay). */
+  existing: OutboundStatus | null;
+}
+
+/**
+ * One test email through a Smartlead mailbox's own SMTP, on the same keyed
+ * path real sends take (claim, fixed Message-ID, receipt, confirm sweep).
+ * `dryRun` resolves the credentials and prints the plan without sending.
+ * No contact hold and no cadence: the recipient is the founder's own test
+ * address. The receipt counts as one send for the identity's cap.
+ */
+export async function sendTestEmail(
+  input: TestSendInput,
+): Promise<{ plan: TestSendPlan; result: EmailResult | null; receiptId: number | null }> {
+  const to = input.to.trim().toLowerCase();
+  const [local, domain, ...rest] = to.split("@");
+  if (!local || !domain?.includes(".") || rest.length > 0 || /\s/.test(to)) {
+    throw new Error(`not an email address: ${input.to}`);
+  }
+  const identity = resolveIdentities(loadConfig()).find((i) => i.id === input.identityId);
+  if (!identity) throw new Error(`No identity '${input.identityId}' in the pool.`);
+  const { smtpHost } = await validateSendVia(identity.id, "smtp");
+  const from = (identity.address ?? "").trim().toLowerCase();
+  const key = outboundSendKey({
+    play: "smtp-test",
+    who: to,
+    step: input.step?.trim() || `test:${new Date().toISOString().slice(0, 10)}`,
+  });
+  const prior = getLedger().outboundSends.get(key);
+  const plan: TestSendPlan = {
+    key,
+    messageId: prior?.messageId ?? outboundMessageId(key, from),
+    identityId: identity.id,
+    from,
+    to,
+    subject: `SMTP test from ${from}`,
+    smtpHost,
+    existing: prior?.status ?? null,
+  };
+  if (input.dryRun) return { plan, result: null, receiptId: null };
+  const out = await sendEmailViaMailboxSmtp(
+    {
+      to,
+      subject: plan.subject,
+      body: `A test of direct SMTP sending from ${from}.\n\nMessage-ID: ${plan.messageId}\n\nNo reply needed.`,
+      idempotencyKey: key,
+    },
+    { playName: "smtp-test", memo: "smtp-test email.send" },
+    identity,
+    key,
+  );
+  return { plan, result: out.result, receiptId: out.receiptId };
+}
+
+/**
+ * Gmail-path send. Same return contract as the OneShot path: callers consume
+ * `receiptId` plus `result.cost` / `result.request_id`. Receipts are recorded
+ * with cost 0 (Gmail sends are free) and the Gmail message id as request id,
+ * so /receipts and spend rollups stay truthful.
+ */
+async function sendEmailViaGmail(
+  input: SendEmailInput,
+  ctx: CallContext,
+  identity: EmailIdentity,
+  key: string,
+) {
+  // The Gmail API rewrites a supplied Message-ID, so the key is the guard and
+  // the API's own message id is what the confirm sweep looks up.
+  return keyedSend({
+    key,
+    identity,
+    transport: "gmail",
+    input,
+    ctx,
+    messageId: null,
+    // Gmail files every API send in Sent, so a missing copy proves "not sent".
+    sentEvidence: true,
+    isDefinite: gmailFailureIsDefinite,
+    settledStatus: "submitted",
+    send: async (_messageId, content) => {
+      const out = await sendEmailViaGmailOnce({ ...input, ...content }, ctx, identity);
+      return { ...out, messageId: out.result.request_id ?? null };
+    },
+  });
+}
+
+async function sendEmailViaGmailOnce(
+  input: SendEmailInput,
+  ctx: CallContext,
+  identity: EmailIdentity,
+) {
+  const cfg = loadConfig();
+  const account = gmailAccountFor(identity);
+  // Hard stop, never fall through to the legacy env token: that token may
+  // belong to a DIFFERENT account, and sending through it would switch the
+  // thread's From address mid-conversation.
+  if (!account) {
+    throw new Error(
+      `no Gmail refresh token stored for sender identity '${identity.id}' — re-authorize it (bun run cli -- gmail auth)`,
+    );
+  }
+  const { emailAddress } = await getGmailProfile(account);
+  const sent = await sendGmailMessage(
+    {
+      to: input.to,
+      fromEmail: emailAddress,
+      fromName: cfg.founderName,
+      subject: input.subject,
+      htmlBody: toHtmlBody(input.body),
+    },
+    account,
+  );
+  const result: EmailResult = {
+    status: "sent",
+    request_id: sent.id,
+    cost: 0,
+    email: { id: sent.id, provider_message_id: sent.id, status: "sent" },
+  };
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "email.send",
+    signedReceipt: {
+      provider: "gmail",
+      message_id: sent.id,
+      thread_id: sent.threadId,
+      from: emailAddress,
+      to: input.to,
+      subject: input.subject,
+      memo: ctx.memo ?? `${ctx.playName} email.send`,
+    },
+    costUsd: 0,
+    oneshotRequestId: sent.id,
+    senderIdentity: identity.id,
+  });
+  return { result, receiptId };
+}
+
+/**
+ * Smartlead-path send. Same contract as Gmail: cost 0, Smartlead's message id
+ * as request id. No idempotency mechanism. A timeout-then-retry can
+ * double-send; OneShot is the only transport with a true idempotency key.
+ */
+async function sendEmailViaSmartlead(
+  input: SendEmailInput,
+  ctx: CallContext,
+  identity: EmailIdentity,
+) {
+  const cfg = loadConfig();
+  const fromEmail = identity.address?.trim().toLowerCase();
+  if (!fromEmail) {
+    throw new Error(
+      `no address on Smartlead sender identity '${identity.id}' — re-add it (bun run cli -- smartlead connect)`,
+    );
+  }
+  if (!smartleadApiKey()) {
+    throw new Error("SMARTLEAD_API_KEY not set — store it with: bun run cli -- smartlead connect");
+  }
+  const sent = await sendViaSmartlead({
+    to: input.to,
+    subject: input.subject,
+    htmlBody: toHtmlBody(input.body),
+    fromEmail,
+    fromName: cfg.founderName,
+  });
+  const result: EmailResult = {
+    status: "sent",
+    request_id: sent.messageId,
+    cost: 0,
+    email: { id: sent.messageId, provider_message_id: sent.messageId, status: "sent" },
+  };
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "email.send",
+    signedReceipt: {
+      provider: "smartlead",
+      message_id: sent.messageId,
+      from: fromEmail,
+      to: input.to,
+      subject: input.subject,
+      memo: ctx.memo ?? `${ctx.playName} email.send`,
+    },
+    costUsd: 0,
+    oneshotRequestId: sent.messageId,
+    senderIdentity: identity.id,
+  });
+  return { result, receiptId };
+}
+
+async function dispatchEmail(input: SendEmailInput, ctx: CallContext) {
+  // Suppression backstop, ahead of everything else: a previously hard-bounced
+  // address can only fail again, and the send is billed before dispatch. Every
+  // caller funnels through here (plays, cadence, queue), so this is the one
+  // place that guarantees it. `replyEmail` is deliberately NOT gated. A manual
+  // inbox reply goes to someone who just emailed us, so they demonstrably exist.
+  const suppression = getLedger().suppressionFor(input.to);
+  if (suppression) {
+    throw new SuppressedRecipientError(
+      `${input.to} hard-bounced${suppression.status_code ? ` (${suppression.status_code})` : ""} on ${suppression.bounced_at.slice(0, 10)} — not sending`,
+    );
+  }
+  // Same backstop for reply-stream verdicts: an unsubscribe or a dead-mailbox
+  // autoresponder is as final as a hard bounce, and stopping one cadence isn't
+  // enough. A later play could re-enroll the prospect and land here again.
+  const contactStop = getLedger().contactSuppressionFor(input.to);
+  if (contactStop) {
+    const why =
+      contactStop.kind === "unsubscribe" ? "asked not to be contacted" : "mailbox reported dead";
+    throw new SuppressedRecipientError(
+      `${input.to} ${why} (${contactStop.kind} reply on ${contactStop.received_at.slice(0, 10)}) — not sending`,
+    );
+  }
+  if (ctx.playName === "breakup-revive") {
+    const manualHold = getLedger().breakupReviveHoldFor(input.to);
+    if (manualHold) {
+      throw new SuppressedRecipientError(
+        `${input.to} has a ${manualHold.reason} manual stop from ${manualHold.stopped_at.slice(0, 10)} — not reviving`,
+      );
+    }
+  }
+  // Sender rotation: resolve the sticky per-prospect identity BEFORE any
+  // network call. Throws SendDeferredError when every identity is at its
+  // daily cap: callers leave the work queued for tomorrow.
+  const identity = resolveSenderIdentity(input.to);
+  const key = input.idempotencyKey ?? contentSendKey(identity.id, input);
+  if (identity.provider === "gmail") {
+    return sendEmailViaGmail(input, ctx, identity, key);
+  }
+  if (identity.provider === "smartlead") {
+    if (identity.sendVia === "smtp") return sendEmailViaMailboxSmtp(input, ctx, identity, key);
+    return sendEmailViaSmartlead(input, ctx, identity);
+  }
+  // Explicit guard: a provider this branch doesn't know must NEVER fall
+  // through to the paid OneShot SDK path below.
+  if (identity.provider !== "oneshot") {
+    throw new Error(`unknown email provider '${identity.provider}' for identity '${identity.id}'`);
+  }
+  const agent = await getAgent();
+  const cfg = loadConfig();
+  // Pinning from_domain (+ from_mailbox below) opts this send OUT of the
+  // platform's domain rotation: the named domain auto-provisions if unknown and
+  // sends as-is (the worker only requires status='verified'; there's no
+  // domain_not_owned 403). The trade-off is that pinned sends BYPASS the
+  // server's warm-up gating. The per-identity client cap is the only throttle.
+  // An unset domain falls back to the SDK's shared demo domain.
+  const fromDomain = input.fromDomain ?? identity.sendingDomain ?? cfg.sendingDomain ?? null;
+
+  const opts: Parameters<OneShot["email"]>[0] = {
+    to: input.to,
+    subject: input.subject,
+    body: toHtmlBody(input.body),
+    // Dedupes a retry after the platform hangs-but-sends (the 2026-06 incident)
+    // or a double-fire from the queue/cadence layer. Keyed on content so two
+    // distinct emails to the same prospect don't collide.
+    idempotencyKey: emailIdempotencyKey([identity.id, input.to, input.subject, input.body]),
+    ...buildAuditOpts(ctx, "email.send"),
+  };
+  if (fromDomain) {
+    // Send from <mailbox-or-first-name>@<domain> with the founder's name as the
+    // display name. from_mailbox (localpart) + from_name (display name) are native fields in
+    // SDK ≥0.16.2: from_name ships as a separate field, so the bare
+    // from_address still passes the server's strict email validation.
+    opts.from_domain = fromDomain;
+    opts.from_mailbox = identity.mailbox?.trim() || fromLocalpart(cfg.founderName);
+    const name = (cfg.founderName ?? "").trim();
+    if (name) opts.from_name = name;
+  }
+  // The SDK key above stays content-derived: the platform rejects a reused key
+  // with a different body, and replays pre-dispatch failures under it. The
+  // semantic key is our own claim on top, so a re-draft can't send twice.
+  return keyedSend({
+    key,
+    identity,
+    transport: "oneshot",
+    input,
+    ctx,
+    messageId: null,
+    // No Sent folder to read. An unknown outcome is settled by the sweep and
+    // retried with the first attempt's content, so the SDK key below matches
+    // and the platform replays that send rather than making a second one.
+    sentEvidence: false,
+    isDefinite: oneshotFailureIsDefinite,
+    settledStatus: "confirmed",
+    send: async (_messageId, content) => {
+      const result = await agent.email({
+        ...opts,
+        subject: content.subject,
+        body: toHtmlBody(content.body),
+        idempotencyKey: emailIdempotencyKey([identity.id, input.to, content.subject, content.body]),
+      });
+      const receiptId = recordCallReceipt({
+        ctx,
+        callType: "email.send",
+        signedReceipt: result,
+        costUsd: result.cost,
+        oneshotRequestId: result.request_id,
+        senderIdentity: identity.id,
+      });
+      return { result, receiptId, messageId: result.request_id ?? null };
+    },
+  });
+}
+
+/**
+ * Every outbound email funnels through here. Order matters: 1. Hard-bounce
+ * suppression (permanent, never overridable); 2. The ATOMIC cross-workspace
+ * claim, before any routing or network; 3. Dispatch, then confirm (success)
+ * or release (failure). A failed send never counts as a touch. `replyEmail`
+ * is deliberately not gated; it only records its touch.
+ */
+export async function sendEmail(input: SendEmailInput, ctx: CallContext) {
+  const claim = claimContactTouch({
+    email: input.to,
+    playName: ctx.playName,
+    override: input.allowContactedElsewhere === true,
+  });
+  if (claim.held) {
+    throw new RecentlyContactedError(`${input.to} was ${describeTouch(claim.held)} — held`);
+  }
+  try {
+    const out = await dispatchEmail(input, ctx);
+    claim.finish(true);
+    return out;
+  } catch (err) {
+    // An unknown outcome may already have reached the recipient: keep the
+    // touch so no other path re-contacts them while it is reconciled.
+    claim.finish(err instanceof UncertainSendError);
+    throw err;
+  }
+}
+
+export interface ReplyEmailInput {
+  /** Direct mailbox: persisted inbound ID and idempotent client send request. */
+  inboundEmailId?: string;
+  sendRequestId?: string;
+  /** Sender identity that RECEIVED the inbound email; the reply goes out from it. */
+  identityId: string;
+  to: string;
+  /** Inbound subject: normalized to "Re: …" here (idempotent). */
+  subject: string;
+  body: string;
+  /** Gmail only: thread to attach the reply to (sender-side threading). */
+  threadId?: string;
+  /** Gmail only: RFC 2822 Message-ID of the inbound email (In-Reply-To/References). */
+  inReplyTo?: string;
+  /**
+   * OneShot only: id of the inbound OneShot inbox email (from inboxList). The
+   * platform resolves In-Reply-To/References/thread_id and can derive
+   * to/subject from it (SDK 0.19+).
+   */
+  replyToEmailId?: string;
+}
+
+/** "Re: " prefix, idempotent and case-insensitive ("RE: x" passes through). */
+export function replySubject(subject: string): string {
+  const s = subject.trim();
+  return /^re:/i.test(s) ? s : `Re: ${s}`;
+}
+
+/**
+ * Reply to an inbound email from the identity whose mailbox received it:
+ * deliberately NOT sender-rotated: a reply must keep the thread's From
+ * address and must not be deferred by warmup caps (callType "email.reply"
+ * stays out of per-identity cap counting). Both transports thread for real
+ * (Gmail: threadId + In-Reply-To/References; OneShot: reply_to_email_id),
+ * and the OneShot send carries an idempotency key.
+ */
+export async function replyEmail(input: ReplyEmailInput, ctx: CallContext) {
+  const cfg = loadConfig();
+  const identity = resolveIdentities(cfg).find((i) => i.id === input.identityId);
+  if (!identity) {
+    throw new Error(
+      `unknown sender identity '${input.identityId}' — it may have been removed from the pool`,
+    );
+  }
+  const subject = replySubject(input.subject);
+
+  if (identity.provider === "gmail") {
+    const account = gmailAccountFor(identity);
+    if (!account) {
+      throw new Error(
+        `no Gmail refresh token stored for sender identity '${identity.id}' — re-authorize it (bun run cli -- gmail auth)`,
+      );
+    }
+    const { emailAddress } = await getGmailProfile(account);
+    const sent = await sendGmailMessage(
+      {
+        to: input.to,
+        fromEmail: emailAddress,
+        fromName: cfg.founderName,
+        subject,
+        htmlBody: toHtmlBody(input.body),
+        ...(input.inReplyTo ? { inReplyTo: input.inReplyTo, references: [input.inReplyTo] } : {}),
+      },
+      account,
+      input.threadId,
+    );
+    const result: EmailResult = {
+      status: "sent",
+      request_id: sent.id,
+      cost: 0,
+      email: { id: sent.id, provider_message_id: sent.id, status: "sent" },
+    };
+    const receiptId = recordCallReceipt({
+      ctx,
+      callType: "email.reply",
+      signedReceipt: {
+        provider: "gmail",
+        message_id: sent.id,
+        thread_id: sent.threadId,
+        from: emailAddress,
+        to: input.to,
+        subject,
+        memo: ctx.memo ?? `${ctx.playName} email.reply`,
+      },
+      costUsd: 0,
+      oneshotRequestId: sent.id,
+      senderIdentity: identity.id,
+    });
+    recordContactTouch(input.to, ctx.playName);
+    return { result, receiptId };
+  }
+
+  if (identity.provider === "smartlead") {
+    if (!input.inboundEmailId || !input.sendRequestId)
+      throw new Error(
+        "A stored inbound message and send request ID are required for a threaded mailbox reply.",
+      );
+    const inbound = getLedger().mailboxes.get(input.inboundEmailId);
+    if (inbound?.identityId !== identity.id)
+      throw new Error("Inbound message does not belong to this sender identity.");
+    // sendMailboxReply claims and records the send in outbound_sends itself.
+    const sent = await sendMailboxReply(input.inboundEmailId, input.body, input.sendRequestId);
+    const result: EmailResult = {
+      status: "sent",
+      request_id: sent.messageId!,
+      cost: 0,
+      email: { id: sent.id, provider_message_id: sent.messageId!, status: "sent" },
+    };
+    const receiptId = recordCallReceipt({
+      ctx,
+      callType: "email.reply",
+      signedReceipt: {
+        provider: "smartlead",
+        transport: "smtp",
+        message_id: sent.messageId,
+        thread_id: sent.threadKey,
+        from: sent.from,
+        to: sent.to[0],
+        subject: sent.subject,
+      },
+      costUsd: 0,
+      oneshotRequestId: sent.messageId!,
+      senderIdentity: identity.id,
+    });
+    getLedger().outboundSends.attachReceipt(replySendKey(input.sendRequestId), receiptId);
+    recordContactTouch(sent.to[0]!, ctx.playName);
+    return { result, receiptId };
+  }
+  if (identity.provider !== "oneshot") {
+    throw new Error(`unknown email provider '${identity.provider}' for identity '${identity.id}'`);
+  }
+
+  const agent = await getAgent();
+  const fromDomain = identity.sendingDomain ?? cfg.sendingDomain ?? null;
+  const opts: Parameters<OneShot["email"]>[0] = {
+    to: input.to,
+    subject,
+    body: toHtmlBody(input.body),
+    idempotencyKey: emailIdempotencyKey([
+      identity.id,
+      input.to,
+      input.body,
+      input.replyToEmailId ?? "",
+    ]),
+    ...buildAuditOpts(ctx, "email.reply"),
+  };
+  // Thread server-side when we know the inbound email id. We still pass
+  // to/subject (the SDK forwards them); a missing id degrades to a fresh
+  // "Re:" send, the pre-0.19 behavior.
+  if (input.replyToEmailId) opts.reply_to_email_id = input.replyToEmailId;
+  if (fromDomain) {
+    opts.from_domain = fromDomain;
+    opts.from_mailbox = identity.mailbox?.trim() || fromLocalpart(cfg.founderName);
+    const name = (cfg.founderName ?? "").trim();
+    if (name) opts.from_name = name;
+  }
+  const result = await agent.email(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "email.reply",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+    senderIdentity: identity.id,
+  });
+  recordContactTouch(input.to, ctx.playName);
+  return { result, receiptId };
+}
+
+export async function deepResearch(input: ResearchInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const result: ResearchResult = await agent.research({
+    topic: input.topic,
+    depth: input.depth ?? "quick",
+    ...buildAuditOpts(ctx, "research.deep"),
+  });
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "research.deep",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export async function enrichProfile(input: EnrichInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["enrichProfile"]>[0] = {
+    ...buildAuditOpts(ctx, "enrich.profile"),
+  };
+  if (input.email) opts.email = input.email;
+  if (input.linkedinUrl) opts.linkedin_url = input.linkedinUrl;
+  if (input.name) opts.name = input.name;
+  if (input.companyDomain) opts.company_domain = input.companyDomain;
+
+  const result: EnrichProfileResult = await agent.enrichProfile(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "enrich.profile",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  captureSdkBusinessAddress(result, {
+    email: input.email,
+    name: input.name,
+    companyDomain: input.companyDomain ?? (result.profile?.company_domain as string | undefined),
+    source: "sdk:enrich.profile",
+  });
+  return { result, receiptId };
+}
+
+export interface DeepResearchPersonInput {
+  /** A known email address: feeds dossier lookup. */
+  email?: string;
+  /** Any social URL (LinkedIn, Twitter, GitHub) the engine can chase. */
+  socialMediaUrl?: string;
+  /** Best-guess full name. */
+  name?: string;
+  /** Best-guess company name (free text: can be a domain or a brand). */
+  company?: string;
+}
+
+/**
+ * Multi-source person dossier: emails (work + personal + alts), phones,
+ * org history, social profiles. Higher cost (~$0.05) and 2-5 min async vs.
+ * findEmail's seconds-and-half-a-cent. Use when you don't have a
+ * `companyDomain` to feed findEmail (e.g. GitHub repo owners with no
+ * resolvable company), not as a default first-pass.
+ */
+export async function deepResearchPerson(input: DeepResearchPersonInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["deepResearchPerson"]>[0] = {
+    ...buildAuditOpts(ctx, "research.person"),
+  };
+  if (input.email) opts.email = input.email;
+  if (input.socialMediaUrl) opts.social_media_url = input.socialMediaUrl;
+  if (input.name) opts.name = input.name;
+  if (input.company) opts.company = input.company;
+
+  const result: DeepResearchPersonResult = await agent.deepResearchPerson(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "research.person",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface PersonNewsfeedInput {
+  /** A LinkedIn `/in/` profile or an X profile URL. */
+  socialMediaUrl: string;
+}
+
+/**
+ * The person's recent posts (LinkedIn about 20, X 20) with dates and
+ * engagement. ~$0.07 and seconds, but rate-limited per wallet: callers
+ * serialize (see `safePersonNewsfeed`).
+ */
+export async function personNewsfeed(input: PersonNewsfeedInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const result: PersonNewsfeedResult = await agent.personNewsfeed({
+    social_media_url: input.socialMediaUrl,
+    ...buildAuditOpts(ctx, "research.newsfeed"),
+  });
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "research.newsfeed",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface FindEmailInput {
+  /** Pass either fullName, OR firstName + lastName. companyDomain is required. */
+  fullName?: string;
+  firstName?: string;
+  lastName?: string;
+  companyDomain: string;
+}
+
+export async function findEmail(input: FindEmailInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["findEmail"]>[0] = {
+    company_domain: input.companyDomain,
+    ...buildAuditOpts(ctx, "email.find"),
+  };
+  if (input.fullName) opts.full_name = input.fullName;
+  if (input.firstName) opts.first_name = input.firstName;
+  if (input.lastName) opts.last_name = input.lastName;
+  const result: FindEmailResult = await agent.findEmail(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "email.find",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface VerifyEmailInput {
+  email: string;
+}
+
+export async function verifyEmail(input: VerifyEmailInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const result: VerifyEmailResult = await agent.verifyEmail({
+    email: input.email,
+    ...buildAuditOpts(ctx, "email.verify"),
+  });
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "email.verify",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface PeopleSearchInput {
+  jobTitles?: string[];
+  keywords?: string[];
+  companies?: string[];
+  companyDomains?: string[];
+  location?: string[];
+  skills?: string[];
+  seniority?: string[];
+  industry?: string[];
+  companySize?: string;
+  /** SDK default is 100; server caps at 500. */
+  limit?: number;
+}
+
+/**
+ * B2B-database-backed person search: $0.01 flat per call, up to 500 results
+ * (server cap; SDK default 100). Unlike `findEmail`/`enrichProfile`, this
+ * doesn't resolve ONE known candidate: it discovers a whole slate up front,
+ * each already carrying `best_work_email`/`phone`/`title`/`company_domain`
+ * where the database has them. A finder can qualify against this list
+ * directly instead of paying per-candidate through
+ * `resolveVerifyEnrichQualify`.
+ */
+export async function peopleSearch(input: PeopleSearchInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["peopleSearch"]>[0] = {
+    ...buildAuditOpts(ctx, "research.people"),
+  };
+  if (input.jobTitles) opts.job_titles = input.jobTitles;
+  if (input.keywords) opts.keywords = input.keywords;
+  if (input.companies) opts.companies = input.companies;
+  if (input.companyDomains) opts.company_domains = input.companyDomains;
+  if (input.location) opts.location = input.location;
+  if (input.skills) opts.skills = input.skills;
+  if (input.seniority) opts.seniority = input.seniority;
+  if (input.industry) opts.industry = input.industry;
+  if (input.companySize) opts.company_size = input.companySize;
+  if (input.limit) opts.limit = input.limit;
+
+  const result: PeopleSearchResult = await agent.peopleSearch(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "research.people",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface CompanySearchInput {
+  name?: string;
+  domain?: string;
+  industry?: string[];
+  location?: string[];
+  size?: string;
+  minEmployeeCount?: number;
+  maxEmployeeCount?: number;
+  fundingStage?: string;
+  tags?: string[];
+  /** SDK/server default cap is 100. */
+  limit?: number;
+}
+
+/** Company-database search: $0.01 flat per call, up to 100 results. All filters optional (an empty call is valid per the SDK signature). */
+export async function companySearch(input: CompanySearchInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["companySearch"]>[0] = {
+    ...buildAuditOpts(ctx, "research.company"),
+  };
+  if (input.name) opts.name = input.name;
+  if (input.domain) opts.domain = input.domain;
+  if (input.industry) opts.industry = input.industry;
+  if (input.location) opts.location = input.location;
+  if (input.size) opts.size = input.size;
+  if (input.minEmployeeCount !== undefined) opts.min_employee_count = input.minEmployeeCount;
+  if (input.maxEmployeeCount !== undefined) opts.max_employee_count = input.maxEmployeeCount;
+  if (input.fundingStage) opts.funding_stage = input.fundingStage;
+  if (input.tags) opts.tags = input.tags;
+  if (input.limit) opts.limit = input.limit;
+
+  const result: CompanySearchResult = await agent.companySearch(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "research.company",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface EnrichCompanyInput {
+  domain?: string;
+  name?: string;
+  linkedinUrl?: string;
+  ticker?: string;
+  /** End-to-end deadline for the SDK call (its `totalTimeoutMs`), for callers answering an interactive click. */
+  timeoutMs?: number;
+}
+
+/**
+ * Company enrichment from a domain, name, LinkedIn URL or stock ticker: $0.005 per call.
+ *
+ * The identifier check below is duplicated ahead of `getAgent()`, not because
+ * the pinned SDK's own `enrichCompany` (node_modules/@oneshot-agent/sdk
+ * dist/index.js) fails to validate (it does, throwing the exact same
+ * `ValidationError` before any network call), but because `getAgent()` runs
+ * BEFORE `agent.enrichCompany(opts)` and, on a cold singleton, itself makes an
+ * outbound network call (`OneShot.create({ cdp: true })` →
+ * `CdpWalletProvider.create()` → `cdp.evm.createAccount()`) that would fire
+ * for an all-empty call before the SDK ever got a chance to reject it. Guard
+ * here first so an invalid call never pays for wallet initialization.
+ * enrichProfile (line 641), deepResearchPerson (line 680) and findEmail (line
+ * 709) above still rely solely on the SDK's own required-field validation and
+ * are unaffected by this. Callers that need a non-throwing path already have
+ * safeEnrichCompany (packages/find/src/_sdk-safe.ts), which catches this
+ * exact ValidationError and resolves to an empty-result sentinel.
+ */
+export async function enrichCompany(input: EnrichCompanyInput, ctx: CallContext) {
+  if (!input.domain && !input.name && !input.linkedinUrl && !input.ticker) {
+    throw new ValidationError(
+      "At least one of domain, name, linkedin_url, or ticker is required",
+      "identifier",
+    );
+  }
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["enrichCompany"]>[0] = {
+    ...buildAuditOpts(ctx, "enrich.company"),
+  };
+  if (input.domain) opts.domain = input.domain;
+  if (input.name) opts.name = input.name;
+  if (input.linkedinUrl) opts.linkedin_url = input.linkedinUrl;
+  if (input.ticker) opts.ticker = input.ticker;
+  if (input.timeoutMs) opts.totalTimeoutMs = input.timeoutMs;
+
+  const result: EnrichCompanyResult = await agent.enrichCompany(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "enrich.company",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  captureSdkBusinessAddress(result, {
+    name: result.company?.name,
+    companyDomain: input.domain ?? result.company?.domain,
+    source: "sdk:enrich.company",
+  });
+  return { result, receiptId };
+}
+
+export type {
+  GovContact,
+  GovNoticeType,
+  GovNoticeTypeCode,
+  GovSolicitationsResult,
+  LocalResolveResult,
+  LocalResult,
+  LocalSearchResult,
+  Solicitation,
+} from "@oneshot-agent/sdk";
+
+export interface GovSolicitationsInput {
+  /** 6-digit NAICS codes, 1-20 per call. */
+  naics: string[];
+  /** SAM.gov notice-type codes; the SDK defaults to ["r", "p"]. */
+  noticeTypes?: GovNoticeTypeCode[];
+  /** Look-back on posted date, 1-365 (SDK default 30). */
+  sinceDays?: number;
+  /** Case-insensitive agency-name substrings to keep. */
+  agencies?: string[];
+  keywords?: string[];
+  /** Place-of-performance state code. */
+  state?: string;
+  setAside?: string;
+  /** SDK default true: drops archived notices and past response deadlines. */
+  activeOnly?: boolean;
+  /** Only notices whose point of contact has both a name and an email. */
+  hasContact?: boolean;
+  /** SDK default true: description bodies come back inline (capped per search). */
+  includeDescription?: boolean;
+  /** 1-500, SDK default 100. */
+  limit?: number;
+}
+
+/**
+ * Federal Sources Sought / Presolicitation notices by NAICS, with the
+ * contracting officer's published contact and the description inline: one
+ * flat-priced search per call. Replaces the two raw SAM.gov fetches (search +
+ * per-notice description) gov-solicitation used to make itself, and with them
+ * the SAM_GOV_API_KEY those needed.
+ */
+export async function govSolicitations(input: GovSolicitationsInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["govSolicitations"]>[0] = {
+    naics: input.naics,
+    ...buildAuditOpts(ctx, "gov.solicitations"),
+  };
+  if (input.noticeTypes) opts.notice_types = input.noticeTypes;
+  if (input.sinceDays !== undefined) opts.since_days = input.sinceDays;
+  if (input.agencies) opts.agencies = input.agencies;
+  if (input.keywords) opts.keywords = input.keywords;
+  if (input.state) opts.state = input.state;
+  if (input.setAside) opts.set_aside = input.setAside;
+  if (input.activeOnly !== undefined) opts.active_only = input.activeOnly;
+  if (input.hasContact !== undefined) opts.has_contact = input.hasContact;
+  if (input.includeDescription !== undefined) opts.include_description = input.includeDescription;
+  if (input.limit) opts.limit = input.limit;
+
+  const result: GovSolicitationsResult = await agent.govSolicitations(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "gov.solicitations",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface LocalSearchInput {
+  /** Business categories, e.g. ["hvac contractor"]. `category` or `keywords` required. */
+  category?: string[];
+  keywords?: string[];
+  /** Cities, neighborhoods, or "City, ST" strings. Required. */
+  location: string[];
+  minRating?: number;
+  minReviewCount?: number;
+  /** true = only chains, false = exclude detected chains (undetected rows survive). */
+  isChain?: boolean;
+  /** SDK default "open". */
+  operatingStatus?: "open" | "any";
+  /** true = only rows with a resolvable website domain. */
+  hasDomain?: boolean;
+  /** 1-500, SDK default 100. */
+  limit?: number;
+}
+
+/**
+ * Local businesses (restaurants, contractors, practices) by category ×
+ * location: flat price per search, not per row. The main-street discovery
+ * tool the B2B people database never was.
+ */
+export async function localSearch(input: LocalSearchInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["localSearch"]>[0] = {
+    location: input.location,
+    ...buildAuditOpts(ctx, "local.search"),
+  };
+  if (input.category) opts.category = input.category;
+  if (input.keywords) opts.keywords = input.keywords;
+  if (input.minRating !== undefined) opts.min_rating = input.minRating;
+  if (input.minReviewCount !== undefined) opts.min_review_count = input.minReviewCount;
+  if (input.isChain !== undefined) opts.is_chain = input.isChain;
+  if (input.operatingStatus) opts.operating_status = input.operatingStatus;
+  if (input.hasDomain !== undefined) opts.has_domain = input.hasDomain;
+  if (input.limit) opts.limit = input.limit;
+
+  const result: LocalSearchResult = await agent.localSearch(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "local.search",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface LocalResolveInput {
+  name: string;
+  address?: string;
+  city?: string;
+  /** State / province. */
+  region?: string;
+  postalCode?: string;
+  /** Strongest single match signal after the name. */
+  phone?: string;
+}
+
+/**
+ * Business name + one locating field → website domain, phone, category and
+ * operating status, with a confidence. A miss is `found: false` (a completed
+ * job), never a rejection. The same contract as findEmail. What
+ * local-registry uses to turn a licence row into a contactable domain,
+ * using the address the registry already gave us instead of guessing from
+ * the name alone.
+ */
+export async function localResolve(input: LocalResolveInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["localResolve"]>[0] = {
+    name: input.name,
+    ...buildAuditOpts(ctx, "local.resolve"),
+  };
+  if (input.address) opts.address = input.address;
+  if (input.city) opts.city = input.city;
+  if (input.region) opts.region = input.region;
+  if (input.postalCode) opts.postal_code = input.postalCode;
+  if (input.phone) opts.phone = input.phone;
+
+  const result: LocalResolveResult = await agent.localResolve(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "local.resolve",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  if (result.found && result.result) {
+    captureSdkBusinessAddress(result.result, {
+      name: result.result.name,
+      ...(result.result.domain ? { companyDomain: result.result.domain } : {}),
+      source: "sdk:local.resolve",
+    });
+  }
+  return { result, receiptId };
+}
+
+export async function getBalance(
+  tokenAddress?: string,
+): Promise<{ balance: string; raw: unknown }> {
+  if (demoMode()) {
+    const fixture = demoFixture<{ balance: string; raw: unknown }>("balance.json");
+    if (fixture) return fixture;
+  }
+  const agent = await getAgent();
+  const raw = await agent.getBalance(tokenAddress);
+  return { balance: raw, raw };
+}
+
+/**
+ * Hard deadline for one inbox source. Without it a hung upstream (the OneShot
+ * inbox endpoint has been observed stalling to Bun's ~300s default fetch
+ * timeout) blocks the /inbox route and stop-on-reply for minutes. The
+ * underlying request keeps running after the race loses: fine, we only need
+ * the caller unblocked; the next poll gets a fresh attempt.
+ */
+const INBOX_SOURCE_TIMEOUT_MS = 15_000;
+
+async function listOneShotInbox(opts?: {
+  since?: string;
+  until?: string;
+  limit?: number;
+}): Promise<InboxListResult> {
+  const agent = await getAgent();
+  const out: { since?: string; limit?: number; include_body?: boolean } = { include_body: true };
+  if (opts?.since) out.since = opts.since;
+  if (opts?.limit) out.limit = opts.limit;
+  const res = await agent.inboxList(out);
+  // The SDK has no upper bound, so `until` is applied client-side to the
+  // newest `limit` rows the platform returns. That makes this source
+  // un-pageable: a slice older than those rows comes back empty. Gmail pages
+  // properly; the OneShot mailbox (one agent address, replies only) is small
+  // enough that its newest page is its history. Revisit if the SDK grows a
+  // `before`/cursor parameter.
+  if (!opts?.until) return res;
+  const until = opts.until;
+  const emails = res.emails.filter((e) => e.received_at < until);
+  return { ...res, emails, count: emails.length };
+}
+
+/**
+ * InboxEmail plus local-only annotations: `message_id` (RFC 2822, Gmail
+ * sources only: needed for In-Reply-To on a threaded reply) and
+ * `source_identity_id` (which sender identity's mailbox received it. A reply
+ * must go out from that same identity). Extends the SDK type, so existing
+ * consumers (stop-on-reply reads `from` only) are unaffected.
+ */
+export type AnnotatedInboxEmail = InboxEmail & {
+  /** Workspace-local association established from references or an explicit match. */
+  matched_prospect_id?: number;
+  message_id?: string;
+  source_identity_id?: string;
+  /** Header-level autoresponder verdict (Gmail sources only: RFC 3834 et al.). */
+  auto_submitted?: boolean;
+};
+
+export interface AnnotatedInboxListResult extends InboxListResult {
+  emails: AnnotatedInboxEmail[];
+  /**
+   * Sources that errored this fetch (multi-source only; a lone source throws).
+   * The reply poll needs this: a partial result must not move its watermark,
+   * or the failed mailbox's replies fall into a gap the next poll skips.
+   */
+  failed_sources?: string[];
+}
+
+/**
+ * Ensure an inbound email has a readable `body`, falling back to a de-tagged
+ * `body_html` (HTML-only mail is the normal shape for replies to our sends).
+ * Applied in the annotate funnel so EVERY listInbox consumer benefits.
+ * Exported for tests.
+ */
+export function fillInboxBody(e: InboxEmail): InboxEmail {
+  if (e.body?.trim()) return e;
+  const html = e.body_html ?? "";
+  if (!html) return e;
+  return { ...e, body: htmlToText(html) };
+}
+
+function annotateInboxResult(r: InboxListResult, identityId: string): AnnotatedInboxListResult {
+  return {
+    ...r,
+    emails: r.emails.map((e) => ({ ...fillInboxBody(e), source_identity_id: identityId })),
+  };
+}
+
+/**
+ * Replies across the WHOLE sender pool (OneShot inbox + every Gmail account):
+ * stop-on-reply must see a reply whichever identity sent the thread. Each
+ * source has its own try/catch so one revoked token cannot blind the rest.
+ * A single source keeps legacy throw semantics for the /inbox route.
+ */
+export async function listInbox(opts?: {
+  since?: string;
+  /** Exclusive upper bound on received_at: for paging a backfill in slices. */
+  until?: string;
+  limit?: number;
+  /**
+   * Per-source fetch deadline. Defaults to the 15s that keeps the /inbox route
+   * and the 5-minute poll responsive; a deliberate backfill over months of
+   * mail (hundreds of full-message fetches per mailbox) needs far longer.
+   */
+  deadlineMs?: number;
+}): Promise<AnnotatedInboxListResult> {
+  const deadlineMs = opts?.deadlineMs ?? INBOX_SOURCE_TIMEOUT_MS;
+  if (demoMode()) {
+    const fixture = demoFixture<AnnotatedInboxListResult>("inbox.json");
+    if (fixture) return fixture;
+  }
+  const identities = resolveIdentities(loadConfig());
+  const sources: Array<{
+    label: string;
+    identityId: string;
+    fetch: () => Promise<AnnotatedInboxListResult>;
+  }> = [];
+  const oneshotIdentity = identities.find((i) => i.provider === "oneshot");
+  if (oneshotIdentity) {
+    sources.push({
+      label: "oneshot",
+      identityId: oneshotIdentity.id,
+      fetch: () => listOneShotInbox(opts),
+    });
+  }
+  for (const identity of identities.filter((i) => i.provider === "smartlead")) {
+    sources.push({
+      label: identity.id,
+      identityId: identity.id,
+      fetch: () => listMailboxInbox(identity.id, opts),
+    });
+  }
+  for (const identity of identities.filter((i) => i.provider === "gmail")) {
+    sources.push({
+      label: identity.id,
+      identityId: identity.id,
+      fetch: () => {
+        const account = gmailAccountFor(identity);
+        if (!account) {
+          // Reject (not fall back to the env token: possibly a different
+          // account's inbox). Multi-source: logged + skipped; single-source:
+          // propagates like any other inbox failure.
+          return Promise.reject(
+            new Error(
+              `no Gmail refresh token stored for sender identity '${identity.id}' — re-authorize it (bun run cli -- gmail auth)`,
+            ),
+          );
+        }
+        return listGmailReplies(opts, account);
+      },
+    });
+  }
+
+  if (sources.length === 1) {
+    const only = sources[0]!;
+    const result = annotateInboxResult(
+      await withDeadline(only.fetch(), deadlineMs, `inbox source '${only.label}'`),
+      only.identityId,
+    );
+    // Same post-processing as the multi-source branch below, without it the
+    // two branches disagree about count semantics (the single-source result
+    // came back unsliced, so `count` meant "fetched" there and "window" here),
+    // which is exactly the kind of drift that made the /inbox numbers lie.
+    return mergeInboxWindow([result], opts?.limit);
+  }
+
+  const results = await parallelMap(sources, 3, async (source) => {
+    try {
+      return annotateInboxResult(
+        await withDeadline(source.fetch(), deadlineMs, `inbox source '${source.label}'`),
+        source.identityId,
+      );
+    } catch (err) {
+      logEvent(
+        "inbox.source_failed",
+        { source: source.label, message_120: ((err as Error).message ?? "").slice(0, 120) },
+        "warn",
+      );
+      return null;
+    }
+  });
+  const ok = results.filter((r): r is AnnotatedInboxListResult => r != null);
+  if (ok.length === 0) {
+    throw new Error("all inbox sources failed — check doctor for identity auth status");
+  }
+  const failed = [
+    ...new Set([
+      ...sources.filter((_, i) => results[i] == null).map((s) => s.label),
+      ...ok.flatMap((r) => r.failed_sources ?? []),
+    ]),
+  ];
+  return {
+    ...mergeInboxWindow(ok, opts?.limit),
+    ...(failed.length ? { failed_sources: failed } : {}),
+  };
+}
+
+/**
+ * Targeted fetch of mail FROM the given addresses across every Gmail identity,
+ * searched all-time, so a known replier's mail surfaces even when the broad
+ * newest-N window is full of noise or the reply predates its recency cutoff.
+ * Best-effort: per-source failures are logged and skipped, and the OneShot
+ * inbox is not queried (it can't filter by sender; its small replies-only
+ * mailbox is already covered by the main window). Returns [] in demo mode.
+ */
+export async function listRepliesFrom(
+  addresses: string[],
+  opts?: { limitPerSource?: number; deadlineMs?: number; maxPagesPerSource?: number },
+): Promise<AnnotatedInboxEmail[]> {
+  if (addresses.length === 0 || demoMode()) return [];
+  const deadlineMs = opts?.deadlineMs ?? INBOX_SOURCE_TIMEOUT_MS;
+  const limit = opts?.limitPerSource ?? 50;
+  const maxPages = opts?.maxPagesPerSource ?? 5;
+  const identities = resolveIdentities(loadConfig()).filter((i) => i.provider === "gmail");
+  const results = await parallelMap(identities, 3, async (identity) => {
+    try {
+      const account = gmailAccountFor(identity);
+      if (!account) return null;
+      // Page backwards by `until` so a busy known-replier set isn't clipped at
+      // one window (a from:() query is small; the page cap only bounds a
+      // pathological mailbox). `until` is nudged +1s past the oldest so a
+      // same-second sibling isn't skipped by Gmail's second-granularity
+      // `before:`; the seen-set makes the overlap a no-op.
+      const seen = new Set<string>();
+      const collected: AnnotatedInboxEmail[] = [];
+      let until: string | undefined;
+      for (let page = 0; page < maxPages; page++) {
+        const r = await withDeadline(
+          listGmailReplies({ fromAnyOf: addresses, limit, ...(until ? { until } : {}) }, account),
+          deadlineMs,
+          `replies-from source '${identity.id}'`,
+        );
+        const annotated = annotateInboxResult(r, identity.id);
+        const fresh = annotated.emails.filter((e) => !seen.has(e.id));
+        for (const e of fresh) seen.add(e.id);
+        collected.push(...fresh);
+        if (!r.has_more || fresh.length === 0) break;
+        const oldest = fresh.reduce(
+          (m, e) => (e.received_at < m ? e.received_at : m),
+          fresh[0]!.received_at,
+        );
+        until = new Date(new Date(oldest).getTime() + 1000).toISOString();
+      }
+      return collected;
+    } catch (err) {
+      logEvent(
+        "inbox.replies_from_failed",
+        { source: identity.id, message_120: ((err as Error).message ?? "").slice(0, 120) },
+        "warn",
+      );
+      return null;
+    }
+  });
+  return results.filter((r): r is AnnotatedInboxEmail[] => r != null).flat();
+}
+
+/**
+ * Dedupe, sort newest-first and clamp source results to the requested window,
+ * with `has_more` true whenever the window is not the whole story: either a
+ * source said so itself, or the clamp dropped rows. Shared by BOTH listInbox
+ * branches so `count`/`has_more` mean the same thing regardless of how many
+ * identities are configured.
+ */
+function mergeInboxWindow(
+  results: AnnotatedInboxListResult[],
+  limit?: number,
+): AnnotatedInboxListResult {
+  const max = limit ?? 50;
+  const seen = new Set<string>();
+  const all = results
+    .flatMap((r) => r.emails)
+    .filter((e) => (seen.has(e.id) ? false : (seen.add(e.id), true)))
+    .toSorted((a, b) =>
+      a.received_at < b.received_at ? 1 : a.received_at > b.received_at ? -1 : 0,
+    );
+  const emails = all.slice(0, max);
+  return {
+    emails,
+    count: emails.length,
+    has_more: results.some((r) => r.has_more) || all.length > max,
+    agent_id: results.map((r) => r.agent_id).join("+"),
+    ...(results.some((r) => r.failed_sources?.length)
+      ? { failed_sources: [...new Set(results.flatMap((r) => r.failed_sources ?? []))] }
+      : {}),
+  };
+}
+
+export interface IdentityBounce extends GmailBounce {
+  /** Identity whose mailbox received the DSN, which is the identity that sent the message. */
+  identityId: string;
+}
+
+export interface BounceListResult {
+  bounces: IdentityBounce[];
+  /**
+   * Identity ids whose mailbox errored or has no token this sweep (multi-source
+   * only. A lone source's failure still returns `[]` bounces here, never
+   * throws). The bounce sweep needs this: a sweep that silently dropped a
+   * source is NOT the same as "that mailbox truly has zero DSNs right now",
+   * and a caller deciding whether it's safe to treat this sweep as a complete
+   * picture of recent bounces (e.g. before permanently watermarking a day as
+   * summarized) must be able to tell the two apart (issue #71 round-4 review
+   * finding).
+   */
+  failedSources: string[];
+}
+
+/**
+ * Delivery failures across the sender pool. Gmail identities only. A DSN
+ * returns to the envelope sender, and OneShot's return path belongs to the
+ * platform. The receiving mailbox IS the sending mailbox, so attribution
+ * needs no join. Per-source try/catch, and unlike listInbox this NEVER
+ * throws on total failure. It runs on a background sweep; report nothing
+ * and retry next tick.
+ */
+export async function listBounces(opts?: {
+  since?: string;
+  limit?: number;
+}): Promise<BounceListResult> {
+  const identities = resolveIdentities(loadConfig()).filter((i) => i.provider === "gmail");
+  const failedSources: string[] = [];
+  const results = await parallelMap(identities, 3, async (identity) => {
+    const account = gmailAccountFor(identity);
+    if (!account) {
+      logEvent("bounce.source_skipped", { source: identity.id, reason: "no_token" }, "warn");
+      failedSources.push(identity.id);
+      return [];
+    }
+    try {
+      const bounces = await withDeadline(
+        listGmailBounces(opts, account),
+        INBOX_SOURCE_TIMEOUT_MS,
+        `bounce source '${identity.id}'`,
+      );
+      // Freshly parsed objects with no other holder: assign in place.
+      return bounces.map((b) => Object.assign(b, { identityId: identity.id }));
+    } catch (err) {
+      logEvent(
+        "bounce.source_failed",
+        { source: identity.id, message_120: ((err as Error).message ?? "").slice(0, 120) },
+        "warn",
+      );
+      failedSources.push(identity.id);
+      return [];
+    }
+  });
+  const mailbox = listMailboxBounces(opts);
+  return {
+    bounces: [...results.flat(), ...mailbox.bounces],
+    failedSources: [...failedSources, ...mailbox.failedSources],
+  };
+}
+
+export interface BuildSiteInput {
+  name: string;
+  description: string;
+  type?:
+    | "saas"
+    | "portfolio"
+    | "agency"
+    | "personal"
+    | "product"
+    | "funnel"
+    | "restaurant"
+    | "event";
+  sections?: string[];
+  leadCaptureEmail?: string;
+  primaryColor?: string;
+  tone?: "professional" | "playful" | "bold" | "minimal";
+  domain?: string;
+}
+
+export async function buildSite(input: BuildSiteInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["build"]>[0] = {
+    product: { name: input.name, description: input.description },
+    ...buildAuditOpts(ctx, "build.website"),
+  };
+  if (input.type) opts.type = input.type;
+  if (input.sections) opts.sections = input.sections;
+  if (input.leadCaptureEmail) {
+    opts.lead_capture = { enabled: true, inbox_email: input.leadCaptureEmail };
+  }
+  if (input.primaryColor || input.tone) {
+    opts.brand = {};
+    if (input.primaryColor) opts.brand.primary_color = input.primaryColor;
+    if (input.tone) opts.brand.tone = input.tone;
+  }
+  if (input.domain) opts.domain = input.domain;
+
+  const result = await agent.build(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "build.website",
+    signedReceipt: result,
+    costUsd: result.cost,
+  });
+  return { result, receiptId };
+}
+
+export interface SendSmsInput {
+  to: string | string[];
+  message: string;
+  maxCost?: number;
+}
+
+export async function sendSms(input: SendSmsInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["sms"]>[0] = {
+    to_number: input.to,
+    message: input.message,
+    ...buildAuditOpts(ctx, "sms.send"),
+  };
+  if (input.maxCost) opts.maxCost = input.maxCost;
+  const result: SmsSendResult = await agent.sms(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "sms.send",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.details[0]?.message_sid ?? undefined,
+  });
+  return { result, receiptId };
+}
+
+export interface VoiceCallInput {
+  objective: string;
+  to: string | string[];
+  callerPersona?: string;
+  context?: string;
+  maxDurationMinutes?: number;
+  maxCost?: number;
+}
+
+export async function voiceCall(input: VoiceCallInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["voice"]>[0] = {
+    objective: input.objective,
+    target_number: input.to,
+    ...buildAuditOpts(ctx, "voice.call"),
+  };
+  if (input.callerPersona) opts.caller_persona = input.callerPersona;
+  if (input.context) opts.context = input.context;
+  if (input.maxDurationMinutes) opts.max_duration_minutes = input.maxDurationMinutes;
+  if (input.maxCost) opts.maxCost = input.maxCost;
+  const result: VoiceCallResult = await agent.voice(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "voice.call",
+    costUsd: result.cost,
+    signedReceipt: result,
+  });
+  return { result, receiptId };
+}
+
+export interface WebSearchInput {
+  query: string;
+  maxResults?: number;
+}
+
+export async function webSearch(input: WebSearchInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["webSearch"]>[0] = {
+    query: input.query,
+    ...buildAuditOpts(ctx, "web.search"),
+  };
+  if (input.maxResults) opts.max_results = input.maxResults;
+  const result: WebSearchResult = await agent.webSearch(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "web.search",
+    signedReceipt: result,
+    costUsd: result.cost,
+  });
+  return { result, receiptId };
+}
+
+export interface WebReadInput {
+  url: string;
+}
+
+export async function webRead(input: WebReadInput, ctx: CallContext) {
+  const agent = await getAgent();
+  const result: WebReadResult = await agent.webRead({
+    url: input.url,
+    ...buildAuditOpts(ctx, "web.read"),
+  });
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "web.read",
+    signedReceipt: result,
+    costUsd: result.cost,
+    oneshotRequestId: result.request_id,
+  });
+  return { result, receiptId };
+}
+
+export interface BrowserTaskInput {
+  task: string;
+  startUrl?: string;
+  allowedDomains?: string[];
+  outputSchema?: Record<string, unknown>;
+  /** A persistent browser profile (cookies, local storage) to run in. */
+  profileId?: string;
+  /** Resume a prior live browser session. */
+  sessionId?: string;
+  /**
+   * The platform's step-derived budget allowance (default 50, supported
+   * 25-100). Below 25 the session cost limit is under the initialisation
+   * cost and the task ends at step 0 with "Session cost limit reached".
+   */
+  maxSteps?: number;
+  maxCost?: number;
+  /** Poll deadline in seconds (SDK default 300). */
+  timeoutSec?: number;
+}
+
+/** A persistent browser profile on the platform (free to create, list, delete). */
+export interface BrowserProfile {
+  id: string;
+  name: string;
+}
+
+/** A cookie imported into a profile at creation (Playwright shape). */
+export type BrowserCookie = SdkBrowserCookie;
+
+/**
+ * An interactive login session on a profile: `liveUrl` is a private hosted
+ * browser the founder logs in through (2FA included); treat it as a
+ * credential and never log it. `status` is `created` / `running` / `idle`
+ * (ready for the login) or a failure state; the session expires after
+ * fifteen minutes.
+ */
+export interface BrowserProfileSetupState {
+  profileId: string;
+  status: string;
+  liveUrl: string | null;
+  expiresAt: string | null;
+  /** After finish: the cookie names the platform stored for the profile. */
+  storedCookies: Array<{ name: string; domain: string; path: string }>;
+}
+
+function setupState(s: BrowserProfileSetup): BrowserProfileSetupState {
+  return {
+    profileId: s.profile_id,
+    status: s.status,
+    liveUrl: s.live_url ?? null,
+    expiresAt: s.expires_at ?? null,
+    storedCookies: s.stored_cookies ?? [],
+  };
+}
+
+export async function browserTask(input: BrowserTaskInput, ctx: CallContext) {
+  // A demo install must never reach the network; the other paid tools already
+  // short-circuit on demoMode(), this one never had a branch.
+  if (demoMode()) {
+    return { result: { output: "", steps: [], cost: 0 } as BrowserResult, receiptId: 0 };
+  }
+  const agent = await getAgent();
+  const opts: Parameters<OneShot["browser"]>[0] = {
+    task: input.task,
+    ...buildAuditOpts(ctx, "browser.task"),
+  };
+  if (input.startUrl) opts.start_url = input.startUrl;
+  if (input.allowedDomains) opts.allowed_domains = input.allowedDomains;
+  if (input.outputSchema) opts.output_schema = input.outputSchema;
+  if (input.profileId) opts.profile_id = input.profileId;
+  if (input.sessionId) opts.session_id = input.sessionId;
+  if (input.maxSteps) opts.max_steps = input.maxSteps;
+  if (input.maxCost) opts.maxCost = input.maxCost;
+  if (input.timeoutSec) opts.timeout = input.timeoutSec;
+  const result: BrowserResult = await agent.browser(opts);
+  const receiptId = recordCallReceipt({
+    ctx,
+    callType: "browser.task",
+    costUsd: browserTaskCost(result),
+    signedReceipt: result,
+    oneshotRequestId: result.browser_task_id ?? undefined,
+  });
+  return { result, receiptId };
+}
+
+/** What the task cost us: the billed charge when the platform reports it, else the quoted cost. */
+export function browserTaskCost(result: BrowserResult): number | undefined {
+  const v = result.billed_cost ?? result.cost ?? result.total_cost_usd;
+  return typeof v === "number" ? v : undefined;
+}
+
+/**
+ * Browser profiles: create / list / delete, plus the interactive login flow
+ * (start → the founder logs in through `liveUrl` → finish). Signed reads on
+ * the platform, no quote and no receipt, so they are logged as events
+ * instead. A profile created with `cookies` starts logged in wherever those
+ * cookies are valid; the values never appear in task prompts or receipts.
+ */
+export async function createBrowserProfile(
+  name: string,
+  ctx: CallContext,
+  options: { cookies?: BrowserCookie[] } = {},
+): Promise<BrowserProfile> {
+  if (demoMode()) return { id: "prof_demo", name };
+  const agent = await getAgent();
+  const profile = await agent.createBrowserProfile(
+    name,
+    options.cookies ? { cookies: options.cookies } : {},
+  );
+  logEvent("browser.profile.created", {
+    play: ctx.playName,
+    profile_id: profile.id,
+    imported_cookies: options.cookies?.length ?? 0,
+  });
+  return profile;
+}
+
+export async function listBrowserProfiles(ctx: CallContext): Promise<BrowserProfile[]> {
+  if (demoMode()) return [];
+  const agent = await getAgent();
+  const profiles = await agent.listBrowserProfiles();
+  logEvent("browser.profile.listed", { play: ctx.playName, count: profiles.length });
+  return profiles;
+}
+
+export async function deleteBrowserProfile(profileId: string, ctx: CallContext): Promise<void> {
+  if (demoMode()) return;
+  const agent = await getAgent();
+  await agent.deleteBrowserProfile(profileId);
+  logEvent("browser.profile.deleted", { play: ctx.playName, profile_id: profileId });
+}
+
+/** Open a hosted browser on `startUrl` for the founder to log in through ($0.30 allowance per login). */
+export async function startBrowserProfileSetup(
+  profileId: string,
+  startUrl: string,
+  ctx: CallContext,
+): Promise<BrowserProfileSetupState> {
+  if (demoMode()) {
+    return { profileId, status: "idle", liveUrl: null, expiresAt: null, storedCookies: [] };
+  }
+  const agent = await getAgent();
+  const state = setupState(await agent.startBrowserProfileSetup(profileId, startUrl));
+  logEvent("browser.profile.setup_started", {
+    play: ctx.playName,
+    profile_id: profileId,
+    status: state.status,
+  });
+  return state;
+}
+
+export async function getBrowserProfileSetup(
+  profileId: string,
+  ctx: CallContext,
+): Promise<BrowserProfileSetupState> {
+  void ctx;
+  if (demoMode()) {
+    return { profileId, status: "idle", liveUrl: null, expiresAt: null, storedCookies: [] };
+  }
+  const agent = await getAgent();
+  return setupState(await agent.getBrowserProfileSetup(profileId));
+}
+
+/** Close the login session and save its state into the profile; call after the login (and 2FA) is done. */
+export async function finishBrowserProfileSetup(
+  profileId: string,
+  ctx: CallContext,
+): Promise<BrowserProfileSetupState> {
+  if (demoMode()) {
+    return { profileId, status: "finished", liveUrl: null, expiresAt: null, storedCookies: [] };
+  }
+  const agent = await getAgent();
+  const state = setupState(await agent.finishBrowserProfileSetup(profileId));
+  logEvent("browser.profile.setup_finished", {
+    play: ctx.playName,
+    profile_id: profileId,
+    status: state.status,
+    stored_cookies: state.storedCookies.length,
+  });
+  return state;
+}
+
+export type {
+  BrowserResult,
+  DeepResearchPersonResult,
+  InboxEmail,
+  InboxListResult,
+  SmsSendResult,
+  VoiceCallResult,
+  WebReadResult,
+  WebSearchResult,
+};
+
+export function receiptUrlForId(receiptId: number): string {
+  return `local://receipt/${receiptId}`;
+}
+
+/** RoCS value tag. The shape OneShot's `tagReceiptValue` accepts. */
+export type ValueTag = { type: string; amount?: number; label?: string };
+
+/**
+ * Funnel rank of a value-tag type, so a later outcome never *downgrades* a
+ * receipt's value (e.g. a reply poll firing AFTER a deal is recorded must not
+ * overwrite `revenue` with `engagement`). Unknown types rank 0.
+ */
+function valueTagRank(type: string): number {
+  switch (type) {
+    case "revenue":
+      return 4;
+    case "qualified":
+      return 3;
+    case "meeting":
+      return 2;
+    case "engagement":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Map a recorded deal outcome to a RoCS value tag, or null when there's no
+ * positive value to attribute (deal_lost / ghosted are left untagged).
+ */
+export function outcomeToValueTag(
+  outcome: "meeting_booked" | "sql_qualified" | "deal_won" | "deal_lost" | "ghosted",
+  amountUsd?: number,
+): ValueTag | null {
+  switch (outcome) {
+    case "meeting_booked":
+      return { type: "meeting", label: "meeting booked" };
+    case "sql_qualified":
+      return { type: "qualified", label: "SQL qualified" };
+    case "deal_won":
+      return Number.isFinite(amountUsd)
+        ? { type: "revenue", amount: amountUsd, label: "deal won" }
+        : { type: "revenue", label: "deal won" };
+    case "deal_lost":
+    case "ghosted":
+      return null;
+  }
+}
+
+/** One cadence's RoCS rollup (spend vs value), keyed by its goalId. */
+export interface CadenceRocsGoal {
+  goalId: string;
+  spend: number;
+  value: number;
+  pendingValue: number;
+  rocs: number;
+  receiptCount: number;
+}
+
+/**
+ * Per-cadence RoCS from OneShot (`rocsByGoal`): spend (receipts grouped by
+ * `decisionContext.goalId`) vs value (outcomes tagged via `tagReceiptValue({goalId})`).
+ * Transient-tolerant. A brief outage returns `[]` rather than blocking the
+ * Measure page; genuine auth errors propagate so misconfig is visible.
+ */
+export async function cadenceRocs(opts: { periodDays?: number } = {}): Promise<CadenceRocsGoal[]> {
+  if (demoMode()) {
+    // Keyed by period ("7"/"30"/"all") so the Measure range chips actually
+    // change the numbers in a demo. A plain array (a fixture from an older
+    // `demo seed`) is served as-is for every period.
+    const fixture = demoFixture<CadenceRocsGoal[] | Record<string, CadenceRocsGoal[]>>(
+      "rocs-by-goal.json",
+    );
+    if (Array.isArray(fixture)) return fixture;
+    if (fixture) return fixture[String(opts.periodDays ?? "all")] ?? fixture["all"] ?? [];
+  }
+  try {
+    const agent = await getAgent();
+    const res = await agent.rocsByGoal(opts.periodDays != null ? { period: opts.periodDays } : {});
+    return res.goals.map((g) => ({
+      goalId: g.goal_id,
+      spend: Number(g.spend),
+      value: Number(g.value),
+      pendingValue: Number(g.pending_value),
+      rocs: g.rocs,
+      receiptCount: g.receipt_count,
+    }));
+  } catch (err) {
+    if (isTransientToolError(err)) {
+      logEvent(
+        "rocs_by_goal.transient_failure",
+        { message_120: ((err as Error).message ?? "").slice(0, 120) },
+        "warn",
+      );
+      return [];
+    }
+    throw err;
+  }
+}
+
+/**
+ * Tag a cadence's value once its outcome is known: one `tagReceiptValue({goalId})`
+ * call fans out across the goal's receipts, mirrored locally for /receipts.
+ * Best-effort: failures are logged and swallowed. The precedence/dedup guard
+ * skips identical re-tags and never downgrades a higher-value tag (a late
+ * reply must not overwrite `revenue` with `engagement`).
+ */
+export async function tagOutcomeValue(input: {
+  prospectId: number;
+  playName: string;
+  valueTag: ValueTag;
+}): Promise<{ tagged: boolean }> {
+  const ledger = getLedger();
+  const email = ledger.getProspectById(input.prospectId)?.email;
+  const goalId = cadenceGoalId(input.playName, email ?? `pid:${input.prospectId}`);
+  const tagJson = JSON.stringify(input.valueTag);
+
+  // Precedence/dedup guard against the goal's current local tag.
+  const existing = ledger.currentGoalValueTag(goalId);
+  if (existing) {
+    if (existing === tagJson) return { tagged: false };
+    let existingType = "";
+    try {
+      existingType = (JSON.parse(existing) as ValueTag).type ?? "";
+    } catch {
+      existingType = "";
+    }
+    if (valueTagRank(existingType) > valueTagRank(input.valueTag.type)) return { tagged: false };
+  }
+
+  // Mirror locally first so the UI reflects the outcome even if the platform call
+  // can't run (no wallet creds) or fails. No-op when no receipt carries this goal.
+  const mirrored = ledger.setReceiptValueTagByGoal(goalId, tagJson);
+  if (mirrored === 0) return { tagged: false };
+
+  // Refresh the per-prospect angle (issue #357): an outcome is exactly the
+  // kind of signal that should change how the next touch reads this
+  // prospect. Keyed by prospect_id per the issue, fires once the value tag
+  // is actually applied (not on a no-op/downgraded re-tag above), and is
+  // itself debounced on `angle_synthesized_at`. Never blocks this call.
+  // The value tag itself is threaded through as refresh context (round-1
+  // correction) so the resynthesis prompt can actually reflect the outcome
+  // instead of re-running an unchanged evidence gather.
+  triggerAngleRefresh(input.prospectId, { outcome: input.valueTag });
+
+  let agent: OneShot | null = null;
+  try {
+    agent = await getAgent();
+  } catch (err) {
+    logEvent(
+      "receipt.value_tag.agent_unavailable",
+      { message_120: ((err as Error).message ?? "").slice(0, 120) },
+      "warn",
+    );
+    return { tagged: false };
+  }
+  try {
+    await agent.tagReceiptValue({ goalId }, input.valueTag);
+    return { tagged: true };
+  } catch (err) {
+    logEvent(
+      "receipt.value_tag.failed",
+      { goal_id: goalId, message_120: ((err as Error).message ?? "").slice(0, 120) },
+      isTransientToolError(err) ? "warn" : "error",
+    );
+    return { tagged: false };
+  }
+}

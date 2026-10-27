@@ -1,0 +1,28 @@
+{
+  "name": "@oneshot-gtm/core",
+  "version": "0.10.0",
+  "homepage": "https://oneshot-gtm.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oneshot-agent/oneshot-gtm",
+    "directory": "packages/core"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./workspaces": "./src/workspaces.ts",
+    "./time": "./src/time.ts"
+  },
+  "dependencies": {
+    "@oneshot-agent/sdk": "0.43.0",
+    "imapflow": "^2.0.2",
+    "mailparser": "^3.9.24",
+    "nodemailer": "^10.0.3",
+    "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.6",
+    "@types/nodemailer": "^8.0.1"
+  }
+}

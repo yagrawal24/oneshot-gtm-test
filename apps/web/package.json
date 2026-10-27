@@ -1,0 +1,44 @@
+{
+  "name": "@oneshot-gtm/web",
+  "version": "0.10.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --open",
+    "build": "vite build",
+    "build:demo": "vite build --mode demo && cp -R fixtures dist-demo/fixtures",
+    "capture": "bun run scripts/capture-fixtures.ts",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "brand": "bun run scripts/build-brand.ts"
+  },
+  "dependencies": {
+    "@assistant-ui/react": "^0.12.25",
+    "@base-ui/react": "^1.2.0",
+    "@fontsource-variable/host-grotesk": "^5.2.8",
+    "@fontsource/ibm-plex-mono": "^5.2.7",
+    "@fontsource/ibm-plex-sans": "^5.2.8",
+    "@oneshot-gtm/shared-types": "workspace:*",
+    "@tanstack/react-query": "^5.90.0",
+    "@tanstack/react-router": "^1.160.2",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "lucide-react": "^1.9.0",
+    "motion": "^12.38.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@tanstack/router-plugin": "^1.161.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "catalog:",
+    "vite": "^8.0.0"
+  }
+}

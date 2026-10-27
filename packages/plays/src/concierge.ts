@@ -1,0 +1,217 @@
+import {
+  cadenceGoalId,
+  getLedger,
+  loadConfig,
+  sendEmail,
+  voiceCall,
+  type VoiceCallResult,
+  outboundSendKey,
+} from "@oneshot-gtm/core";
+import { complete, loadPrompt, tryParseJsonObject } from "@oneshot-gtm/intel";
+import { humanizeDraft, lintEmail, repairWritingLints } from "./_lib.ts";
+
+const PLAY_NAME = "concierge";
+
+export interface ConciergeTarget {
+  name: string;
+  email: string;
+  phone: string;
+  signupContext?: string;
+  callWindow?: string;
+  linkedinUrl?: string;
+}
+
+export interface ConciergeRunOptions {
+  dryRun: boolean;
+  targets: ConciergeTarget[];
+  /** Skip the pre-call email (default: send it). */
+  skipPrepEmail?: boolean;
+  /** Skip the post-call summary email (default: send it). */
+  skipSummaryEmail?: boolean;
+  /** Max minutes for the voice call (default 8). */
+  maxDurationMinutes?: number;
+}
+
+export interface ConciergeRunResult {
+  outcomes: Array<{
+    target: ConciergeTarget;
+    prepEmail: { subject: string; body: string; sent: boolean; flags: string[] } | null;
+    voice: VoiceCallResult | null;
+    summaryEmail: { subject: string; body: string; sent: boolean; flags: string[] } | null;
+    receiptIds: number[];
+  }>;
+}
+
+export async function runConcierge(opts: ConciergeRunOptions): Promise<ConciergeRunResult> {
+  const cfg = loadConfig();
+  if (!cfg.founderName || !cfg.productOneLiner) {
+    throw new Error("founder profile incomplete. Run: oneshot-gtm config founder");
+  }
+  const outcomes: ConciergeRunResult["outcomes"] = [];
+
+  for (const t of opts.targets) {
+    const receiptIds: number[] = [];
+    const window = t.callWindow ?? "in the next 30 minutes";
+
+    // 1. Pre-call email (optional)
+    let prepEmail: ConciergeRunResult["outcomes"][number]["prepEmail"] = null;
+    if (!opts.skipPrepEmail) {
+      const draft = await draftWithPrompt({
+        promptName: "concierge-prep-email",
+        maxBodyWords: 80,
+        inputBlock: [
+          `FOUNDER: ${cfg.founderName}`,
+          `PRODUCT: ${cfg.productOneLiner}`,
+          `CUSTOMER: ${t.name}`,
+          `CONTEXT: ${t.signupContext ?? "(new signup)"}`,
+          `CALL WINDOW: ${window}`,
+        ].join("\n"),
+      });
+      const flags = lintEmail(draft.subject, draft.body, 80);
+      let sent = false;
+      if (!opts.dryRun && flags.length === 0) {
+        const send = await sendEmail(
+          {
+            to: t.email,
+            subject: draft.subject,
+            body: draft.body,
+            idempotencyKey: outboundSendKey({
+              play: PLAY_NAME,
+              who: t.email,
+              step: `prep:${new Date().toISOString().slice(0, 10)}`,
+            }),
+          },
+          { playName: PLAY_NAME },
+        );
+        receiptIds.push(send.receiptId);
+        sent = true;
+      }
+      prepEmail = { ...draft, sent, flags };
+    }
+
+    // 2. Voice call
+    let voice: VoiceCallResult | null = null;
+    if (!opts.dryRun) {
+      const voiceVars = {
+        founderName: cfg.founderName,
+        productOneLiner: cfg.productOneLiner,
+        productHeadline: cfg.productOneLiner.split(/[.,]/)[0] ?? cfg.productOneLiner,
+        customerName: t.name,
+        signupContext: t.signupContext ?? "new signup",
+      };
+      const objective = fillTemplate(loadPrompt("concierge-voice-objective"), voiceVars);
+      const context = fillTemplate(loadPrompt("concierge-voice-context"), voiceVars);
+      const call = await voiceCall(
+        {
+          objective,
+          to: t.phone,
+          context,
+          maxDurationMinutes: opts.maxDurationMinutes ?? 8,
+          callerPersona: `${cfg.founderName}'s onboarding agent`,
+        },
+        {
+          playName: PLAY_NAME,
+          memo: `${PLAY_NAME} onboarding call → ${t.name ?? t.phone}`,
+          decisionContext: {
+            source: "concierge.voice",
+            goalId: cadenceGoalId(PLAY_NAME, t.email),
+            customerName: t.name ?? null,
+            signupContext: t.signupContext ?? "new signup",
+          },
+        },
+      );
+      receiptIds.push(call.receiptId);
+      voice = call.result;
+
+      const ledger = getLedger();
+      const prospectId = ledger.upsertProspect({
+        name: t.name,
+        email: t.email,
+        company: null,
+        linkedin_url: t.linkedinUrl ?? null,
+        source: "concierge",
+        ...({ phone: t.phone } as Record<string, unknown>),
+      });
+      ledger.recordSequenceEvent({
+        prospectId,
+        playName: PLAY_NAME,
+        stepIndex: 0,
+        channel: "voice",
+        status: "sent",
+        receiptId: call.receiptId,
+        metadata: {
+          summary: voice.summary ?? null,
+          ended_reason: voice.ended_reason ?? null,
+          duration_seconds: voice.duration_seconds ?? null,
+        },
+      });
+    }
+
+    // 3. Post-call summary email
+    let summaryEmail: ConciergeRunResult["outcomes"][number]["summaryEmail"] = null;
+    if (!opts.skipSummaryEmail && voice) {
+      const draft = await draftWithPrompt({
+        promptName: "concierge-summary-email",
+        maxBodyWords: 100,
+        inputBlock: [
+          `FOUNDER: ${cfg.founderName}`,
+          `PRODUCT: ${cfg.productOneLiner}`,
+          `CUSTOMER: ${t.name}`,
+          `CALL SUMMARY: ${voice.summary ?? "(no summary returned)"}`,
+          `STRUCTURED DATA: ${JSON.stringify(voice.structured_data ?? {})}`,
+          `ENDED REASON: ${voice.ended_reason ?? "unknown"}`,
+        ].join("\n"),
+      });
+      const flags = lintEmail(draft.subject, draft.body, 100);
+      let sent = false;
+      if (!opts.dryRun && flags.length === 0) {
+        const send = await sendEmail(
+          {
+            to: t.email,
+            subject: draft.subject,
+            body: draft.body,
+            idempotencyKey: outboundSendKey({
+              play: PLAY_NAME,
+              who: t.email,
+              step: `summary:${new Date().toISOString().slice(0, 10)}`,
+            }),
+          },
+          { playName: PLAY_NAME },
+        );
+        receiptIds.push(send.receiptId);
+        sent = true;
+      }
+      summaryEmail = { ...draft, sent, flags };
+    }
+
+    outcomes.push({ target: t, prepEmail, voice, summaryEmail, receiptIds });
+  }
+
+  return { outcomes };
+}
+
+async function draftWithPrompt(opts: {
+  promptName: string;
+  inputBlock: string;
+  maxBodyWords: number;
+}): Promise<{
+  subject: string;
+  body: string;
+}> {
+  const system = loadPrompt(opts.promptName);
+  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+    { role: "system", content: system },
+    { role: "user", content: opts.inputBlock },
+  ];
+  const res = await complete({ messages, temperature: 0.5, maxTokens: 400 });
+  const parsed = tryParseJsonObject<{ subject?: string; body?: string }>(res.content, {});
+  const draft = humanizeDraft({
+    subject: (parsed.subject ?? "").trim(),
+    body: (parsed.body ?? "").trim(),
+  });
+  return repairWritingLints(messages, draft, { ...opts, temperature: 0.5, maxTokens: 400 });
+}
+
+function fillTemplate(raw: string, vars: Record<string, string>): string {
+  return raw.replace(/\{\{(\w+)\}\}/g, (_, k: string) => vars[k] ?? "").trim();
+}

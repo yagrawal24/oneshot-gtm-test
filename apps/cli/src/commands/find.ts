@@ -1,0 +1,274 @@
+import {
+  drainQueue,
+  importCsv,
+  nextSleepMs,
+  runDueTriggers,
+  type FinderResult,
+  type TriggerRunOutcome,
+} from "@oneshot-gtm/find";
+import { readFile } from "node:fs/promises";
+import { currentWorkspaceName, linkedInOutreachAccount, linkedInSdk } from "@oneshot-gtm/core";
+import {
+  bail,
+  bailEmpty,
+  c,
+  emitJson,
+  fail,
+  header,
+  human,
+  note,
+  ok,
+  setJsonMode,
+  warn,
+} from "../output.ts";
+
+export async function commandFindImport(opts: {
+  csv: string;
+  play: string;
+  map?: string[];
+  dryRun: boolean;
+  failOnEmpty?: boolean;
+  json?: boolean;
+}): Promise<void> {
+  setJsonMode(opts.json ?? false);
+  header(`find import ${opts.dryRun ? c.dim("(dry-run)") : ""}`);
+  const text = await readFile(opts.csv, "utf8");
+  const result = await importCsv({
+    text,
+    playName: opts.play,
+    dryRun: opts.dryRun,
+    ...(opts.map ? { mapValues: opts.map } : {}),
+  });
+
+  if (opts.json) {
+    emitJson({ imported: result.imported, skipped: result.skipped, errors: result.errors });
+  } else {
+    const mapping = Object.entries(result.mapping)
+      .map(([field, column]) => `${column} → ${field}`)
+      .join(", ");
+    note(`mapping: ${mapping}`);
+    note(`rows: ${result.rowCount}`);
+    for (const error of result.errors) warn(`row ${error.row}: ${error.message}`);
+    ok(
+      `${opts.dryRun ? "would import" : "imported"} ${result.imported}; skipped ${result.skipped}`,
+    );
+  }
+
+  if (opts.failOnEmpty && result.imported === 0) {
+    bailEmpty(`find import ${opts.csv}: 0 rows imported`);
+  }
+}
+
+export async function commandFindDrain(opts: {
+  play: string;
+  limit?: number;
+  dryRun: boolean;
+  failOnEmpty?: boolean;
+  json?: boolean;
+}): Promise<void> {
+  setJsonMode(opts.json ?? false);
+  header(`find drain ${opts.play} ${opts.dryRun ? c.dim("(dry-run)") : ""}`);
+  let result;
+  try {
+    // The CLI can only call OneShot as its own workspace; a LinkedIn account
+    // connected under another workspace is reached from that workspace's
+    // dashboard instead.
+    const account = linkedInOutreachAccount();
+    result = await drainQueue({
+      playName: opts.play,
+      limit: opts.limit ?? 10,
+      dryRun: opts.dryRun,
+      linkedIn:
+        account && account.workspace === currentWorkspaceName()
+          ? { accountId: account.accountId, workspace: account.workspace, call: linkedInSdk }
+          : null,
+    });
+  } catch (err: unknown) {
+    if (opts.json) {
+      await emitJson({ error: err instanceof Error ? err.message : String(err) });
+    }
+    throw err;
+  }
+  // Emit JSON before any non-zero exit so it explains the failure.
+  if (opts.json) {
+    await emitJson({
+      command: "find drain",
+      play: opts.play,
+      dryRun: opts.dryRun,
+      drained: result.drained,
+      sent: result.sent,
+      deferred: result.deferred,
+      errors: result.errors.map((e) => ({ id: e.id, message: e.message })),
+      ...(result.haltedReason ? { haltedReason: result.haltedReason } : {}),
+    });
+  }
+
+  // The daily ceiling blocks batch sends until local midnight or a higher limit.
+  // Approved rows remain queued; manual sends from /queue are still allowed.
+  if (result.haltedReason) {
+    warn(`find drain ${opts.play}: ${result.haltedReason}`);
+    if (opts.failOnEmpty) bail(`find drain ${opts.play}: ${result.haltedReason}`);
+    return;
+  }
+
+  // Check errors before emptiness: an invalid play with no rows must exit 1, not 2.
+  if (result.errors.length > 0) {
+    for (const e of result.errors) fail(`#${e.id}: ${e.message}`);
+    if (opts.failOnEmpty) bail(`find drain ${opts.play}: ${result.errors.length} row(s) errored`);
+    // Errors exit 0 unless --fail-on-empty is set.
+  }
+
+  if (result.drained === 0) {
+    note(`No approved rows for ${c.cyan(opts.play)}. Approve some in the dashboard at /queue.`);
+    if (opts.failOnEmpty) bailEmpty(`find drain ${opts.play}: 0 rows drained`);
+    return;
+  }
+  ok(`drained ${result.drained} row(s); ${result.sent} ${opts.dryRun ? "would be sent" : "sent"}.`);
+}
+
+export async function commandFindWatch(opts: {
+  once: boolean;
+  quiet: boolean;
+  failOnEmpty?: boolean;
+  json?: boolean;
+  ignoreApprovalRate?: boolean;
+}): Promise<void> {
+  setJsonMode(opts.json ?? false);
+  header(`find watch ${opts.once ? c.dim("(--once)") : c.dim("(daemon)")}`);
+  let cancelled = false;
+  let wake: (() => void) | null = null;
+  const shutdown = (): void => {
+    cancelled = true;
+    human(`\n${c.dim("watch: shutting down...")}\n`);
+    if (wake) wake();
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  // State of the most recent tick. Only --once reads it; the daemon reports
+  // each error and keeps polling (one flaky finder must not stop the others).
+  let errored = 0;
+  let queued = 0;
+  let firedNames: string[] = [];
+  // Outcomes of the last tick, kept for the --json document (--once only).
+  let lastTick: TriggerRunOutcome[] = [];
+  try {
+    for (;;) {
+      const outcomes = await runDueTriggers({ ignoreApprovalRate: opts.ignoreApprovalRate });
+      lastTick = outcomes;
+      errored = 0;
+      queued = 0;
+      firedNames = [];
+      for (const o of outcomes) {
+        if (!o.fired) {
+          if (!opts.quiet)
+            note(
+              `${o.name}: skipped${o.skippedReason ? ` (${o.skippedReason})` : ` (next due in ${humanMs(o.nextDueInMs)})`}`,
+            );
+          continue;
+        }
+        firedNames.push(o.name);
+        if (o.error !== undefined) {
+          errored++;
+          fail(`${o.name}: error — ${o.error}`);
+        } else if (o.result) {
+          // Count enqueued rows; duplicate and off-ICP candidates leave the queue unchanged.
+          queued += o.result.enqueued;
+          printSummaryLine(o.name, o.result);
+        }
+      }
+
+      if (opts.once || cancelled) break;
+      const sleepMs = nextSleepMs(outcomes);
+      if (!opts.quiet) note(`watch: sleeping ${humanMs(sleepMs)}`);
+      await sleepCancellable(sleepMs, (cancel) => {
+        wake = cancel;
+      });
+      wake = null;
+      if (cancelled) break;
+    }
+  } finally {
+    process.removeListener("SIGINT", shutdown);
+    process.removeListener("SIGTERM", shutdown);
+  }
+
+  // Emit JSON before the failure exit so stdout includes the outcome.
+  if (opts.json) {
+    await emitJson({
+      command: "find watch",
+      ok: errored === 0,
+      errored,
+      triggers: lastTick.map((o) =>
+        Object.assign(
+          {
+            name: o.name,
+            fired: o.fired,
+            nextDueInMs: o.nextDueInMs,
+          },
+          o.skippedReason ? { skippedReason: o.skippedReason } : {},
+          o.duration_ms != null ? { durationMs: o.duration_ms } : {},
+          o.error !== undefined ? { error: o.error } : {},
+          o.result ? { result: jsonFinderResult(o.result) } : {},
+        ),
+      ),
+    });
+  }
+
+  // --once exposes failures to cron/launchd. Daemons keep polling after bad ticks.
+  if (opts.once && errored > 0) {
+    bail(`${errored} due trigger(s) errored`, 1);
+  }
+
+  // A clean, empty poll exits 2 when requested; errors above take precedence.
+  if (opts.once && opts.failOnEmpty && queued === 0) {
+    bailEmpty(
+      `find watch --once: 0 candidates queued (${
+        firedNames.length > 0 ? `triggers: ${firedNames.join(", ")}` : "no triggers due"
+      })`,
+    );
+  }
+}
+
+/** FinderResult in the flag's camelCase contract, optionals normalized to 0. */
+function jsonFinderResult(r: FinderResult): Record<string, unknown> {
+  return {
+    source: r.source,
+    candidates: r.candidates,
+    enqueued: r.enqueued,
+    droppedIcp: r.droppedIcp,
+    droppedRole: r.droppedRole ?? 0,
+    droppedDuplicate: r.droppedDuplicate,
+    droppedEnrichment: r.droppedEnrichment,
+    droppedLowSignal: r.droppedLowSignal ?? 0,
+    costUsd: r.costUsd,
+    perCohort: r.perCohort,
+    ...(r.halted ? { halted: r.halted } : {}),
+  };
+}
+
+function printSummaryLine(name: string, r: FinderResult): void {
+  ok(
+    `${name}: candidates=${r.candidates} kept=${r.enqueued} icp-dropped=${r.droppedIcp} role-dropped=${r.droppedRole ?? 0} dup=${r.droppedDuplicate} enrich-failed=${r.droppedEnrichment} cost=$${r.costUsd.toFixed(2)}${r.halted ? ` (halted: ${r.halted})` : ""}`,
+  );
+}
+
+/**
+ * Resolves after `ms` OR when the registered cancel function is called.
+ * Lets SIGINT/SIGTERM short-circuit a long sleep so `find watch` exits
+ * promptly instead of blocking until the next poll window.
+ */
+function sleepCancellable(ms: number, register: (cancel: () => void) => void): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, ms);
+    register(() => {
+      clearTimeout(t);
+      resolve();
+    });
+  });
+}
+
+function humanMs(ms: number): string {
+  if (ms < 60_000) return `${Math.ceil(ms / 1000)}s`;
+  if (ms < 3600_000) return `${Math.ceil(ms / 60_000)}m`;
+  return `${(ms / 3600_000).toFixed(1)}h`;
+}

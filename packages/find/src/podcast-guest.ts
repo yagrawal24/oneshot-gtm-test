@@ -1,0 +1,321 @@
+import { getLedger, logEvent, webRead, webSearch } from "@oneshot-gtm/core";
+import { resolveVerifyEnrichQualify, icpFields } from "./_contact.ts";
+import { enqueueScoredTarget } from "./_priority-adapters.ts";
+import { persistRoleRejection, qualifyPreSpend } from "./_qualify.ts";
+import { complete, loadPrompt, tryParseJsonObject } from "@oneshot-gtm/intel";
+import type { PodcastGuestTarget } from "@oneshot-gtm/plays";
+import { isDuplicate } from "./_dedupe.ts";
+import { icpFilter, resolveIcp } from "./_filter.ts";
+import { findLinkedInUrl, isLinkedInProfileUrl } from "./_linkedin.ts";
+import { buildDesignPartnerLoiPayload, dedupePlayNames, resolvePlayRoute } from "./_play-route.ts";
+import type { FinderResult, PodcastGuestExtract, RunOpts } from "./_types.ts";
+
+const PLAY_NAME = "podcast-guest";
+const SOURCE = "find:podcast-guest";
+
+export interface PodcastGuestFinderOpts extends RunOpts {
+  /** Podcasts to search. Default a small set of YC-adjacent shows. */
+  podcasts?: string[];
+  /** Days back to bias the search query. Default 21. */
+  sinceDays?: number;
+  /** Skip the deeper webRead step (cheaper but less accurate). */
+  skipRead?: boolean;
+  /**
+   * Founder's one-line angle. Podcast-guest has no such field for its own
+   * play (the hook quote/bridge IS the angle), but `design-partner-loi`
+   * requires one. Only read/required when `play` routes there. See #705.
+   */
+  yourEdge?: string;
+  /**
+   * Route this finder's rows to `design-partner-loi` (the enterprise
+   * register) instead of `podcast-guest`'s own founder-to-founder play.
+   * `"design-partner-loi"` opts in; absent = today's behaviour, unchanged.
+   * Requires `buyerType`. See issue #705.
+   */
+  play?: string;
+  /** Required when `play` is `"design-partner-loi"`. See `DesignPartnerLoiTarget.buyerType`. */
+  buyerType?: string;
+}
+
+const DEFAULT_PODCASTS = [
+  "Latent Space",
+  "Lenny's Podcast",
+  "20VC",
+  "Acquired",
+  "Invest Like the Best",
+];
+
+interface SearchHit {
+  url: string;
+  title: string;
+  description: string;
+}
+
+export async function runPodcastGuestFinder(opts: PodcastGuestFinderOpts): Promise<FinderResult> {
+  const limit = opts.limit ?? 25;
+  const sinceDays = opts.sinceDays ?? 21;
+  const icp = resolveIcp(opts.icpOverride);
+  const ledger = getLedger();
+  const system = loadPrompt("podcast-guest-extract");
+  const podcasts = opts.podcasts && opts.podcasts.length > 0 ? opts.podcasts : DEFAULT_PODCASTS;
+  const route = resolvePlayRoute(opts);
+  const dedupeScope = dedupePlayNames(PLAY_NAME);
+
+  const result: FinderResult = {
+    source: SOURCE,
+    candidates: 0,
+    droppedIcp: 0,
+    droppedDuplicate: 0,
+    droppedEnrichment: 0,
+    enqueued: 0,
+    costUsd: 0,
+  };
+
+  const seen = new Set<string>();
+  const hits: SearchHit[] = [];
+  const sincePhrase = sinceDays <= 7 ? "this week" : `last ${sinceDays} days`;
+
+  for (const show of podcasts) {
+    if (hits.length >= limit * 2) break;
+    const query = `"${show}" episode guest ${sincePhrase}`;
+    try {
+      const search = await webSearch(
+        { query, maxResults: Math.min(15, limit) },
+        { playName: PLAY_NAME },
+      );
+      result.costUsd += search.result.cost ?? 0;
+      for (const hit of search.result.results ?? []) {
+        if (!hit.url || seen.has(hit.url)) continue;
+        seen.add(hit.url);
+        hits.push({ url: hit.url, title: hit.title, description: hit.description });
+      }
+    } catch (err) {
+      logEvent(
+        "error.swallowed",
+        {
+          kind: "podcast-guest.webSearch",
+          show,
+          message_120: ((err as Error).message ?? "").slice(0, 120),
+        },
+        "warn",
+      );
+    }
+  }
+  result.candidates = hits.length;
+
+  for (const hit of hits.slice(0, limit)) {
+    if (result.enqueued >= limit) break;
+    if (opts.maxCostUsd != null && result.costUsd >= opts.maxCostUsd) {
+      result.halted = `max-cost cap (${opts.maxCostUsd})`;
+      break;
+    }
+    if (dedupeScope.some((p) => ledger.isQueueDuplicate(p, hit.url))) {
+      result.droppedDuplicate++;
+      continue;
+    }
+
+    if (opts.dryRun) {
+      result.enqueued++;
+      continue;
+    }
+
+    const filter = await icpFilter({
+      icp,
+      candidate: { title: hit.title, url: hit.url, summary: hit.description },
+    });
+    if (filter.match === null) {
+      // Transient classifier failure (Anthropic 5xx, timeout, rate limit):
+      // drop without persisting. A rejection would burn the dedupeKey for
+      // every future watch tick since isQueueDuplicate ignores status.
+      result.droppedEnrichment++;
+      continue;
+    }
+    if (!filter.match) {
+      result.droppedIcp++;
+      ledger.enqueueTarget({
+        playName: PLAY_NAME,
+        payload: { title: hit.title, url: hit.url, description: hit.description },
+        dedupeKey: hit.url,
+        source: SOURCE,
+        initialStatus: "rejected",
+        notes: `auto: ICP — ${filter.reason}`,
+      });
+      continue;
+    }
+
+    let extract: PodcastGuestExtract;
+    try {
+      let payload: Record<string, unknown> = {
+        url: hit.url,
+        title: hit.title,
+        description: hit.description,
+      };
+      if (!opts.skipRead) {
+        const read = await webRead({ url: hit.url }, { playName: PLAY_NAME });
+        result.costUsd += read.result.cost ?? 0;
+        payload = { ...payload, markdown: (read.result.markdown ?? "").slice(0, 12000) };
+      }
+      const llm = await complete({
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: JSON.stringify(payload) },
+        ],
+        temperature: 0.1,
+        maxTokens: 500,
+      });
+      extract = parsePodcastGuestExtract(llm.content);
+    } catch (err) {
+      logEvent(
+        "error.swallowed",
+        {
+          kind: "podcast-guest.llm.extract",
+          message_120: ((err as Error).message ?? "").slice(0, 120),
+        },
+        "warn",
+      );
+      result.droppedEnrichment++;
+      continue;
+    }
+
+    if (!extract.guestName || !extract.guestCompanyDomain || !extract.podcastName) {
+      result.droppedEnrichment++;
+      continue;
+    }
+    // Stage A: judge the extracted role BEFORE paying for findEmail +
+    // verify + enrich. A clearly off-ICP guestRole must not consume
+    // the run's cost budget and crowd out valid candidates behind it.
+    const preSpend = await qualifyPreSpend({
+      icp,
+      person: {
+        name: extract.guestName,
+        company: extract.guestCompany,
+        roleText: extract.guestRole,
+        evidence: `guest on ${extract.podcastName ?? "a podcast"}`,
+      },
+    });
+    if (preSpend.action === "reject") {
+      result.droppedRole = (result.droppedRole ?? 0) + 1;
+      persistRoleRejection({
+        playName: PLAY_NAME,
+        dedupeKey: hit.url,
+        payload: { name: extract.guestName },
+        source: SOURCE,
+        reason: preSpend.reason,
+        dryRun: opts.dryRun,
+      });
+      continue;
+    }
+
+    const contact = await resolveVerifyEnrichQualify({
+      playName: PLAY_NAME,
+      fullName: extract.guestName,
+      companyDomain: extract.guestCompanyDomain,
+      isDuplicate: (email) =>
+        isDuplicate({ playName: dedupeScope, dedupeKey: hit.url, prospectEmail: email }),
+      icp,
+      person: {
+        name: extract.guestName,
+        company: extract.guestCompany,
+        roleText: extract.guestRole,
+        evidence: `guest on ${extract.podcastName ?? "a podcast"}`,
+      },
+      // Stage-C target when email enrichment surfaces no LinkedIn: the page
+      // extract often carries one, and without it an off-ICP person slides
+      // through as `unclear` instead of being judged on a bought title.
+      linkedinUrlHint: isLinkedInProfileUrl(extract.linkedinUrl) ? extract.linkedinUrl : null,
+      fillGaps: opts.qualifyFillGaps ?? true,
+    });
+    result.costUsd += contact.costUsd;
+    if (!contact.ok) {
+      if (contact.reason === "duplicate") result.droppedDuplicate++;
+      else if (contact.reason === "role") {
+        result.droppedRole = (result.droppedRole ?? 0) + 1;
+        persistRoleRejection({
+          playName: PLAY_NAME,
+          dedupeKey: hit.url,
+          payload: { name: extract.guestName },
+          source: SOURCE,
+          reason: contact.detail ?? "off-ICP role",
+          dryRun: opts.dryRun,
+        });
+      } else result.droppedEnrichment++;
+      continue;
+    }
+    // "" on a LinkedIn-channel contact: the row's channel decides how it is sent.
+    const email = contact.email ?? "";
+
+    const enr = { phone: contact.phone, linkedinUrl: contact.linkedinUrl };
+    // Priority mirrors LinkedIn chain: page-specific extract beats generic
+    // enrichment lookup when both are set.
+    const phone = (extract.phone || null) ?? enr.phone;
+    let linkedinUrl: string | null = isLinkedInProfileUrl(extract.linkedinUrl)
+      ? extract.linkedinUrl
+      : null;
+    linkedinUrl =
+      contact.channel === "linkedin" ? contact.linkedinUrl : (linkedinUrl ?? enr.linkedinUrl);
+    if (!linkedinUrl) {
+      linkedinUrl = await findLinkedInUrl({
+        fullName: extract.guestName,
+        disambiguators: [extract.podcastName],
+        accumCost: (c) => {
+          result.costUsd += c ?? 0;
+        },
+        errKindPrefix: "podcast-guest",
+      });
+    }
+
+    const target: PodcastGuestTarget = {
+      name: extract.guestName,
+      email,
+      company: extract.guestCompany ?? extract.guestCompanyDomain,
+      podcast: extract.podcastName,
+      episodeTitle: extract.episodeTitle ?? hit.title,
+      hookQuote: (extract.summary ?? hit.description ?? "").slice(0, 240),
+      ...(linkedinUrl ? { linkedinUrl } : {}),
+      ...(phone ? { phone } : {}),
+      ...(contact.title ? { title: contact.title } : {}),
+      ...icpFields(contact),
+    };
+    const id = enqueueScoredTarget(ledger, {
+      playName: route ? route.playName : PLAY_NAME,
+      payload: route
+        ? buildDesignPartnerLoiPayload({
+            name: target.name,
+            email: target.email,
+            company: target.company,
+            buyerType: route.buyerType,
+            yourEdge: (opts.yourEdge ?? "").trim(),
+            title: contact.title,
+            linkedinUrl,
+            phone,
+            icp: icpFields(contact),
+          })
+        : target,
+      dedupeKey: hit.url,
+      source: SOURCE,
+      fitReason: filter.reason,
+      notes: `${extract.guestName} on ${extract.podcastName} — ${filter.reason}`,
+      channel: contact.channel,
+    });
+    if (id != null) result.enqueued++;
+    else result.droppedDuplicate++;
+  }
+
+  return result;
+}
+
+export function parsePodcastGuestExtract(raw: string): PodcastGuestExtract {
+  return tryParseJsonObject<PodcastGuestExtract>(raw, {
+    podcastName: null,
+    episodeTitle: null,
+    episodeUrl: null,
+    guestName: null,
+    guestRole: null,
+    guestCompany: null,
+    guestCompanyDomain: null,
+    publishedAt: null,
+    linkedinUrl: null,
+    phone: null,
+    summary: null,
+  });
+}

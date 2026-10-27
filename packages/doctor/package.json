@@ -1,0 +1,19 @@
+{
+  "name": "@oneshot-gtm/doctor",
+  "version": "0.10.0",
+  "homepage": "https://oneshot-gtm.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oneshot-agent/oneshot-gtm",
+    "directory": "packages/doctor"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@oneshot-gtm/core": "workspace:*",
+    "@oneshot-gtm/find": "workspace:*"
+  }
+}

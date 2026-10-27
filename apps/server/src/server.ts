@@ -1,0 +1,478 @@
+import { getOnboarding, deferOnboarding, verifyOnboardingAI } from "./api/onboarding.ts";
+import { resolveQueueContactRoute } from "./api/queue-contact.ts";
+import { queueDossierRoute } from "./api/queue-dossier.ts";
+import {
+  repliesRoute,
+  replyStateRoute,
+  replyDraftSaveRoute,
+  replyGenerateRoute,
+  replyLearningRoute,
+  replyImproveRoute,
+  replySendRoute,
+  repliesLinkedInRoute,
+  replyAssignRoute,
+  replyProspectsRoute,
+} from "./api/replies.ts";
+import { directMailRoute } from "./api/direct-mail.ts";
+import {
+  mailboxStateRoute,
+  mailboxMatchRoute,
+  mailboxHistoryRoute,
+  mailboxRefreshRoute,
+  mailboxConnectRoute,
+} from "./api/mailboxes.ts";
+import { existsSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { configDir, demoMode, scrubDemoPaths } from "@oneshot-gtm/core";
+import { health } from "./api/health.ts";
+import { homeMetrics } from "./api/home.ts";
+import {
+  listCadences,
+  getCadence,
+  stopCadence,
+  skipCadenceMailRoute,
+  skipCadenceMailBatchRoute,
+  previewCadenceStepRoute,
+  sendCadenceStepRoute,
+  previewCadenceBatchRoute,
+  sendCadenceBatchRoute,
+  cadenceDraftVersionsRoute,
+} from "./api/cadences.ts";
+import { listReceipts, getReceipt } from "./api/receipts.ts";
+import {
+  archiveInboxConversationRoute,
+  draftReplyRoute,
+  listInboxRoute,
+  saveDraftRoute,
+  sendReplyRoute,
+  steerRoute,
+} from "./api/inbox.ts";
+import { listPlays, setCadenceRoute } from "./api/plays.ts";
+import {
+  measureCac,
+  measureRocs,
+  measureRocsByGoal,
+  measureSpendSeries,
+  recordOutcome,
+} from "./api/measure.ts";
+import {
+  setup,
+  getSetupDomains,
+  getSetupStatus,
+  linkedinSessionRoute,
+  linkedinLoginStartRoute,
+  linkedinLoginFinishRoute,
+  linkedinLoginCancelRoute,
+  linkedinLoginStateRoute,
+} from "./api/setup.ts";
+import { gmailAuthCallbackRoute, startGmailAuthRoute } from "./api/gmail-auth.ts";
+import {
+  confirmMeetingMatchRoute,
+  dismissMeetingMatchRoute,
+  listMeetingsRoute,
+  logMeetingOutcomeRoute,
+} from "./api/meetings.ts";
+import { listCalendarsRoute } from "./api/calendar-setup.ts";
+import { smartleadAccountsRoute } from "./api/smartlead.ts";
+import { deriveBriefRoute } from "./api/derive-brief.ts";
+import { deriveIcpRoute } from "./api/derive-icp.ts";
+import { strategistRoute } from "./api/strategist.ts";
+import { doctor } from "./api/doctor.ts";
+import { workspaceInfo, workspaceLaunch } from "./api/workspace.ts";
+import { pauseDomainRoute, resumeDomainRoute } from "./api/domains.ts";
+import { cancelRunRoute, runPlay } from "./api/run.ts";
+import { getRunRoute } from "./api/runs.ts";
+import {
+  approveAllRoute,
+  approveQueueRoute,
+  drainQueueRoute,
+  listQueueRoute,
+  importQueueRowRoute,
+  markSentRoute,
+  withdrawInviteRoute,
+  setQueueChannelRoute,
+  moveQueueRowRoute,
+  queueDraftVersionsRoute,
+  queueRowDetailRoute,
+  regenerateDraftRoute,
+  rejectQueueRoute,
+  suggestRejectReasonRoute,
+  searchQueueRoute,
+  sendDraftRoute,
+} from "./api/queue.ts";
+import {
+  listTriggersRoute,
+  runTriggerRoute,
+  setTriggerConfigRoute,
+  setTriggerEnabledRoute,
+} from "./api/triggers.ts";
+import { applyPackRoute, listPacksRoute } from "./api/packs.ts";
+import {
+  approveIcpProposalRoute,
+  dismissIcpProposalRoute,
+  listIcpProposalsRoute,
+} from "./api/icp-proposals.ts";
+import { addProspectRoute } from "./api/prospects.ts";
+import { calNoShowWebhookRoute, signupWebhookRoute } from "./api/webhook-triggers.ts";
+import { markLinkedInReplyRoute } from "./api/linkedin-replies.ts";
+
+interface ServerOptions {
+  port: number;
+}
+
+interface RouteHandler {
+  (req: Request, params: Record<string, string>): Promise<Response> | Response;
+}
+
+interface RouteEntry {
+  method: string;
+  pattern: RegExp;
+  paramNames: string[];
+  handler: RouteHandler;
+}
+
+function route(method: string, pattern: string, handler: RouteHandler): RouteEntry {
+  const paramNames: string[] = [];
+  const regexStr = pattern.replace(/:(\w+)/g, (_, name: string) => {
+    paramNames.push(name);
+    return "([^/]+)";
+  });
+  return { method, pattern: new RegExp(`^${regexStr}$`), paramNames, handler };
+}
+
+const routes: RouteEntry[] = [
+  route("GET", "/api/direct-mail", directMailRoute),
+  route("POST", "/api/direct-mail/:action", directMailRoute),
+  route("GET", "/api/health", health),
+  route("GET", "/api/home", homeMetrics),
+  route("GET", "/api/cadences", listCadences),
+  route("GET", "/api/cadences/:id", getCadence),
+  route("POST", "/api/cadences/:id/stop", stopCadence),
+  route("POST", "/api/cadences/:id/skip-mail", skipCadenceMailRoute),
+  route("POST", "/api/cadences/skip-mail-batch", skipCadenceMailBatchRoute),
+  route("POST", "/api/prospects/:id/linkedin-reply", markLinkedInReplyRoute),
+  route("GET", "/api/cadences/:id/drafts", cadenceDraftVersionsRoute),
+  route("POST", "/api/cadences/:id/preview-next", previewCadenceStepRoute),
+  route("POST", "/api/cadences/:id/send-next", sendCadenceStepRoute),
+  route("POST", "/api/cadences/preview-batch", previewCadenceBatchRoute),
+  route("POST", "/api/cadences/send-batch", sendCadenceBatchRoute),
+  route("GET", "/api/receipts", listReceipts),
+  route("GET", "/api/receipts/:id", getReceipt),
+  route("GET", "/api/replies", repliesRoute),
+  route("GET", "/api/replies/prospects", replyProspectsRoute),
+  route("POST", "/api/replies/state", replyStateRoute),
+  route("POST", "/api/replies/drafts", replyDraftSaveRoute),
+  route("POST", "/api/replies/generate", replyGenerateRoute),
+  route("GET", "/api/replies/learning", replyLearningRoute),
+  route("POST", "/api/replies/learning", replyLearningRoute),
+  route("POST", "/api/replies/improve", replyImproveRoute),
+  route("POST", "/api/replies/send", replySendRoute),
+  route("POST", "/api/replies/linkedin", repliesLinkedInRoute),
+  route("POST", "/api/replies/assign", replyAssignRoute),
+  route("GET", "/api/inbox", listInboxRoute),
+  route("POST", "/api/inbox/thread-state", mailboxStateRoute),
+  route("POST", "/api/inbox/thread-match", mailboxMatchRoute),
+  route("POST", "/api/inbox/thread-history", mailboxHistoryRoute),
+  route("POST", "/api/inbox/mailbox-refresh", mailboxRefreshRoute),
+  route("POST", "/api/inbox/mailbox-connect", mailboxConnectRoute),
+  route("POST", "/api/inbox/archive", archiveInboxConversationRoute),
+  route("POST", "/api/inbox/draft-reply", draftReplyRoute),
+  route("POST", "/api/inbox/draft", saveDraftRoute),
+  route("POST", "/api/inbox/reply", sendReplyRoute),
+  route("POST", "/api/inbox/steer", steerRoute),
+  route("GET", "/api/plays", listPlays),
+  route("POST", "/api/plays/:name/cadence", setCadenceRoute),
+  route("GET", "/api/measure/cac", measureCac),
+  route("GET", "/api/measure/rocs", measureRocs),
+  route("GET", "/api/measure/rocs-by-goal", measureRocsByGoal),
+  route("GET", "/api/measure/spend-series", measureSpendSeries),
+  route("POST", "/api/measure/outcome", recordOutcome),
+  route("GET", "/api/onboarding", getOnboarding),
+  route("POST", "/api/onboarding/defer", deferOnboarding),
+  route("POST", "/api/onboarding/verify-ai", verifyOnboardingAI),
+  route("GET", "/api/setup", getSetupStatus),
+  route("GET", "/api/setup/domains", getSetupDomains),
+  route("GET", "/api/setup/calendars", listCalendarsRoute),
+  route("POST", "/api/setup", setup),
+  route("POST", "/api/domains/resume", resumeDomainRoute),
+  route("POST", "/api/domains/pause", pauseDomainRoute),
+  route("GET", "/api/gmail/auth/start", startGmailAuthRoute),
+  route("GET", "/api/gmail/auth/callback", gmailAuthCallbackRoute),
+  route("GET", "/api/meetings", listMeetingsRoute),
+  route("POST", "/api/meetings/outcome", logMeetingOutcomeRoute),
+  route("POST", "/api/meetings/confirm", confirmMeetingMatchRoute),
+  route("POST", "/api/meetings/dismiss", dismissMeetingMatchRoute),
+  route("POST", "/api/smartlead/accounts", smartleadAccountsRoute),
+  route("POST", "/api/setup/derive-icp", deriveIcpRoute),
+  route("POST", "/api/setup/derive-brief", deriveBriefRoute),
+  route("POST", "/api/setup/linkedin-session", linkedinSessionRoute),
+  route("POST", "/api/setup/linkedin-login/start", linkedinLoginStartRoute),
+  route("POST", "/api/setup/linkedin-login/finish", linkedinLoginFinishRoute),
+  route("POST", "/api/setup/linkedin-login/cancel", linkedinLoginCancelRoute),
+  route("GET", "/api/setup/linkedin-login/state", linkedinLoginStateRoute),
+  route("POST", "/api/strategist/stream", strategistRoute),
+  route("GET", "/api/doctor", doctor),
+  route("GET", "/api/workspace", workspaceInfo),
+  route("POST", "/api/workspace/launch", workspaceLaunch),
+  route("POST", "/api/run/:playName", runPlay),
+  // Distinct shape from the line above (three segments, not two), so the
+  // patterns can't collide however they are ordered.
+  route("POST", "/api/run/:runId/cancel", cancelRunRoute),
+  route("GET", "/api/runs/:id", getRunRoute),
+  route("POST", "/api/prospects/add", addProspectRoute),
+  route("GET", "/api/queue", listQueueRoute),
+  // Literal before param: `:id` matches [^/]+ and would otherwise swallow "search".
+  route("GET", "/api/queue/search", searchQueueRoute),
+  // Literal before param for the same reason; the destination side of a move.
+  route("POST", "/api/queue/import", importQueueRowRoute),
+  route("GET", "/api/queue/:id", queueRowDetailRoute),
+  route("GET", "/api/queue/:id/drafts", queueDraftVersionsRoute),
+  route("GET", "/api/queue/:id/dossier", queueDossierRoute),
+  route("POST", "/api/queue/approve-all", approveAllRoute),
+  route("POST", "/api/queue/drain", drainQueueRoute),
+  route("POST", "/api/queue/:id/approve", approveQueueRoute),
+  route("POST", "/api/queue/:id/resolve-contact", resolveQueueContactRoute),
+  route("POST", "/api/queue/:id/reject", rejectQueueRoute),
+  route("POST", "/api/queue/:id/reject-reason", suggestRejectReasonRoute),
+  route("POST", "/api/queue/:id/regenerate", regenerateDraftRoute),
+  route("POST", "/api/queue/:id/send-draft", sendDraftRoute),
+  route("POST", "/api/queue/:id/mark-sent", markSentRoute),
+  route("POST", "/api/queue/:id/withdraw-invite", withdrawInviteRoute),
+  route("POST", "/api/queue/:id/channel", setQueueChannelRoute),
+  route("POST", "/api/queue/:id/move", moveQueueRowRoute),
+  route("GET", "/api/triggers", listTriggersRoute),
+  route("POST", "/api/triggers/cal-no-show", calNoShowWebhookRoute),
+  route("POST", "/api/triggers/signup", signupWebhookRoute),
+  route("POST", "/api/triggers/:name/enabled", setTriggerEnabledRoute),
+  route("POST", "/api/triggers/:name/config", setTriggerConfigRoute),
+  route("POST", "/api/triggers/:name/run", runTriggerRoute),
+  route("GET", "/api/packs", listPacksRoute),
+  route("POST", "/api/packs/:id/apply", applyPackRoute),
+  route("GET", "/api/icp-proposals", listIcpProposalsRoute),
+  route("POST", "/api/icp-proposals/:id/approve", approveIcpProposalRoute),
+  route("POST", "/api/icp-proposals/:id/dismiss", dismissIcpProposalRoute),
+];
+
+function findRoute(req: Request): { handler: RouteHandler; params: Record<string, string> } | null {
+  const url = new URL(req.url);
+  for (const r of routes) {
+    if (r.method !== req.method) continue;
+    const m = r.pattern.exec(url.pathname);
+    if (!m) continue;
+    const params: Record<string, string> = {};
+    r.paramNames.forEach((name, i) => {
+      params[name] = decodeURIComponent(m[i + 1] ?? "");
+    });
+    return { handler: r.handler, params };
+  }
+  return null;
+}
+
+function getStaticDir(): string | null {
+  // Layouts we might run from:
+  //   1. Source dev:   apps/server/src/server.ts → ../../web/dist
+  //   2. Bundle:       apps/server/dist/bin.mjs  → ../../web/dist
+  //   3. npm publish:  <pkg>/dist/bin.mjs       → ./web (we copy apps/web/dist here)
+  const here = fileURLToPath(new URL(".", import.meta.url));
+  const candidates = [
+    join(here, "..", "..", "web", "dist"),
+    join(here, "..", "..", "..", "web", "dist"),
+    join(here, "web"),
+  ];
+  for (const c of candidates) {
+    if (existsSync(join(c, "index.html"))) return c;
+  }
+  return null;
+}
+
+const notFound = (): Response =>
+  new Response("not found", { status: 404, headers: { "content-type": "text/plain" } });
+
+/**
+ * Vite content-hashes everything under assets/, so those are immutable. Nothing
+ * else is: index.html must never be cached, or a `bunx oneshot-gtm-server`
+ * upgrade serves a stale document pointing at deleted chunks. A white screen
+ * that a reload does not fix. The brand files in public/ are unhashed too, so
+ * they land in the same revalidate bucket, which is what we want the first time
+ * an icon changes.
+ */
+function cacheHeaders(rel: string): Record<string, string> {
+  return rel.startsWith("assets/")
+    ? { "cache-control": "public, max-age=31536000, immutable" }
+    : { "cache-control": "no-cache" };
+}
+
+/** Exported for tests: CI never runs the web build, so this is the only cover it gets. */
+export async function serveStatic(staticDir: string, pathname: string): Promise<Response> {
+  const root = resolve(staticDir);
+  const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+  const candidate = resolve(root, rel);
+  // Reject anything that escapes the static dir. `relative` rather than a
+  // string prefix: on Windows `resolve` returns backslash-separated paths, so
+  // a `${root}/` comparison rejects every legitimate asset there.
+  const within = relative(root, candidate);
+  if (within.startsWith("..") || isAbsolute(within)) return notFound();
+  const stat = statSync(candidate, { throwIfNoEntry: false });
+  // isFile, not exists: a directory passes existsSync and then Bun.file() fails
+  // mid-stream with EISDIR instead of returning a status.
+  if (stat?.isFile()) {
+    return new Response(Bun.file(candidate), { headers: cacheHeaders(rel) });
+  }
+  // An existing non-file (/assets, say) is not a client route, so it must not
+  // be handed the SPA shell just for having no dot in it.
+  if (stat) return notFound();
+  // SPA fallback: serve index.html for non-asset paths (paths without a dot).
+  if (!rel.includes(".")) {
+    return new Response(Bun.file(join(root, "index.html")), {
+      headers: cacheHeaders("index.html"),
+    });
+  }
+  // A missing asset used to fall through to the 200 text/plain "server running"
+  // body below, which the browser then tried to decode AS the asset. A missing
+  // icon looked like a corrupt one, with no status to explain it.
+  return notFound();
+}
+
+export function buildFetchHandler(): (req: Request) => Promise<Response> | Response {
+  const staticDir = getStaticDir();
+  const viteDevUrl = process.env["VITE_DEV_SERVER_URL"] ?? null;
+
+  return async function fetchHandler(req) {
+    const url = new URL(req.url);
+
+    // DNS-rebinding defense: reject any request whose Host header isn't a
+    // loopback name. An attacker who points evil.com at 127.0.0.1 still
+    // sends Host: evil.com to the browser, which we reject here.
+    if (!isLoopbackHost(req.headers.get("host"))) {
+      return new Response("forbidden: non-loopback host", {
+        status: 403,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+
+    // CORS for vite dev server (different port). Non-loopback origins get
+    // an empty header set from corsHeaders() → browser blocks both
+    // preflight and the response, preventing CSRF-style side effects on
+    // mutating endpoints (e.g. POST /api/run/$playName triggering spend).
+    if (req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(req),
+      });
+    }
+
+    if (url.pathname.startsWith("/api/")) {
+      // Cross-site request forgery defense for every mutating route. The CORS
+      // headers below only keep a cross-site page from READING a response; a
+      // simple POST (form, text/plain fetch) still executes. Browsers stamp
+      // `Origin` on every POST and page script cannot forge it, so a mutating
+      // call whose Origin is not loopback is refused before dispatch. No
+      // Origin (curl, the CLI, server-side fetch) passes as before.
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        const origin = req.headers.get("origin") ?? "";
+        if (!isLoopbackOrigin(origin) || req.headers.get("sec-fetch-site") === "cross-site") {
+          return jsonResponse({ error: "forbidden: cross-site request" }, 403, req);
+        }
+      }
+      const match = findRoute(req);
+      if (!match) {
+        return jsonResponse({ error: "not found", path: url.pathname }, 404, req);
+      }
+      try {
+        const res = await match.handler(req, match.params);
+        // Inject CORS headers if not already set
+        for (const [k, v] of Object.entries(corsHeaders(req))) {
+          if (!res.headers.has(k)) res.headers.set(k, v);
+        }
+        return res;
+      } catch (err) {
+        return jsonResponse({ error: (err as Error).message ?? "internal error" }, 500, req);
+      }
+    }
+
+    // Dev: the real UI is served by Vite (with HMR), so redirect non-API
+    // requests there: preserving the path so a bookmarked deep-link like
+    // :3030/cadences lands on :5173/cadences. This takes precedence over the
+    // built `dist`: in dev that bundle is stale (frontend changes only land in
+    // `dist` on a rebuild), and serving it silently is a footgun.
+    if (viteDevUrl) {
+      return Response.redirect(`${viteDevUrl}${url.pathname}${url.search}`, 302);
+    }
+
+    // Static / SPA serving (production / built dashboard). getStaticDir only
+    // returns a dir that contains index.html, so the message below stays
+    // reachable for its one real case: no build on disk at all.
+    if (staticDir) return await serveStatic(staticDir, url.pathname);
+
+    return new Response(
+      "oneshot-gtm server running. Build the web app to see the dashboard, or set VITE_DEV_SERVER_URL.",
+      { status: 200, headers: { "content-type": "text/plain" } },
+    );
+  };
+}
+
+/** Shared options; idleTimeout 255 is the max: Bun defaults to 10s which is short for sync handlers. */
+export const SERVER_BASE_OPTS = { idleTimeout: 255 } as const;
+
+export async function startServer(
+  opts: ServerOptions,
+): Promise<{ url: string; server: ReturnType<typeof Bun.serve> }> {
+  const server = Bun.serve({
+    port: opts.port,
+    hostname: "127.0.0.1",
+    ...SERVER_BASE_OPTS,
+    fetch: buildFetchHandler(),
+  });
+
+  return { url: `http://127.0.0.1:${server.port}`, server };
+}
+
+export function isLoopbackOrigin(origin: string): boolean {
+  // Empty origin = same-origin request (curl, server-side fetch); allow.
+  if (origin === "") return true;
+  try {
+    const url = new URL(origin);
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isLoopbackHost(host: string | null): boolean {
+  if (!host) return false;
+  const hostname = host.replace(/:\d+$/, "").toLowerCase();
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+}
+
+function corsHeaders(req: Request): Record<string, string> {
+  // Loopback-only. Non-loopback origins get NO Access-Control-* headers,
+  // which makes the browser refuse both the preflight and any cross-origin
+  // response read.
+  const origin = req.headers.get("origin") ?? "";
+  if (!isLoopbackOrigin(origin)) {
+    return {};
+  }
+  return {
+    "Access-Control-Allow-Origin": origin || "http://127.0.0.1",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "content-type",
+    Vary: "Origin",
+  };
+}
+
+export function jsonResponse(body: unknown, status = 200, req?: Request): Response {
+  const headers: Record<string, string> = {
+    "content-type": "application/json; charset=utf-8",
+  };
+  if (req) Object.assign(headers, corsHeaders(req));
+
+  // Every JSON response the server produces passes through here, which is the
+  // only place a demo install can be stopped from printing the operator's home
+  // directory back at a camera. See scrubDemoPaths.
+  const json = JSON.stringify(body);
+  return new Response(demoMode() ? scrubDemoPaths(json, configDir()) : json, { status, headers });
+}

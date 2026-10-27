@@ -1,0 +1,195 @@
+import { emailDomain } from "./_lib.ts";
+import { type EmailPlayDef, runEmailPlay, standardEnrich } from "./_run-play.ts";
+import { designPartnerLoiMetadata } from "./_metadata.ts";
+import { buildFollowUpEmail, registerSequence } from "./_cadence.ts";
+import { recentPostsBlock } from "./_recent-posts.ts";
+
+const PLAY_NAME = "design-partner-loi";
+
+/**
+ * Buyer-type strings this play is allowed to draft for. The finders that
+ * feed this play route by config (gov-solicitation, a future local-business
+ * pack), so a misconfigured trigger, or a future pack pointing the wrong
+ * lane at it: could hand this play an owner-operator target under a label
+ * we've never seen (e.g. "restaurant", "small-business", a typo of
+ * "owner-operator"). An enumeration of known-bad labels can't defend against
+ * an unknown future one, so this is an ALLOWLIST of the three supported
+ * buyer types: anything else is rejected, not just the labels we happen to
+ * know about today. Convention (the TypeScript field being typed as a union)
+ * is not a guard: `buyerType` arrives as a plain string off a finder
+ * payload, so the check must be a runtime one, not just a type. Checked
+ * BEFORE any paid call.
+ */
+const ALLOWED_BUYER_TYPES = new Set(["enterprise", "government", "hardware"]);
+
+/**
+ * Predicate form of the allowlist, for callers that need to validate a
+ * `buyerType` BEFORE committing to route to this play (e.g. a trigger's
+ * readiness gate or the config route, which must warn rather than let a bad
+ * value reach the runtime throw below). Single source of truth: this and
+ * `assertNotOwnerOperatorBuyer` share `ALLOWED_BUYER_TYPES` so the two can
+ * never drift apart.
+ */
+export function isAllowedDesignPartnerLoiBuyerType(buyerType: string): boolean {
+  return ALLOWED_BUYER_TYPES.has(buyerType.trim().toLowerCase());
+}
+
+/**
+ * Throws unless `buyerType` is one of the supported buyer types
+ * (enterprise/government/hardware). The "design partner" / "non-binding
+ * LOI" register is real language for those buyers and exactly the wrong
+ * language for an owner-operator counterpart such as an independent
+ * restaurateur or a two-truck plumber (see #457's free-pilot /
+ * discovery-interview instead). Rejects by allowlist rather than by naming
+ * known-bad labels, so an unrecognized or misspelled owner-operator-ish
+ * label from a future finder/pack is refused too. Exported so a test can
+ * assert the guard directly, not just observe its effect on a drafted row.
+ */
+export function assertNotOwnerOperatorBuyer(buyerType: string): void {
+  if (!isAllowedDesignPartnerLoiBuyerType(buyerType)) {
+    throw new Error(
+      `design-partner-loi: refusing to draft for buyerType "${buyerType}" — this play is for ` +
+        `enterprise/government/hardware counterparties only, never an owner-operator. Route this ` +
+        `target to free-pilot or discovery-interview instead.`,
+    );
+  }
+}
+
+export interface DesignPartnerLoiTarget {
+  name: string;
+  email: string;
+  company: string;
+  /**
+   * Who is being emailed: deliberately a plain string (not a union) so the
+   * runtime guard above is what enforces the rule, not the type system: a
+   * finder payload arrives untyped off JSON. Expected values: "enterprise",
+   * "government", "hardware". "owner-operator" (or any main-street label)
+   * throws in `prepare` before any paid call.
+   */
+  buyerType: string;
+  /** One fact about how your product fits this buyer's evaluation criteria. */
+  yourEdge: string;
+  linkedinUrl?: string;
+  phone?: string;
+  /** Job title from the person-level ICP gate: persisted to prospects.title. */
+  title?: string;
+  /** A public list the company is on and what that means ("runs Backstage"): list-page rows. */
+  signal?: string;
+  /** The list's own line about this company. */
+  signalContext?: string;
+}
+
+export interface DesignPartnerLoiRunOptions {
+  dryRun: boolean;
+  targets: DesignPartnerLoiTarget[];
+  /** Per-target progress hook installed by /api/run SSE handler. */
+  onProgress?: (
+    index: number,
+    draft: { subject: string; body: string; flags: string[]; sent: boolean; receiptIds: number[] },
+  ) => void;
+  /** Abort signal for the run: see `runEmailPlay`'s `signal`. */
+  signal?: AbortSignal;
+  /** Explicit draft argument chosen by the user; bypasses automatic angle selection. */
+  draftAngle?: string;
+}
+
+export interface DesignPartnerLoiDraft {
+  target: DesignPartnerLoiTarget;
+  subject: string;
+  body: string;
+  receiptIds: number[];
+  sent: boolean;
+  flags: string[];
+}
+
+const designPartnerLoiDef: EmailPlayDef<DesignPartnerLoiTarget> = {
+  playName: PLAY_NAME,
+  promptName: "design-partner-loi-email",
+  maxBodyWords: 150,
+  // Ask-ladder cadence: conversation (day 0) -> scoped pilot (day ~6) -> LOI (day ~14).
+  enrollCadence: true,
+  toEmail: (t) => t.email,
+  prepare: (t) => {
+    assertNotOwnerOperatorBuyer(t.buyerType);
+    return standardEnrich({
+      playName: PLAY_NAME,
+      enrichInput: {
+        ...(t.email ? { email: t.email } : {}),
+        ...(t.linkedinUrl ? { linkedinUrl: t.linkedinUrl } : {}),
+        name: t.name,
+        companyDomain: emailDomain(t.email),
+      },
+      enrichSlice: 3500,
+    });
+  },
+  buildInputBlock: (t, prep, cfg) => {
+    const posts = recentPostsBlock(t as unknown as Record<string, unknown>);
+    return [
+      `FOUNDER: ${cfg.founderName}`,
+      `PRODUCT: ${cfg.productOneLiner}`,
+      `PROSPECT: ${t.name} at ${t.company}`,
+      ...(t.title ? [`ROLE: ${t.title}`] : []),
+      `BUYER TYPE: ${t.buyerType}`,
+      `YOUR EDGE: ${t.yourEdge}`,
+      ...(t.signal
+        ? [`SIGNAL: ${t.signal}${t.signalContext ? ` (the list says: ${t.signalContext})` : ""}`]
+        : []),
+      `DOSSIER:\n${prep.dossier || "(dry-run)"}`,
+      ...(posts ? ["", posts] : []),
+    ].join("\n");
+  },
+  prospectMeta: (t) => ({
+    name: t.name,
+    email: t.email,
+    company: t.company,
+    linkedin_url: t.linkedinUrl ?? null,
+    phone: t.phone ?? null,
+    source: "design-partner-loi",
+  }),
+  metadata: designPartnerLoiMetadata,
+};
+
+export function runDesignPartnerLoi(
+  opts: DesignPartnerLoiRunOptions,
+): Promise<{ drafted: DesignPartnerLoiDraft[] }> {
+  return runEmailPlay(designPartnerLoiDef, opts);
+}
+
+// Ask ladder, one rung per touch: day 0 asks whether they own the problem;
+// day ~6 offers the design-partner conversation; day ~14 proposes a scoped
+// pilot and closes. Each touch adds substance, not just a bigger ask.
+registerSequence({
+  playName: PLAY_NAME,
+  steps: [
+    {
+      dayOffset: 6,
+      channel: "email",
+      breakOnReply: true,
+      label: "design-partner offer",
+      builder: buildFollowUpEmail({
+        playName: PLAY_NAME,
+        promptName: "design-partner-loi-offer-followup",
+        contextLines: [
+          `PLAY: design-partner-loi. Step 2 of the ask ladder: the first email asked whether ` +
+            `they own the problem; now offer the design-partner conversation.`,
+        ],
+        prospectContext: true,
+        admission: true,
+      }),
+    },
+    {
+      dayOffset: 8, // ~14 days from enrollment
+      channel: "email",
+      breakOnReply: true,
+      label: "scoped pilot + close",
+      builder: buildFollowUpEmail({
+        playName: PLAY_NAME,
+        promptName: "design-partner-loi-pilot-followup",
+        contextLines: [
+          `PLAY: design-partner-loi. Final rung: propose one scoped pilot and close the thread.`,
+        ],
+        prospectContext: true,
+      }),
+    },
+  ],
+});

@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+reviews:
+  profile: chill
+
+  # Keep a visible completion signal even when a review has no findings.
+  review_status: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    # The default branch is always reviewed; these are the EXTRA bases. `feat/.*`
+    # is a regex, not a glob — the schema takes regex here.
+    base_branches:
+      - staging
+      - "feat/.*"
+
+  # Exclude generated output from source review.
+  path_filters:
+    - "!**/*.lock"
+    - "!**/*.lockb"
+    - "!**/package-lock.json"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/*.snap"

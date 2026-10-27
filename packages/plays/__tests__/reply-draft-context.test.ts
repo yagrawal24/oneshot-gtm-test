@@ -1,0 +1,315 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// What draftInboxReply's user block contains, per input. The regression suite
+// for "the reply draft has nothing real to draw on". The LLM is mocked; we
+// assert on the assembled prompt block.
+
+let cfgOverride: { productBrief: string | null; icpOneLiner: string | null } = {
+  productBrief: null,
+  icpOneLiner: null,
+};
+
+vi.mock("@oneshot-gtm/core", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/core")>("@oneshot-gtm/core");
+  return {
+    ...actual,
+    loadConfig: () => ({
+      walletMode: "cdp",
+      llmProvider: "anthropic",
+      llmModel: "x",
+      telemetryEnabled: false,
+      founderName: "Mira",
+      founderEmail: null,
+      productOneLiner: "drop-in tracing",
+      productDomain: null,
+      sendingDomain: null,
+      emailProvider: "oneshot",
+      emailIdentities: null,
+      icpOneLiner: cfgOverride.icpOneLiner,
+      cadenceOverrides: null,
+      founderCredentials: null,
+      productPortfolio: null,
+      partners: null,
+      productBrief: cfgOverride.productBrief,
+      mobileSignature: false,
+      clientId: null,
+    }),
+  };
+});
+
+const completeMock = vi.fn();
+vi.mock("@oneshot-gtm/intel", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/intel")>("@oneshot-gtm/intel");
+  return { ...actual, complete: completeMock };
+});
+
+const { draftInboxReply } = await import("../src/reply.ts");
+
+function lastUserBlock(): string {
+  const call = completeMock.mock.calls.at(-1)?.[0] as {
+    messages: Array<{ role: string; content: string }>;
+  };
+  return call.messages.find((m) => m.role === "user")?.content ?? "";
+}
+
+beforeEach(() => {
+  cfgOverride = { productBrief: null, icpOneLiner: null };
+  completeMock.mockResolvedValue({ content: JSON.stringify({ body: "drafted." }) });
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
+
+const BASE = { fromEmail: "a@b.dev", subject: "Re: x", body: "tell me about payments" };
+
+describe("draftInboxReply context assembly", () => {
+  it("injects PRODUCT BRIEF and ICP when configured", async () => {
+    cfgOverride = {
+      productBrief: "Settled per call in USDC on Base.\nhttps://docs.example.com/payments",
+      icpOneLiner: "seed-stage agent builders",
+    };
+    await draftInboxReply(BASE);
+    const block = lastUserBlock();
+    expect(block).toContain("PRODUCT BRIEF (facts and the ONLY links you may cite):");
+    expect(block).toContain("https://docs.example.com/payments");
+    expect(block).toContain("ICP: seed-stage agent builders");
+  });
+
+  it("omits the brief/ICP blocks cleanly when unset", async () => {
+    await draftInboxReply(BASE);
+    const block = lastUserBlock();
+    expect(block).not.toContain("PRODUCT BRIEF");
+    expect(block).not.toContain("ICP:");
+  });
+
+  it("injects the sender dossier when research produced one", async () => {
+    await draftInboxReply({ ...BASE, dossier: "Runs x402 payments on his own site." });
+    expect(lastUserBlock()).toContain(
+      "SENDER DOSSIER (research about who wrote this):\nRuns x402 payments on his own site.",
+    );
+  });
+
+  it("omits the dossier block for blank research", async () => {
+    await draftInboxReply({ ...BASE, dossier: "  " });
+    expect(lastUserBlock()).not.toContain("SENDER DOSSIER");
+  });
+
+  it("injects prior thread replies so round 2 doesn't repeat round 1", async () => {
+    await draftInboxReply({
+      ...BASE,
+      threadSent: [{ body: "Already answered the pricing question.", sentAt: "2026-08-20" }],
+    });
+    const block = lastUserBlock();
+    expect(block).toContain("THREAD — REPLIES YOU ALREADY SENT");
+    expect(block).toContain("Already answered the pricing question.");
+  });
+
+  it("omits the thread block when there is no history", async () => {
+    await draftInboxReply({ ...BASE, threadSent: [] });
+    expect(lastUserBlock()).not.toContain("THREAD — REPLIES YOU ALREADY SENT");
+  });
+
+  it("injects the intent directive when intent is classified (issue #480)", async () => {
+    await draftInboxReply({ ...BASE, intent: "interested" });
+    const block = lastUserBlock();
+    expect(block).toContain("INTENT DIRECTIVE");
+    expect(block).toContain("interested");
+  });
+
+  it("injects a directive for each expanded label", async () => {
+    const cues: Record<string, string> = {
+      partnership: "next step",
+      meeting: "logistics",
+      intro: "introduction",
+      complaint: "Own it",
+      not_interested: "Close gracefully",
+      pitch_back: "Decline politely",
+    };
+    for (const [intent, cue] of Object.entries(cues)) {
+      await draftInboxReply({ ...BASE, intent });
+      const block = lastUserBlock();
+      expect(block).toContain(`INTENT DIRECTIVE (classified: ${intent}`);
+      expect(block).toContain(cue);
+    }
+  });
+
+  it("omits the intent directive when intent is null or unhandled", async () => {
+    await draftInboxReply({ ...BASE, intent: null });
+    expect(lastUserBlock()).not.toContain("INTENT DIRECTIVE");
+    await draftInboxReply({ ...BASE, intent: "auto_reply" });
+    expect(lastUserBlock()).not.toContain("INTENT DIRECTIVE");
+  });
+
+  it("injects the founder steer as a binding block when set (issue #480)", async () => {
+    await draftInboxReply({ ...BASE, steer: "docs listing only, no exclusivity" });
+    const block = lastUserBlock();
+    expect(block).toContain("FOUNDER STEER");
+    expect(block).toContain("docs listing only, no exclusivity");
+  });
+
+  it("omits the steer block when unset", async () => {
+    await draftInboxReply({ ...BASE, steer: null });
+    expect(lastUserBlock()).not.toContain("FOUNDER STEER");
+  });
+
+  it("derives an ASKS ALREADY MADE block from prior sent replies and excludes it when none", async () => {
+    await draftInboxReply({
+      ...BASE,
+      threadSent: [{ body: "Does later this week work for a quick call?", sentAt: "2026-08-26" }],
+    });
+    const block = lastUserBlock();
+    expect(block).toContain("ASKS ALREADY MADE");
+    expect(block).toContain("Does later this week work for a quick call?");
+
+    await draftInboxReply({
+      ...BASE,
+      threadSent: [{ body: "Sounds good, no rush.", sentAt: "2026-08-26" }],
+    });
+    expect(lastUserBlock()).not.toContain("ASKS ALREADY MADE");
+  });
+
+  // ANGLE injection (issue #356). The reply-path payoff for #355's synthesis.
+  // `doNotSay` matters most here: it's what stops a reply re-asserting a
+  // premise the prospect already corrected ("not sure what you mean" /
+  // "starred for research").
+  it("omits the ANGLE block when angleJson is absent", async () => {
+    await draftInboxReply(BASE);
+    expect(lastUserBlock()).not.toContain("ANGLE");
+  });
+
+  it("omits the ANGLE block for null angle_json — unchanged output (issue #356)", async () => {
+    await draftInboxReply({ ...BASE, angleJson: null });
+    expect(lastUserBlock()).not.toContain("ANGLE");
+  });
+
+  it("omits the ANGLE block for blank/unparsable angle_json — must not throw", async () => {
+    await draftInboxReply({ ...BASE, angleJson: "  " });
+    expect(lastUserBlock()).not.toContain("ANGLE");
+    await draftInboxReply({ ...BASE, angleJson: "not json" });
+    expect(lastUserBlock()).not.toContain("ANGLE");
+  });
+
+  it("injects hook and doNotSay from angle_json — doNotSay is what stops re-asserting a corrected premise", async () => {
+    const angle = JSON.stringify({
+      hook: "Just shipped x402 support.",
+      doNotSay: ["not sure what you mean by that", "this was starred for research only"],
+    });
+    await draftInboxReply({ ...BASE, angleJson: angle });
+    const block = lastUserBlock();
+    expect(block).toContain("ANGLE");
+    expect(block).toContain("Hook: Just shipped x402 support.");
+    expect(block).toContain("Do NOT say");
+    expect(block).toContain("not sure what you mean by that");
+    expect(block).toContain("this was starred for research only");
+  });
+
+  // MEETING injection (issue #578). The direct outcome-to-draft path,
+  // alongside the indirect tagOutcomeValue -> angle_json path.
+  it("omits the MEETING block when there is no meeting", async () => {
+    await draftInboxReply(BASE);
+    expect(lastUserBlock()).not.toContain("MEETING");
+  });
+
+  it("omits the MEETING block for null meeting — byte-identical output with no meeting on the prospect", async () => {
+    await draftInboxReply({ ...BASE, meeting: null });
+    expect(lastUserBlock()).not.toContain("MEETING");
+  });
+
+  it("injects a held meeting as the most specific fact known, outranking the dossier", async () => {
+    await draftInboxReply({
+      ...BASE,
+      meeting: { outcome: "held", note: "They asked about SSO timelines.", summary: "Intro call" },
+    });
+    const block = lastUserBlock();
+    expect(block).toContain("MEETING");
+    expect(block).toContain("the call happened");
+    expect(block).toContain("outranks the dossier");
+    expect(block).toContain("They asked about SSO timelines.");
+  });
+
+  it("injects a no-show as non-terminal — re-offer, never acknowledge the miss", async () => {
+    await draftInboxReply({ ...BASE, meeting: { outcome: "no_show", note: null, summary: null } });
+    const block = lastUserBlock();
+    expect(block).toContain("MEETING");
+    expect(block).toContain("no-showed");
+    expect(block).toContain("Do not acknowledge the no-show");
+  });
+
+  it("omits the MEETING block for a cancelled or rescheduled meeting — neither ever happened", async () => {
+    await draftInboxReply({
+      ...BASE,
+      meeting: { outcome: "cancelled", note: null, summary: "Intro call" },
+    });
+    expect(lastUserBlock()).not.toContain("MEETING");
+    await draftInboxReply({
+      ...BASE,
+      meeting: { outcome: "rescheduled", note: null, summary: "Intro call" },
+    });
+    expect(lastUserBlock()).not.toContain("MEETING");
+  });
+});
+
+describe("draftInboxReply ledger grounding", () => {
+  it("renders the ICP gate with its caveat when the ledger has a verdict", async () => {
+    await draftInboxReply({
+      ...BASE,
+      icp: {
+        verdict: "reject",
+        reason: "VMware Administrator roles focus on infrastructure maintenance.",
+      },
+    });
+    expect(lastUserBlock()).toContain(
+      "ICP GATE (title-based, decided before this conversation; the thread outranks it): reject - VMware Administrator roles focus on infrastructure maintenance.",
+    );
+  });
+
+  it("renders a verdict without a reason, and nothing when the verdict is missing", async () => {
+    await draftInboxReply({ ...BASE, icp: { verdict: "pass", reason: null } });
+    expect(lastUserBlock()).toContain("the thread outranks it): pass\n");
+    await draftInboxReply({ ...BASE, icp: { verdict: null, reason: "stale" } });
+    expect(lastUserBlock()).not.toContain("ICP GATE");
+    await draftInboxReply({ ...BASE, icp: null });
+    expect(lastUserBlock()).not.toContain("ICP GATE");
+  });
+});
+
+describe("draftInboxReply link gate", () => {
+  it("flags a URL that is not verbatim in the product brief", async () => {
+    cfgOverride = { productBrief: "Docs: https://docs.example.com/", icpOneLiner: null };
+    completeMock.mockResolvedValue({
+      content: JSON.stringify({ body: "see https://docs.example.com/receipts for the shape." }),
+    });
+    const draft = await draftInboxReply(BASE);
+    expect(draft.flags).toContain("link-not-in-brief");
+  });
+
+  it("accepts a brief URL, ignoring a trailing slash or punctuation", async () => {
+    cfgOverride = { productBrief: "Docs: https://docs.example.com/", icpOneLiner: null };
+    completeMock.mockResolvedValue({
+      content: JSON.stringify({ body: "the spec is at https://docs.example.com, have a look." }),
+    });
+    const draft = await draftInboxReply(BASE);
+    expect(draft.flags).not.toContain("link-not-in-brief");
+  });
+
+  it("normalizes scheme and host case only; the path stays case-sensitive", async () => {
+    cfgOverride = { productBrief: "Docs: https://docs.example.com/Payments", icpOneLiner: null };
+    completeMock.mockResolvedValue({
+      content: JSON.stringify({ body: "see HTTPS://DOCS.EXAMPLE.COM/Payments." }),
+    });
+    expect((await draftInboxReply(BASE)).flags).not.toContain("link-not-in-brief");
+    completeMock.mockResolvedValue({
+      content: JSON.stringify({ body: "see https://docs.example.com/payments." }),
+    });
+    expect((await draftInboxReply(BASE)).flags).toContain("link-not-in-brief");
+  });
+
+  it("allows no link at all when there is no brief", async () => {
+    completeMock.mockResolvedValue({
+      content: JSON.stringify({ body: "docs are at https://docs.example.com/" }),
+    });
+    const draft = await draftInboxReply(BASE);
+    expect(draft.flags).toContain("link-not-in-brief");
+  });
+});

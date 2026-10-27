@@ -1,0 +1,278 @@
+import {
+  loadConfig,
+  saveConfig,
+  motionMailPolicy,
+  type MotionMailSettings,
+} from "@oneshot-gtm/core";
+import {
+  defaultSequence,
+  captureCadencePlans,
+  applyCadencePlans,
+  getSequence,
+  isBreakupLabel,
+  isBreakupStepAt,
+  type Sequence,
+} from "@oneshot-gtm/plays";
+import type { PlayDescriptor, StepChannel } from "@oneshot-gtm/shared-types";
+import { jsonResponse } from "../server.ts";
+
+interface PlayMeta {
+  name: string;
+  cli: string;
+}
+
+const PLAY_CATALOG: PlayMeta[] = [
+  {
+    name: "show-hn",
+    cli: "oneshot-gtm motion show-hn --target ./examples/show-hn.json",
+  },
+  {
+    name: "job-change",
+    cli: "oneshot-gtm motion job-change --target ./examples/job-change.json",
+  },
+  {
+    name: "post-funding",
+    cli: "oneshot-gtm motion post-funding --target ./examples/post-funding.json",
+  },
+  {
+    name: "accelerator-batch",
+    cli: "oneshot-gtm motion accelerator-batch --target ./examples/accelerator-batch.json --sender-cohort yc-w26",
+  },
+  {
+    name: "concierge",
+    cli: "oneshot-gtm motion concierge --target ./examples/concierge.json",
+  },
+  {
+    name: "demo-no-show",
+    cli: "oneshot-gtm motion demo-no-show --target ./examples/demo-no-show.json",
+  },
+  {
+    name: "competitor-switch",
+    cli: "oneshot-gtm motion competitor-switch --target ./examples/competitor-switch.json",
+  },
+  {
+    name: "stack-consolidation",
+    cli: "oneshot-gtm find watch  # fed by the github-topics finder, drained from /queue",
+  },
+  {
+    name: "repo-interest",
+    cli: "oneshot-gtm find watch  # fed by the github-stars finder (adjacent repos), drained from /queue",
+  },
+  {
+    name: "luma-events",
+    cli: "oneshot-gtm find watch  # fed by the luma-events finder (publicly-visible attendees), drained from /queue",
+  },
+  {
+    name: "hiring-signal",
+    cli: "oneshot-gtm motion hiring-signal --target ./examples/hiring-signal.json",
+  },
+  {
+    name: "podcast-guest",
+    cli: "oneshot-gtm motion podcast-guest --target ./examples/podcast-guest.json",
+  },
+  {
+    name: "breakup-revive",
+    cli: "oneshot-gtm motion breakup-revive --min-days 60 --max-days 90",
+  },
+  {
+    name: "profile-intro",
+    cli: "added from the dashboard: Add Prospect → paste a LinkedIn or X/Twitter URL",
+  },
+  {
+    name: "x-repost-intro",
+    cli: "oneshot-gtm find watch  # fed by the x-reposters finder (founder lane), drained from /queue",
+  },
+  {
+    name: "x-amplify",
+    cli: "oneshot-gtm find watch  # fed by the x-reposters finder (amplifier lane, email found), drained from /queue",
+  },
+  {
+    name: "x-amplify-dm",
+    cli: "manual X send — draft on /queue, send by hand from the X app, then Mark sent",
+  },
+  {
+    name: "sources-sought",
+    cli: "oneshot-gtm find watch  # fed by the gov-solicitation finder (ptype r/p), drained from /queue",
+  },
+  {
+    name: "civic-pilot",
+    cli: "oneshot-gtm find watch  # fed by the civic-agenda finder, drained from /queue",
+  },
+  {
+    name: "design-partner-loi",
+    cli: "oneshot-gtm find watch  # fed by the gov-solicitation finder (non-r/p notices) today; enterprise/hardware targets are manually queued until a matching finder exists, drained from /queue",
+  },
+  {
+    name: "discovery-interview",
+    cli: "oneshot-gtm motion discovery-interview --target ./examples/discovery-interview.json",
+  },
+  {
+    name: "free-pilot",
+    cli: "oneshot-gtm motion free-pilot --target ./examples/free-pilot.json",
+  },
+  {
+    name: "new-business",
+    cli: "oneshot-gtm find watch  # fed by the local-registry finder's recent-issue lane, drained from /queue",
+  },
+];
+
+/** Relative per-step dayOffsets → cumulative days from the day-0 initial send. */
+function cumulativeDays(seq: Sequence | undefined): number[] {
+  if (!seq) return [];
+  let acc = 0;
+  return seq.steps.map((s) => (acc += s.dayOffset));
+}
+
+export function listPlays(req: Request): Response {
+  const plays: PlayDescriptor[] = PLAY_CATALOG.map((p) => {
+    const seq = getSequence(p.name);
+    const channels: StepChannel[] = seq
+      ? Array.from(
+          new Set<StepChannel>(["email", ...seq.steps.map((s) => s.channel as StepChannel)]),
+        )
+      : ["email"];
+    const followupCount = seq?.steps.length ?? 0;
+    // hasBreakup uses the same step-position rule as the cadence runtime so
+    // accelerator-batch (which uses the breakup PROMPT as its only follow-up
+    // at index 0) doesn't get flagged as having a breakup step here.
+    const hasBreakup = seq ? isBreakupStepAt(seq, seq.steps.length - 1) : false;
+    const days = cumulativeDays(seq);
+    const stepsArr = seq?.steps ?? [];
+    const steps = stepsArr.map((s, i) => ({
+      day: days[i] ?? 0,
+      label: s.label ?? `step ${i + 1}`,
+      channel: s.channel as StepChannel,
+      // Per-step breakup flag using the SAME label rule the cadence engine
+      // uses. Note: the /cadences progress UI only treats the FINAL such
+      // step as the cadence-terminal breakup (see isBreakupStepAt). Here
+      // we surface the label-level signal so /plays can hint a per-step
+      // visual without re-deriving the substring.
+      isBreakup: isBreakupLabel(s.label),
+    }));
+    return {
+      name: p.name,
+      channels,
+      followupCount,
+      hasBreakup,
+      cliInvocation: p.cli,
+      steps,
+      defaultDays: cumulativeDays(defaultSequence(p.name)),
+      directMail: motionMailPolicy(loadConfig(), p.name).settings,
+      mailRecommendation: motionMailPolicy(loadConfig(), p.name).reason,
+      mailAutomaticSupported: motionMailPolicy(loadConfig(), p.name).recommended,
+      mailEligible: !!defaultSequence(p.name),
+      baseSteps: (() => {
+        const base = defaultSequence(p.name);
+        const offsets = loadConfig().cadenceOverrides?.[p.name];
+        let day = 0;
+        return (base?.steps ?? []).map((s, i) => ({
+          day: (day +=
+            offsets && offsets.length === base?.steps.length ? offsets[i]! : s.dayOffset),
+          label: s.label ?? `step ${i + 1}`,
+          channel: s.channel,
+          isBreakup: isBreakupLabel(s.label),
+        }));
+      })(),
+    };
+  });
+  return jsonResponse({ plays }, 200, req);
+}
+
+/**
+ * Set (or clear) per-play cadence timing. Body: { days: number[] | null }.
+ * `days` are CUMULATIVE days from the initial send (intuitive in the UI); we
+ * convert to the engine-native relative offsets before persisting. `null`
+ * clears the override (reset to code defaults). Timing only: step structure
+ * is fixed in code.
+ */
+export async function setCadenceRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const name = params["name"] ?? "";
+  const def = defaultSequence(name);
+  if (!def) {
+    return jsonResponse({ error: `play '${name}' has no editable cadence` }, 400, req);
+  }
+
+  let body: { days?: number[] | null; directMail?: MotionMailSettings | null };
+  try {
+    body = (await req.json()) as { days?: number[] | null };
+  } catch {
+    return jsonResponse({ error: "invalid JSON body" }, 400, req);
+  }
+
+  if (!body || typeof body !== "object" || Array.isArray(body))
+    return jsonResponse({ error: "Expected a cadence settings object" }, 400, req);
+  const cfg = loadConfig();
+  const overrides = { ...cfg.cadenceOverrides };
+  const previous = captureCadencePlans(name);
+  if (previous.some(({ cadence }) => cadence.sending_started_at))
+    return jsonResponse(
+      { error: "Wait for in-flight sends before changing this motion" },
+      409,
+      req,
+    );
+  if ("directMail" in body) {
+    const mail = body.directMail;
+    if (
+      mail !== null &&
+      (!mail ||
+        !Number.isInteger(mail.position) ||
+        mail.position < 2 ||
+        mail.position > def.steps.length + 2 ||
+        !Number.isInteger(mail.delayDays) ||
+        mail.delayDays < 1 ||
+        mail.delayDays > 120 ||
+        (mail.mode !== undefined && !["automatic", "always"].includes(mail.mode)) ||
+        (mail.mode === "automatic" && !motionMailPolicy(cfg, name).recommended))
+    )
+      return jsonResponse(
+        { error: "Choose a valid mail position and a delay of 1–120 days" },
+        400,
+        req,
+      );
+    const motions = { ...cfg.directMailMotions };
+    if (mail) motions[name] = mail;
+    else motions[name] = null;
+    saveConfig({ ...cfg, directMailMotions: motions });
+    applyCadencePlans(name, previous);
+    return jsonResponse({ ok: true }, 200, req);
+  }
+
+  // Reset path: clear this play's override.
+  if (body.days === null || body.days === undefined) {
+    delete overrides[name];
+    saveConfig({
+      ...cfg,
+      cadenceOverrides: Object.keys(overrides).length > 0 ? overrides : null,
+    });
+    applyCadencePlans(name, previous);
+    return jsonResponse({ ok: true }, 200, req);
+  }
+
+  const days = body.days;
+  const stepCount = def.steps.length;
+  if (!Array.isArray(days) || days.length !== stepCount) {
+    return jsonResponse(
+      { error: `days must be an array of ${stepCount} cumulative day value(s)` },
+      400,
+      req,
+    );
+  }
+  if (!days.every((d) => Number.isInteger(d) && d >= 1 && d <= 120)) {
+    return jsonResponse({ error: "each day must be an integer between 1 and 120" }, 400, req);
+  }
+  for (let i = 1; i < days.length; i++) {
+    if ((days[i] as number) <= (days[i - 1] as number)) {
+      return jsonResponse({ error: "days must be strictly increasing" }, 400, req);
+    }
+  }
+
+  // Cumulative → relative offsets (each ≥ 1, guaranteed by the checks above).
+  const relative = days.map((d, i) => (i === 0 ? d : d - (days[i - 1] as number)));
+  overrides[name] = relative;
+  saveConfig({ ...cfg, cadenceOverrides: overrides });
+  applyCadencePlans(name, previous);
+  return jsonResponse({ ok: true }, 200, req);
+}

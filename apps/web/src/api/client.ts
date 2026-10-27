@@ -1,0 +1,525 @@
+import type { OnboardingStatus } from "@oneshot-gtm/shared-types";
+import type {
+  RepliesResult,
+  ReplyLearningStatus,
+  ReplyLearningUpdate,
+  ReplyDraftSet,
+  ReplyThread,
+  ReplyStateRequest,
+  ReplyVariant,
+  ReplySendState,
+} from "@oneshot-gtm/shared-types";
+import type { InboxArchiveRequest, InboxArchiveResult } from "@oneshot-gtm/shared-types";
+import type {
+  AddProspectResult,
+  QueueDossierView,
+  BusinessMailAddress,
+  CadencesResult,
+  CadenceStopReason,
+  CadenceView,
+  CalendarPickerEntry,
+  CancelRunResponse,
+  ConfirmMeetingMatchRequest,
+  DismissMeetingMatchRequest,
+  DoctorCheck,
+  DrainRequest,
+  DrainResult,
+  EventsByPlay,
+  HomeMetrics,
+  InboxDraftReplyRequest,
+  InboxDraftReplyResult,
+  InboxResult,
+  LinkedInReplyResult,
+  InboxSaveDraftRequest,
+  InboxSaveDraftResult,
+  InboxSendReplyRequest,
+  InboxSendReplyResult,
+  InboxSteerRequest,
+  InboxSteerResult,
+  DraftVersionView,
+  LastDraft,
+  MoveQueueRowResult,
+  LogMeetingOutcomeRequest,
+  MeetingsResult,
+  OutcomeByPlay,
+  OutcomeRequest,
+  PackApplyResult,
+  PackView,
+  PlayDescriptor,
+  ProspectSearchResponse,
+  QueueRowDetail,
+  WorkspaceInfo,
+  DomainActionResult,
+  DomainPoolView,
+  QueueListResponse,
+  QueueStatusView,
+  DeriveBriefResult,
+  DeriveIcpResult,
+  ReceiptDetail,
+  ReceiptView,
+  RocsGoalView,
+  RunRecord,
+  RunTriggerResult,
+  SenderIdentityView,
+  SetupRequest,
+  SmartleadAccountView,
+  SpendByPlay,
+  SpendSeries,
+  TriggerView,
+  IcpProposalDecisionResult,
+  IcpProposalsResult,
+} from "@oneshot-gtm/shared-types";
+import { demoGet, demoWrite, IS_DEMO } from "./demo.ts";
+import {
+  applyProspectFilters,
+  toApiQuery,
+  type ProspectsSearch,
+} from "../lib/prospects-helpers.ts";
+
+const BASE = "/api";
+
+/*
+ * Demo mode swaps the transport and nothing else.
+ *
+ * Every read in this file goes through getJson and every write through
+ * postJson, so these two branches are the entire seam: the api object below,
+ * the 36 mutation sites behind it and all nine routes stay untouched. That is
+ * why the seam is worth keeping narrow.
+ */
+/**
+ * Error message for a non-2xx response: the server's `{ error }` string when
+ * the body carries one (every 4xx we emit does: e.g. the /setup 400s that a
+ * section form shows inline), else `status statusText: fallback`.
+ */
+async function errorMessage(res: Response, fallback: string): Promise<string> {
+  let message = `${res.status} ${res.statusText}: ${fallback}`;
+  try {
+    const text = await res.text();
+    if (text) {
+      const body = JSON.parse(text) as { error?: unknown; requestId?: unknown; code?: unknown };
+      if (typeof body.error === "string" && body.error) message = body.error;
+      else message = `${res.status} ${res.statusText}: ${text.slice(0, 200)}`;
+      if (typeof body.code === "string") message += ` (${body.code})`;
+      if (typeof body.requestId === "string") message += ` · request ${body.requestId}`;
+    }
+  } catch {
+    // body absent, empty, or not JSON. Keep the fallback message
+  }
+  return message;
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  if (IS_DEMO) return demoGet<T>(path);
+  const res = await fetch(BASE + path);
+  if (!res.ok) throw new Error(await errorMessage(res, path));
+  return (await res.json()) as T;
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  if (IS_DEMO) demoWrite(path);
+  const res = await fetch(BASE + path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, path));
+  return (await res.json()) as T;
+}
+
+export interface LinkedInSessionOutcome {
+  ok: boolean;
+  loggedIn: boolean;
+  name: string | null;
+  profileId: string;
+  costUsd: number;
+  /** Why the session is not usable, when it is not. */
+  reason: string | null;
+  checkedAt: string;
+}
+
+export const api = {
+  onboarding: () => getJson<OnboardingStatus>("/onboarding"),
+  deferOnboarding: () => postJson<OnboardingStatus>("/onboarding/defer", {}),
+  verifyOnboardingAI: () => postJson<OnboardingStatus>("/onboarding/verify-ai", {}),
+  home: () => getJson<HomeMetrics>("/home"),
+  cadences: (opts: { all?: boolean; sinceRun?: number } = {}) => {
+    const qs: string[] = [];
+    if (opts.all) qs.push("all=1");
+    if (opts.sinceRun != null) qs.push(`sinceRun=${opts.sinceRun}`);
+    return getJson<CadencesResult>(`/cadences${qs.length > 0 ? `?${qs.join("&")}` : ""}`);
+  },
+  run: (id: number) => getJson<RunRecord>(`/runs/${id}`),
+  cancelRun: (id: number, reason?: string) =>
+    postJson<CancelRunResponse>(`/run/${id}/cancel`, reason ? { reason } : {}),
+  cadenceForProspect: (id: number) => getJson<{ cadences: CadenceView[] }>(`/cadences/${id}`),
+  stopCadence: (
+    id: number,
+    playName: string,
+    input: { reason: CadenceStopReason; note?: string },
+  ) =>
+    postJson<{ stopped: number }>(
+      `/cadences/${id}/stop?play=${encodeURIComponent(playName)}`,
+      input,
+    ),
+  /** Skip a cadence's pending letter and continue with its next step (#611). */
+  skipCadenceMail: (id: number, playName: string) =>
+    postJson<{
+      ok: boolean;
+      currentStep: number;
+      status: string;
+      nextStepChannel: string | null;
+    }>(`/cadences/${id}/skip-mail?play=${encodeURIComponent(playName)}`, {}),
+  skipCadenceMailBatch: (items: Array<{ prospectId: number; playName: string }>) =>
+    postJson<{
+      results: Array<{ prospectId: number; playName: string; ok: boolean; error?: string }>;
+      skipped: number;
+      failed: number;
+    }>(`/cadences/skip-mail-batch`, { items }),
+  markLinkedInReply: (id: number, body?: string) =>
+    postJson<LinkedInReplyResult>(
+      `/prospects/${id}/linkedin-reply`,
+      body?.trim() ? { body: body.trim() } : {},
+    ),
+  previewCadenceNext: (id: number, playName: string, rotateAngle = false) =>
+    postJson<{
+      subject: string;
+      body: string;
+      flags: string[];
+      draftedAt: string;
+      stepLabel: string | null;
+      isBreakup: boolean;
+    }>(
+      `/cadences/${id}/preview-next?play=${encodeURIComponent(playName)}`,
+      rotateAngle ? { rotateAngle: true } : {},
+    ),
+  sendCadenceNext: (id: number, playName: string) =>
+    postJson<{ accepted: true }>(
+      `/cadences/${id}/send-next?play=${encodeURIComponent(playName)}`,
+      {},
+    ),
+  previewCadenceBatch: (items: Array<{ prospectId: number; playName: string }>) =>
+    postJson<{
+      results: Array<{
+        prospectId: number;
+        playName: string;
+        ok: boolean;
+        preview?: { subject: string; body: string; flags: string[]; draftedAt: string };
+        error?: string;
+      }>;
+    }>(`/cadences/preview-batch`, { items }),
+  sendCadenceBatch: (items: Array<{ prospectId: number; playName: string }>) =>
+    postJson<{ accepted: number }>(`/cadences/send-batch`, { items }),
+  receipts: (opts?: { play?: string; sinceDays?: number; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (opts?.play) q.set("play", opts.play);
+    if (opts?.sinceDays != null) q.set("sinceDays", String(opts.sinceDays));
+    if (opts?.limit != null) q.set("limit", String(opts.limit));
+    const qs = q.toString();
+    return getJson<{ receipts: ReceiptView[] }>(`/receipts${qs ? `?${qs}` : ""}`);
+  },
+  replies: () => getJson<RepliesResult>("/replies"),
+  replyLearning: () => getJson<ReplyLearningStatus>("/replies/learning"),
+  updateReplyLearning: (change: ReplyLearningUpdate) =>
+    postJson<ReplyLearningStatus>("/replies/learning", change),
+  replyState: (request: ReplyStateRequest) => postJson<ReplyThread>("/replies/state", request),
+  saveReplyOptions: (key: string, drafts: ReplyDraftSet, expectedRevision: number | null) =>
+    postJson<ReplyDraftSet>("/replies/drafts", { key, drafts, expectedRevision }),
+  generateReplyOptions: (key: string, force = false, steer = "") =>
+    postJson<ReplyDraftSet>("/replies/generate", { key, force, steer }),
+  improveReplyOption: (key: string, variant: ReplyVariant, text: string, feedback: string) =>
+    postJson<{ text: string; improvementId?: string }>("/replies/improve", {
+      key,
+      variant,
+      text,
+      feedback,
+    }),
+  sendReplyOption: (key: string, sendId: string, revision: number) =>
+    postJson<ReplySendState>("/replies/send", { key, sendId, revision }),
+  checkReplySend: (key: string) => postJson<ReplySendState>("/replies/send", { key, check: true }),
+  linkedinAction: (request: { action: string; accountKey?: string; intentId?: string }) =>
+    postJson<{
+      url?: string;
+      intent_id?: string;
+      status?: string;
+      failure_reason?: string;
+      upstreamDeleted?: boolean;
+    }>("/replies/linkedin", request),
+  replyProspects: (q: string) =>
+    getJson<{
+      prospects: Array<{ workspace: string; id: number; name: string; email: string | null }>;
+    }>(`/replies/prospects?q=${encodeURIComponent(q)}`),
+  assignReply: (key: string, workspace: string, prospectId: number) =>
+    postJson<{ ok: boolean }>("/replies/assign", { key, workspace, prospectId }),
+  inbox: () => getJson<InboxResult>("/inbox"),
+  mailboxState: (req: import("@oneshot-gtm/shared-types").MailboxStateRequest) =>
+    postJson<{ ok: boolean }>("/inbox/thread-state", req),
+  mailboxMatch: (threadKey: string, email: string) =>
+    postJson<{ ok: boolean }>("/inbox/thread-match", { threadKey, email }),
+  mailboxHistory: (threadKey: string) =>
+    postJson<{ ok: boolean }>("/inbox/thread-history", { threadKey }),
+  mailboxRefresh: () =>
+    postJson<Pick<InboxResult, "mailboxThreads" | "mailboxes">>("/inbox/mailbox-refresh", {}),
+  mailboxConnect: (req: import("@oneshot-gtm/shared-types").MailboxConnectionRequest) =>
+    postJson<{ ok: boolean }>("/inbox/mailbox-connect", req),
+  archiveInboxConversation: (req: InboxArchiveRequest) =>
+    postJson<InboxArchiveResult>("/inbox/archive", req),
+  draftInboxReply: (req: InboxDraftReplyRequest) =>
+    postJson<InboxDraftReplyResult>("/inbox/draft-reply", req),
+  saveInboxDraft: (req: InboxSaveDraftRequest) =>
+    postJson<InboxSaveDraftResult>("/inbox/draft", req),
+  sendInboxReply: (req: InboxSendReplyRequest) =>
+    postJson<InboxSendReplyResult>("/inbox/reply", req),
+  steerInboxReply: (req: InboxSteerRequest) => postJson<InboxSteerResult>("/inbox/steer", req),
+  receipt: (id: number) => getJson<{ receipt: ReceiptDetail }>(`/receipts/${id}`),
+  plays: () => getJson<{ plays: PlayDescriptor[] }>("/plays"),
+  // Timing only (cumulative days from send); null resets to code defaults. Step structure is fixed.
+  setDirectMail: (
+    name: string,
+    directMail: { position: number; delayDays: number; mode?: "automatic" | "always" } | null,
+  ) => postJson<{ ok: boolean }>(`/plays/${name}/cadence`, { directMail }),
+  setCadence: (name: string, days: number[] | null) =>
+    postJson<{ ok: boolean }>(`/plays/${name}/cadence`, { days }),
+  measureCac: (sinceDays?: number) =>
+    getJson<{ spend: SpendByPlay[]; events: EventsByPlay[] }>(
+      `/measure/cac${sinceDays != null ? `?sinceDays=${sinceDays}` : ""}`,
+    ),
+  measureRocs: (sinceDays?: number) =>
+    getJson<{ spend: SpendByPlay[]; events: EventsByPlay[]; outcomes: OutcomeByPlay[] }>(
+      `/measure/rocs${sinceDays != null ? `?sinceDays=${sinceDays}` : ""}`,
+    ),
+  rocsByGoal: (sinceDays?: number) =>
+    getJson<{ goals: RocsGoalView[] }>(
+      `/measure/rocs-by-goal${sinceDays != null ? `?sinceDays=${sinceDays}` : ""}`,
+    ),
+  measureSpendSeries: (sinceDays?: number) =>
+    getJson<SpendSeries>(
+      `/measure/spend-series${sinceDays != null ? `?sinceDays=${sinceDays}` : ""}`,
+    ),
+  recordOutcome: (req: OutcomeRequest) => postJson<{ id: number }>("/measure/outcome", req),
+  doctor: () => getJson<{ checks: DoctorCheck[] }>("/doctor"),
+  // Same checks, but the wallet balance is re-read instead of served from
+  // the day-old cache. The masthead pill's refresh control after a top-up.
+  // The vendored demo has a fixture for /doctor only; there a "refresh" is
+  // just the same read again, never a 404 on an uncaptured query variant.
+  doctorRefreshBalance: () =>
+    getJson<{ checks: DoctorCheck[] }>(IS_DEMO ? "/doctor" : "/doctor?refresh=1"),
+  workspace: () => getJson<WorkspaceInfo>("/workspace"),
+  workspaceLaunch: (name: string) =>
+    postJson<{ status: "starting" | "already-running"; port: number }>("/workspace/launch", {
+      name,
+    }),
+  resumeDomain: (domain: string) => postJson<DomainActionResult>("/domains/resume", { domain }),
+  pauseDomain: (domain: string) => postJson<DomainActionResult>("/domains/pause", { domain }),
+  // POST so a just-pasted (not yet saved) key rides the body, never a URL.
+  smartleadAccounts: (apiKey?: string) =>
+    postJson<{ accounts: SmartleadAccountView[] }>(
+      "/smartlead/accounts",
+      apiKey?.trim() ? { apiKey: apiKey.trim() } : {},
+    ),
+  setupStatus: () =>
+    getJson<{
+      identities: SenderIdentityView[];
+      provisionedDomains: DomainPoolView[];
+      cfg: {
+        founderName: string | null;
+        founderEmail: string | null;
+        productOneLiner: string | null;
+        productDomain: string | null;
+        sendingDomain: string | null;
+        emailProvider: "oneshot" | "gmail";
+        icpOneLiner: string | null;
+        founderCredentials: string | null;
+        productPortfolio: string | null;
+        partners: string | null;
+        founderCohort: string | null;
+        founderAdmission: string | null;
+        pilotOffer?: string | null;
+        productBrief: string | null;
+        founderVoice?: string | null;
+        mobileSignature: boolean;
+        dailySpendCeilingUsd: number | null;
+        llmProvider: "openrouter" | "openai" | "anthropic";
+        llmModel: string;
+        telemetryEnabled: boolean;
+        walletMode: "cdp" | "private-key";
+        slackWebhookUrl: string | null;
+        // Optional: older servers / the demo fixture may omit them; the
+        // server has always returned them (publicCfg spreads the whole cfg).
+        queueReviewOrder?: "ranked" | "newest";
+        replyClassifier?: {
+          engine: "llm" | "decisions";
+          model?: string;
+          minConfidence?: number;
+        };
+        timezone?: string | null;
+        calendarIdentityId?: string | null;
+        calendarId?: string;
+        linkedinBrowserProfileId?: string | null;
+        linkedinPendingProfileId?: string | null;
+        linkedinSessionCheckedAt?: string | null;
+        linkedinSessionName?: string | null;
+        linkedinSessionInvalidAt?: string | null;
+        linkedinReadsPerDay?: number;
+      };
+      secretsPath: string;
+      sources: Record<string, "env" | "file" | null>;
+    }>("/setup"),
+  /**
+   * The provisioned OneShot domain pool alone. Off the /setup critical path:
+   * the platform's listDomains has been seen taking 60-80s, so the status
+   * call above carries only a ~2.5s best-effort copy and the sender picker
+   * refines it from this route.
+   */
+  setupDomains: () => getJson<{ provisionedDomains: DomainPoolView[] }>("/setup/domains"),
+  setup: (req: SetupRequest) => postJson<{ ok: boolean }>("/setup", req),
+  setupCalendars: (identityId: string) =>
+    getJson<{ calendars: CalendarPickerEntry[] }>(
+      `/setup/calendars?identityId=${encodeURIComponent(identityId)}`,
+    ),
+  deriveIcp: (domain: string) => postJson<DeriveIcpResult>("/setup/derive-icp", { domain }),
+  deriveBrief: (urls: string[]) => postJson<DeriveBriefResult>("/setup/derive-brief", { urls }),
+  /**
+   * Connect LinkedIn for live profile reads. Two ways in: import the stored
+   * li_at cookie into a fresh OneShot browser profile, or open a hosted
+   * browser on the login page (the returned liveUrl is a credential: shown
+   * to the founder, never logged) and finish once the login is done.
+   */
+  connectLinkedInSession: () => postJson<LinkedInSessionOutcome>("/setup/linkedin-session", {}),
+  startLinkedInLogin: () =>
+    postJson<{
+      ok: boolean;
+      profileId: string;
+      liveUrl: string | null;
+      status: string;
+      expiresAt: string | null;
+    }>("/setup/linkedin-login/start", {}),
+  finishLinkedInLogin: () => postJson<LinkedInSessionOutcome>("/setup/linkedin-login/finish", {}),
+  cancelLinkedInLogin: () =>
+    postJson<{ ok: boolean; cancelled: boolean }>("/setup/linkedin-login/cancel", {}),
+  linkedinLoginState: () =>
+    getJson<
+      | { ok: boolean; pending: false }
+      | {
+          ok: boolean;
+          pending: true;
+          profileId: string;
+          liveUrl: string | null;
+          status: string;
+          expiresAt: string | null;
+        }
+    >("/setup/linkedin-login/state"),
+  meetings: () => getJson<MeetingsResult>("/meetings"),
+  logMeetingOutcome: (req: LogMeetingOutcomeRequest) =>
+    postJson<{ ok: boolean }>("/meetings/outcome", req),
+  confirmMeetingMatch: (req: ConfirmMeetingMatchRequest) =>
+    postJson<{ ok: boolean }>("/meetings/confirm", req),
+  dismissMeetingMatch: (req: DismissMeetingMatchRequest) =>
+    postJson<{ ok: boolean }>("/meetings/dismiss", req),
+  // Manual add-prospect from a LinkedIn/X URL. Returns 202 immediately; the
+  // researched + drafted row appears on /queue when the background job finishes.
+  addProspect: (url: string, email?: string, businessAddress?: BusinessMailAddress) =>
+    postJson<AddProspectResult>("/prospects/add", {
+      url,
+      ...(email ? { email } : {}),
+      ...(businessAddress ? { businessAddress } : {}),
+    }),
+  queue: (opts?: {
+    forRun?: boolean;
+    play?: string;
+    status?: QueueStatusView;
+    limit?: number;
+    /** Review-order override; omit to use the configured default. */
+    order?: "ranked" | "newest";
+    /** Explicit row pick. The "drain selected" path. */
+    ids?: number[];
+  }) => {
+    const q = new URLSearchParams();
+    if (opts?.forRun) q.set("forRun", "1");
+    if (opts?.play) q.set("play", opts.play);
+    if (opts?.status) q.set("status", opts.status);
+    if (opts?.limit != null) q.set("limit", String(opts.limit));
+    if (opts?.order) q.set("order", opts.order);
+    // Note the `!= null`, not a length check: an empty array is an explicit
+    // "nothing picked" and must reach the server as `ids=`, or the server would
+    // read it as absent and return the unscoped batch instead of no rows.
+    if (opts?.ids != null) q.set("ids", opts.ids.join(","));
+    const qs = q.toString();
+    return getJson<QueueListResponse>(`/queue${qs ? `?${qs}` : ""}`);
+  },
+  /**
+   * /prospects browse. In the demo the search runs client-side over ONE
+   * captured document (the whole seeded ledger, `limit=500`): a free-text
+   * `q` has no bounded fixture space, and refusing to search would leave the
+   * page a mockup of itself. Live installs hand the filters to SQL.
+   */
+  prospectSearch: (search: ProspectsSearch) =>
+    IS_DEMO
+      ? demoGet<ProspectSearchResponse>("/queue/search?limit=500").then((r) =>
+          applyProspectFilters(r.rows, search),
+        )
+      : getJson<ProspectSearchResponse>(`/queue/search?${toApiQuery(search)}`),
+  queueRowDetail: (id: number) => getJson<QueueRowDetail>(`/queue/${id}`),
+  queueDossier: (id: number) => getJson<QueueDossierView>(`/queue/${id}/dossier`),
+  resolveQueueContact: (id: number) =>
+    postJson<{ ok: boolean; payload: Record<string, unknown> }>(`/queue/${id}/resolve-contact`, {}),
+  approveQueue: (id: number) => postJson<{ ok: boolean }>(`/queue/${id}/approve`, {}),
+  // `reason` undefined → the row's note is left alone; a string: including
+  // "": is written, so a founder can clear a prefilled reason.
+  rejectQueue: (id: number, reason?: string) =>
+    postJson<{ ok: boolean }>(`/queue/${id}/reject`, reason === undefined ? {} : { reason }),
+  // The reject box's LLM fallback: one sentence on why this row might not
+  // fit, or null when the model sees no mismatch. Never sends, never decides.
+  suggestRejectReason: (id: number) =>
+    postJson<{ reason: string | null; source: "llm" | null }>(`/queue/${id}/reject-reason`, {}),
+  approveAllQueue: (play?: string) =>
+    postJson<{ approved: number }>("/queue/approve-all", play ? { play } : {}),
+  // Re-draft a row in preview (dry-run, never sends); overwrites the persisted last_draft_json.
+  regenerateDraft: (id: number, rotateAngle = false) =>
+    postJson<LastDraft>(`/queue/${id}/regenerate`, { rotateAngle }),
+  // Send the row's already-reviewed draft verbatim (no LLM re-roll). Requires
+  // a clean, not-yet-sent persisted draft; marks the row sent on success.
+  sendDraft: (id: number) =>
+    postJson<{ sent: boolean; receiptIds: number[] }>(`/queue/${id}/send-draft`, {}),
+  // Record a hand-sent manual-play draft (x-amplify-dm): writes the channel:"x"
+  // sequence event + prospect and flips the row to sent. No transport.
+  markSent: (id: number) =>
+    postJson<{ ok: boolean; prospectId: number }>(`/queue/${id}/mark-sent`, {}),
+  // Withdraw the LinkedIn invite a sent row went out with (OneShot's withdraw route).
+  withdrawInvite: (id: number) =>
+    postJson<{ ok: boolean; status: string | null }>(`/queue/${id}/withdraw-invite`, {}),
+  // Move an unsent row to another channel; its draft is dropped for a redraft.
+  setQueueChannel: (id: number, channel: "email" | "linkedin" | "x") =>
+    postJson<{ ok: boolean; channel: string }>(`/queue/${id}/channel`, { channel }),
+  // Hand the row to another workspace's queue (started if needed); the row
+  // here is rejected with a "moved to" note once the destination holds it.
+  moveQueueRow: (id: number, workspace: string) =>
+    postJson<MoveQueueRowResult>(`/queue/${id}/move`, { workspace }),
+  // Web UI no longer calls this. The drain modal navigates to /run/$playName
+  // so drafts + lint flags are visible per row. Kept for the CLI's HTTP path
+  // (`oneshot-gtm find drain`) and any external scripted callers.
+  drainQueue: (req: DrainRequest) => postJson<DrainResult>("/queue/drain", req),
+  // Every draft a queue row went through (regenerated, rotated, sent), newest first.
+  queueDrafts: (id: number) => getJson<{ versions: DraftVersionView[] }>(`/queue/${id}/drafts`),
+  // Same for a cadence's next step.
+  cadenceDrafts: (id: number, playName: string) =>
+    getJson<{ versions: DraftVersionView[] }>(
+      `/cadences/${id}/drafts?play=${encodeURIComponent(playName)}`,
+    ),
+  triggers: () => getJson<{ triggers: TriggerView[] }>("/triggers"),
+  setTriggerEnabled: (name: string, enabled: boolean) =>
+    postJson<{ ok: boolean }>(`/triggers/${encodeURIComponent(name)}/enabled`, { enabled }),
+  setTriggerConfig: (name: string, config: unknown) =>
+    postJson<{ ok: boolean; warnings?: string[] }>(`/triggers/${encodeURIComponent(name)}/config`, {
+      config,
+    }),
+  runTrigger: (name: string) =>
+    postJson<RunTriggerResult>(`/triggers/${encodeURIComponent(name)}/run`, {}),
+  packs: () => getJson<{ packs: PackView[] }>("/packs"),
+  applyPack: (id: string) =>
+    postJson<PackApplyResult>(`/packs/${encodeURIComponent(id)}/apply`, {}),
+  icpProposals: () => getJson<IcpProposalsResult>("/icp-proposals"),
+  approveIcpProposal: (id: string) =>
+    postJson<IcpProposalDecisionResult>(`/icp-proposals/${encodeURIComponent(id)}/approve`, {}),
+  dismissIcpProposal: (id: string) =>
+    postJson<IcpProposalDecisionResult>(`/icp-proposals/${encodeURIComponent(id)}/dismiss`, {}),
+};

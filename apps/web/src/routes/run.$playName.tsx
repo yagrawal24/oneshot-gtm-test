@@ -1,0 +1,991 @@
+import { validateRunSearch } from "../lib/runSearch.ts";
+import { Explain } from "../components/primitives/Explain.tsx";
+import { useQuery } from "@tanstack/react-query";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { ArrowLeft, CheckCircle2, Loader2, Play, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { type RunPlayEvent, type RunPlayRequest, type RunRecord } from "@oneshot-gtm/shared-types";
+import { api } from "../api/client.ts";
+import { Badge } from "../components/primitives/Badge.tsx";
+import { Button } from "../components/primitives/Button.tsx";
+import { Field, Input, Textarea } from "../components/primitives/Field.tsx";
+import { cn } from "../lib/cn.ts";
+import { missingRequiredFields, missingRequiredExtras, PLAY_SCHEMAS } from "../lib/playSchemas.ts";
+import { useMask } from "../lib/privacy.tsx";
+import { pruneSentRows, remapFilteredEventIndexes } from "../lib/pruneSentRows.ts";
+import { IS_DEMO, demoWrite } from "../api/demo.ts";
+import { readOnly } from "../lib/readOnly.ts";
+import {
+  allTargetsLinked,
+  dryRunReturnSummary,
+  RETURN_TO_QUEUE_SECONDS,
+  shouldReturnToQueue,
+} from "../lib/runReturn.ts";
+
+/**
+ * Search-param contract for arrivals from the `/queue` drain modal: `fromQueue=1`
+ * fetches approved rows to hydrate the targets editor; the rest round-trip the
+ * modal's fields so the founder can submit from /run as if never leaving /queue.
+ */
+export const Route = createFileRoute("/run/$playName")({
+  staticData: { title: (p: Record<string, string>) => `Run ${p["playName"] ?? ""}`.trim() },
+  component: RunPage,
+  validateSearch: validateRunSearch,
+});
+
+function RunPage() {
+  const { playName } = Route.useParams();
+  const search = Route.useSearch();
+  const schema = PLAY_SCHEMAS[playName];
+  const mask = useMask();
+
+  const [rows, setRows] = useState<Record<string, string>[]>(
+    schema ? [{ ...schema.defaultRow }] : [],
+  );
+  // Parallel to `rows`: each entry is the originating queue row's dedupeKey
+  // (when hydrated from `?fromQueue=1`) or null (manual entry / added row).
+  // The server uses these to persist drafts back to the matching queue row;
+  // null entries get skipped (correct: there's nothing to update).
+  const [dedupeKeys, setDedupeKeys] = useState<(string | null)[]>(schema ? [null] : []);
+  const [extras, setExtras] = useState<Record<string, string>>({});
+  // dryRun mirrors what the founder picked in the drain modal when arriving
+  // via `?fromQueue=1`. Default true otherwise: manual /run entry is more
+  // commonly a preview than a real send.
+  const [dryRun, setDryRun] = useState(search.dryRun !== "0");
+  const [running, setRunning] = useState(false);
+  // In-flight state for the Stop button, so a slow cancel can't be double-fired.
+  const [cancelling, setCancelling] = useState(false);
+  const [events, setEvents] = useState<RunPlayEvent[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  // Every other page says what went wrong in a toast, where the eye already
+  // is. The banner under the form stays as the record; a validation refusal
+  // that only appeared down there read as a button that did nothing.
+  const fail = (message: string): void => {
+    setError(message);
+    toast.error(message);
+  };
+  const navigate = Route.useNavigate();
+  // Cross-route navigation (e.g. to /cadences for the deep-link from done mode).
+  const globalNavigate = useNavigate();
+
+  // Run state machine (edit | progress | done | interrupted), driven by `search.runId`.
+  // Rendering from server-persisted events keeps the page resumable across nav-away
+  // and server restarts (the cold-boot sweep flips stranded runs to 'interrupted').
+  const runQuery = useQuery({
+    queryKey: ["run", search.runId],
+    queryFn: () => (search.runId ? api.run(search.runId) : Promise.resolve(null)),
+    enabled: search.runId != null,
+    refetchInterval: (q): false | number => {
+      const data = q.state.data as RunRecord | null | undefined;
+      return data && data.status === "running" ? 2000 : false;
+    },
+  });
+  const runRecord: RunRecord | null = (runQuery.data as RunRecord | null | undefined) ?? null;
+  // A 404 from /api/runs/:id (run was deleted, or the URL was hand-edited
+  // with a bad id) shouldn't pin the page on "progress" forever: flag the
+  // missing-id case so the page can recover to edit mode.
+  const runNotFound =
+    search.runId != null &&
+    runQuery.isError &&
+    /\b404\b/.test((runQuery.error as Error | null)?.message ?? "");
+  const mode: "edit" | "progress" | "done" | "interrupted" | "cancelled" =
+    search.runId == null || runNotFound
+      ? "edit"
+      : runRecord == null
+        ? "progress" // still loading
+        : runRecord.status === "running"
+          ? "progress"
+          : runRecord.status === "interrupted"
+            ? "interrupted"
+            : runRecord.status === "cancelled"
+              ? "cancelled"
+              : "done";
+  // When the server-persisted record arrives, mirror its events into the
+  // local stream array so the existing per-target rendering keeps working
+  // unmodified. Local SSE writes still hit setEvents during a live submit;
+  // when search.runId flips on, this overrides with the durable copy.
+  useEffect(() => {
+    if (runRecord) {
+      setEvents(runRecord.events);
+    }
+  }, [runRecord]);
+  // Set when navigated from /queue with fromQueue=1 AND the approved-rows
+  // fetch returned zero. Surfaces a one-line empty-state hint so the
+  // founder isn't confused by the schema's default empty row.
+  const [hydrationEmpty, setHydrationEmpty] = useState(false);
+  const [missingContactIds, setMissingContactIds] = useState<number[]>([]);
+  const [resolvingContacts, setResolvingContacts] = useState(false);
+
+  // Mount-only hydrate-from-queue. StrictMode double-invokes this effect: the
+  // closure-scoped `cancelled` flag must stay (a useRef ran-once guard would
+  // persist across the remount and leave state un-hydrated).
+  const hydrateFromQueue = useCallback(
+    async (cancelledRef?: { cancelled: boolean }): Promise<void> => {
+      if (!schema) return;
+      try {
+        // `ids` (drain-selected) narrows to exactly the founder's pick. play +
+        // status stay on as a guard: a hand-edited URL can't pull another
+        // play's rows into this play's form, and a row that got sent between
+        // the click and the load drops out instead of being re-sent.
+        const res = await api.queue({
+          forRun: true,
+          play: playName,
+          status: "approved",
+          ...(search.ids ? { ids: search.ids } : {}),
+          limit: search.ids ? Math.max(1, search.ids.length) : (search.limit ?? 50),
+        });
+        if (cancelledRef?.cancelled) return;
+        setMissingContactIds(
+          res.rows
+            .filter((r) => {
+              const p = r.payload as Record<string, unknown> | null;
+              return (
+                r.source.startsWith("find:github-stars:") &&
+                !(typeof p?.email === "string" && p.email.trim())
+              );
+            })
+            .map((r) => r.id),
+        );
+        const pairs = res.rows
+          .map((r) => ({ payload: r.payload, dedupeKey: r.dedupeKey }))
+          .filter((p): p is { payload: Record<string, unknown>; dedupeKey: string } => {
+            return Boolean(p.payload) && typeof p.payload === "object";
+          });
+        const targets = pairs.map(({ payload }) => {
+          const out: Record<string, string> = Object.assign({}, schema.defaultRow);
+          for (const k of Object.keys(payload)) {
+            const v = payload[k];
+            out[k] = v == null ? "" : typeof v === "string" ? v : JSON.stringify(v);
+          }
+          return out;
+        });
+        if (targets.length === 0) {
+          setHydrationEmpty(true);
+          setRows([{ ...schema.defaultRow }]);
+          setDedupeKeys([null]);
+          return;
+        }
+        setHydrationEmpty(false);
+        setRows(targets);
+        setDedupeKeys(pairs.map((p) => p.dedupeKey));
+      } catch (err) {
+        if (cancelledRef?.cancelled) return;
+        fail(`failed to load approved targets from queue: ${(err as Error).message}`);
+      }
+    },
+    [playName, schema, search.limit, search.ids],
+  );
+
+  useEffect(() => {
+    if (search.fromQueue !== "1") return;
+    const ref = { cancelled: false };
+    void (async () => {
+      await hydrateFromQueue(ref);
+    })();
+    return () => {
+      ref.cancelled = true;
+    };
+    // Mount-only on purpose: re-running on search-param edits would clobber
+    // founder edits to the loaded rows. The manual "Refresh from queue"
+    // button invokes hydrateFromQueue directly on demand.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const recoverContacts = async (): Promise<void> => {
+    setResolvingContacts(true);
+    let resolved = 0;
+    let lastError = "";
+    try {
+      for (const id of missingContactIds) {
+        try {
+          await api.resolveQueueContact(id);
+          resolved++;
+        } catch (err) {
+          lastError = (err as Error).message;
+        }
+      }
+      await hydrateFromQueue();
+      if (resolved < missingContactIds.length)
+        fail(`Resolved ${resolved} of ${missingContactIds.length} missing emails. ${lastError}`);
+      else toast.success(`Resolved ${resolved} missing emails`);
+    } finally {
+      setResolvingContacts(false);
+    }
+  };
+
+  const draftedByIndex = useMemo(() => {
+    const m = new Map<
+      number,
+      { subject: string; body: string; flags: string[]; receiptIds?: number[] }
+    >();
+    for (const e of events) {
+      if (e.kind === "draft") {
+        m.set(e.index, { subject: e.subject, body: e.body, flags: e.flags });
+      } else if (e.kind === "send") {
+        const cur = m.get(e.index);
+        if (cur) m.set(e.index, { ...cur, receiptIds: e.receiptIds });
+      }
+    }
+    return m;
+  }, [events]);
+
+  const doneEvent = events.find((e) => e.kind === "done");
+  // Terminal counterpart to `done` for an aborted run: present on both the
+  // live stream and the persisted resume view.
+  const cancelledEvent = events.find((e) => e.kind === "cancelled");
+  const errorEvents = events.filter((e) => e.kind === "error");
+  const verifyEvent = events.find((e) => e.kind === "verify");
+  // Latest pipeline stage ("verifying" / "drafting + sending"), shown while the
+  // run is in flight so it doesn't read as frozen on a slow real send.
+  const latestStage = events.findLast((e) => e.kind === "stage");
+
+  const aggregate = useMemo(() => {
+    const drafts = draftedByIndex.size;
+    let sent = 0;
+    let flagged = 0;
+    for (const d of draftedByIndex.values()) {
+      if (d.receiptIds && d.receiptIds.length > 0) sent++;
+      if (d.flags.length > 0) flagged++;
+    }
+    return { drafts, sent, flagged };
+  }, [draftedByIndex]);
+
+  // A dry run drained from the queue heads back there once it finishes live,
+  // landing on the play's approved rows where the new drafts now sit. The
+  // countdown gives a beat to read the result; "stay" cancels it.
+  // Evidence this mount watched the run live: it submitted it, or saw the
+  // record while still running. A late-loading finished record is neither.
+  const watchedLiveRef = useRef(false);
+  if (running || runRecord?.status === "running") watchedLiveRef.current = true;
+  const [returnIn, setReturnIn] = useState<number | null>(null);
+  const returnDecidedRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!runRecord || runRecord.status === "running") return;
+    // Decide once per run, from the completed record (not the event mirror,
+    // which catches up an effect later).
+    if (returnDecidedRef.current === runRecord.id) return;
+    returnDecidedRef.current = runRecord.id;
+    if (
+      shouldReturnToQueue({
+        watchedLive: watchedLiveRef.current,
+        status: runRecord.status,
+        fromQueue: search.fromQueue === "1",
+        dryRun: runRecord.dryRun,
+        drafts: runRecord.draftedCount,
+        errors: runRecord.errorCount,
+        allLinked: allTargetsLinked(runRecord.targetCount, runRecord.dedupeKeys),
+      })
+    ) {
+      setReturnIn(RETURN_TO_QUEUE_SECONDS);
+    }
+  }, [runRecord, search.fromQueue]);
+  useEffect(() => {
+    if (returnIn == null) return;
+    if (returnIn <= 0) {
+      toast.success(dryRunReturnSummary(aggregate.drafts, aggregate.flagged));
+      void globalNavigate({ to: "/queue", search: { status: "approved", play: playName } });
+      return;
+    }
+    const timer = setTimeout(() => setReturnIn((n) => (n == null ? null : n - 1)), 1000);
+    return () => clearTimeout(timer);
+  }, [returnIn, aggregate.drafts, aggregate.flagged, globalNavigate, playName]);
+
+  if (!schema) {
+    return (
+      <div className="-mx-6 -my-6 flex flex-col">
+        <section className="border-b border-ink-rule px-6 pb-5 pt-6">
+          <Link
+            to="/plays"
+            className="inline-flex items-center gap-1 font-mono text-[11px] text-ink-muted hover:text-ink-cream"
+          >
+            <ArrowLeft size={11} /> back to plays
+          </Link>
+          <div className="ln-eyebrow mt-3">The Ledger · Run</div>
+          <h1
+            className="mt-1 text-ink-cream"
+            style={{
+              fontFamily: "var(--font-display)",
+              fontSize: 36,
+              fontWeight: 400,
+              letterSpacing: "-0.02em",
+              lineHeight: 1,
+            }}
+          >
+            CLI-only play.
+          </h1>
+          <p className="ln-note mt-3 max-w-[64ch] text-[14px] text-ink-cream-2">
+            <code className="font-mono text-[color:var(--ink-spend-2)]">{playName}</code> isn&apos;t
+            exposed in the dashboard yet. Run it from the CLI; the copy-CLI button is on the{" "}
+            <Link
+              to="/plays"
+              className="text-ink-cream underline decoration-ink-faint decoration-1 underline-offset-2"
+            >
+              Plays page
+            </Link>
+            .
+          </p>
+        </section>
+      </div>
+    );
+  }
+
+  const updateRow = (rowIdx: number, fieldKey: string, value: string): void => {
+    setRows((prev) => {
+      const next = prev.slice();
+      next[rowIdx] = { ...(next[rowIdx] ?? schema.defaultRow), [fieldKey]: value };
+      return next;
+    });
+  };
+
+  const addRow = (): void => {
+    setRows((prev) => [...prev, { ...schema.defaultRow }]);
+    // New rows have no queue origin → null in the parallel array. Keeps
+    // indices aligned so server-side persistence skips them cleanly.
+    setDedupeKeys((prev) => [...prev, null]);
+  };
+
+  const removeRow = (rowIdx: number): void => {
+    setRows((prev) => prev.filter((_, i) => i !== rowIdx));
+    setDedupeKeys((prev) => prev.filter((_, i) => i !== rowIdx));
+  };
+
+  const submit = async (): Promise<void> => {
+    /*
+     * The read-only guarantee is enforced HERE and not only on the button.
+     *
+     * This dispatch is the one write in the app that does not go through
+     * `postJson` (it needs an SSE body, which that wrapper cannot carry) so
+     * the transport-level refusal in api/demo.ts never sees it. A disabled
+     * button is a courtesy; this is the guarantee, and without it a demo build
+     * would POST a real run payload at whatever origin it was served from.
+     */
+    if (IS_DEMO) {
+      demoWrite(`/run/${playName}`);
+      return;
+    }
+
+    // Enforce the schema's `required` keys before dispatch. Rows here render
+    // outside a <form> (this is a plain button onClick, not a submit event),
+    // so the `required` attribute on each field is decorative, and `submit`
+    // strips blank fields below, which would otherwise let e.g. a blank
+    // `agency` or `yourEdge` reach the play as `undefined` and produce a
+    // malformed, paid draft.
+    //
+    // finding PRRT_kwDOSKzrBs6ewsAf / PRRT_kwDOSKzrBs6fD-hj: this only ever
+    // checked target-row fields (`schema.fields`). Required EXTRAS
+    // bypassed the guard entirely and
+    // `submit` below omits a blank extra from the request despite its schema
+    // contract: validate both collections before dispatching.
+    const rowIssues = rows
+      .map((row, idx) => ({ idx, missing: missingRequiredFields(schema, row) }))
+      .filter((r) => r.missing.length > 0);
+    const missingExtras = missingRequiredExtras(schema, extras);
+    if (rowIssues.length > 0 || missingExtras.length > 0) {
+      const rowDetail =
+        rowIssues
+          .slice(0, 5)
+          .map((r) => `row ${r.idx + 1}: ${r.missing.join(", ")}`)
+          .join("; ") + (rowIssues.length > 5 ? `; and ${rowIssues.length - 5} more rows` : "");
+      const extraDetail =
+        missingExtras.length > 0 ? `run options: ${missingExtras.join(", ")}` : "";
+      const detail = [rowDetail, extraDetail].filter(Boolean).join("; ");
+      fail(`fill in the required fields before dispatching — ${detail}`);
+      return;
+    }
+
+    setError(null);
+    setEvents([]);
+    setRunning(true);
+
+    // Snapshot rows/dedupeKeys at submit time so the post-run auto-prune
+    // can reconcile by original index even though the form is disabled
+    // during the run (state can't drift here, but the closure capture is
+    // explicit and avoids any future foot-gun).
+    const rowsSnapshot = rows;
+    const dedupeKeysSnapshot = dedupeKeys;
+
+    const targets = rows.map((r) => stripEmpty(r));
+    // Only attach dedupeKeys when at least one row has one (i.e. arrived
+    // from /queue). Pure-manual sessions skip the field; the server then
+    // skips persistence entirely.
+    const hasAnyDedupeKey = dedupeKeys.some((k) => k != null);
+    const body: RunPlayRequest = {
+      dryRun,
+      targets,
+      ...(hasAnyDedupeKey ? { dedupeKeys } : {}),
+    };
+
+    // Local mirror of the SSE event stream: avoids reading React state in
+    // the finally block (which would be stale due to async update batching)
+    // and keeps setState calls below pure (one setter per concern).
+    const streamedEvents: RunPlayEvent[] = [];
+
+    try {
+      const res = await fetch(`/api/run/${encodeURIComponent(playName)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "text/event-stream" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok || !res.body) {
+        const text = await res.text();
+        throw new Error(`${res.status}: ${text.slice(0, 200)}`);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const frames = buf.split("\n\n");
+        buf = frames.pop() ?? "";
+        for (const frame of frames) {
+          const line = frame.split("\n").find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          try {
+            const ev = JSON.parse(line.slice(5).trim()) as RunPlayEvent;
+            streamedEvents.push(ev);
+            setEvents((prev) => [...prev, ev]);
+            // First frame is always { kind: "runStarted", runId }. Navigating to
+            // `?runId=N` makes the URL the durable handle; SSE keeps feeding
+            // `setEvents`, `runQuery` takes over after nav-away.
+            if (ev.kind === "runStarted") {
+              void navigate({ search: (prev) => ({ ...prev, runId: ev.runId }) });
+            }
+          } catch {
+            // ignore parse errors
+          }
+        }
+      }
+    } catch (err) {
+      fail((err as Error).message);
+    } finally {
+      setRunning(false);
+      // After a real-send run, drop rows whose draft actually shipped so
+      // they can't be resent by a second submission of the same form.
+      // Held / errored / unsent rows stay so the founder can edit and retry.
+      const mappedEvents = remapFilteredEventIndexes(streamedEvents, rowsSnapshot);
+      const pruned = pruneSentRows(mappedEvents, rowsSnapshot, dedupeKeysSnapshot);
+      if (pruned.prunedCount > 0) {
+        setRows(pruned.rows);
+        setDedupeKeys(pruned.dedupeKeys);
+        // The per-index draft/send details from the just-finished run no
+        // longer line up with the surviving rows: clear so the UI doesn't
+        // show stale previews under freshly-shifted indices.
+        setEvents([]);
+      }
+    }
+  };
+
+  return (
+    <div className="-mx-6 -my-6 flex flex-col">
+      <section className="border-b border-ink-rule px-6 pb-5 pt-6">
+        <Link
+          to="/plays"
+          className="inline-flex items-center gap-1 font-mono text-[11px] text-ink-muted hover:text-ink-cream"
+        >
+          <ArrowLeft size={11} /> back to plays
+        </Link>
+        {search.fromQueue === "1" && (
+          <Link
+            to="/queue"
+            className="ml-4 inline-flex items-center gap-1 font-mono text-[11px] text-ink-muted hover:text-ink-cream"
+          >
+            <ArrowLeft size={11} /> back to queue
+          </Link>
+        )}
+        <div className="mt-3 flex items-baseline gap-3">
+          <div className="ln-eyebrow">The Ledger · Run</div>
+          <code
+            className="font-mono text-[13px] text-[color:var(--ink-spend-2)]"
+            style={{ fontFeatureSettings: '"zero"' }}
+          >
+            {playName}
+          </code>
+          {search.fromQueue === "1" && (
+            <button
+              type="button"
+              onClick={() => void hydrateFromQueue()}
+              disabled={running || resolvingContacts}
+              title="Re-load approved rows from the queue (drops your in-form edits)"
+              className="ml-2 inline-flex items-center gap-1 font-mono text-[11px] text-ink-muted hover:text-ink-cream disabled:opacity-40"
+            >
+              <RefreshCw size={11} /> refresh from queue
+            </button>
+          )}
+        </div>
+        <h1
+          className="mt-1 text-ink-cream"
+          style={{
+            fontFamily: "var(--font-display)",
+            fontSize: 44,
+            fontWeight: 600,
+            letterSpacing: "-0.025em",
+            lineHeight: 0.98,
+          }}
+        >
+          Draft in dry-run, then send.
+        </h1>
+        <p className="ln-note mt-3 max-w-[72ch] text-[14px] text-ink-cream-2">
+          {schema.description}
+        </p>
+        {mode === "edit" && missingContactIds.length > 0 && (
+          <div className="mt-3 text-sm text-ink-muted">
+            <p>
+              {missingContactIds.length} approved GitHub prospects have no email because contact
+              lookup did not finish. Find verified emails before dispatching, or enter them below.
+              Lookup charges may apply. This reloads the form and replaces unsaved edits.
+            </p>
+            <Button
+              className="mt-2"
+              disabled={running || resolvingContacts}
+              onClick={() => void recoverContacts()}
+              {...readOnly}
+            >
+              {resolvingContacts ? "Finding emails…" : "Find missing emails"}
+            </Button>
+          </div>
+        )}
+        {hydrationEmpty && (
+          <p className="mt-3 font-mono text-[12px] text-ink-spend-2">
+            no approved targets in <code>{playName}</code> queue right now — add rows below or
+            approve some on the{" "}
+            <Link to="/queue" className="underline decoration-ink-faint underline-offset-2">
+              queue page
+            </Link>
+            .
+          </p>
+        )}
+        {mode === "progress" && runRecord && (
+          <p className="mt-3 font-mono text-[12px] text-ink-cream-2">
+            Run #{runRecord.id} · {runRecord.draftedCount}/{runRecord.targetCount} drafted ·{" "}
+            {runRecord.sentCount} sent · {runRecord.errorCount} errors · in progress
+          </p>
+        )}
+        {mode === "done" && runRecord && (
+          <p className="mt-3 font-mono text-[12px] text-ink-cream-2">
+            Run #{runRecord.id} complete · {runRecord.sentCount} of {runRecord.targetCount} sent ·{" "}
+            {runRecord.errorCount} errors
+          </p>
+        )}
+        {mode === "interrupted" && runRecord && (
+          <div className="mt-3 rounded-[var(--radius-sm)] border border-[color:var(--ink-blocked-2)] bg-[color:var(--ink-blocked-2)]/10 px-3 py-2 font-mono text-[12px] text-[color:var(--ink-blocked-2)]">
+            Run #{runRecord.id} was interrupted by a server restart. {runRecord.sentCount} of{" "}
+            {runRecord.targetCount} drafted before the kill. Click <em>Run again</em> below to
+            re-fire the remaining targets — already-sent emails won't fire twice (per-prospect
+            step-0 dedupe).
+            <Explain concept="dedupe" />
+          </div>
+        )}
+        {mode === "cancelled" && runRecord && (
+          <div className="mt-3 rounded-[var(--radius-sm)] border border-[color:var(--ink-blocked-2)] bg-[color:var(--ink-blocked-2)]/10 px-3 py-2 font-mono text-[12px] text-[color:var(--ink-blocked-2)]">
+            Run #{runRecord.id} was cancelled
+            {runRecord.cancelReason ? ` — ${runRecord.cancelReason}` : ""}. {runRecord.sentCount} of{" "}
+            {runRecord.targetCount} sent before the stop; targets that hadn't started yet were never
+            billed. Click <em>Run again</em> below to re-fire the remaining targets.
+          </div>
+        )}
+      </section>
+
+      {schema.extras && (
+        <RunLedgerSection eyebrow="Run options">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {schema.extras.map((f) => (
+              <Field key={f.key} label={f.label} hint={f.hint ?? ""}>
+                <Input
+                  type={f.type === "textarea" ? "text" : f.type}
+                  required={!!f.required}
+                  placeholder={f.placeholder ?? ""}
+                  value={extras[f.key] ?? ""}
+                  onChange={(e) => setExtras((s) => ({ ...s, [f.key]: e.target.value }))}
+                />
+              </Field>
+            ))}
+          </div>
+        </RunLedgerSection>
+      )}
+
+      <RunLedgerSection
+        eyebrow={`Targets · ${rows.length}`}
+        action={
+          <Button variant="secondary" size="sm" onClick={addRow}>
+            <Plus size={12} /> add row
+          </Button>
+        }
+      >
+        <div className="flex flex-col gap-5">
+          {rows.map((row, rowIdx) => (
+            <div
+              // eslint-disable-next-line react/no-array-index-key
+              key={`row-${rowIdx}`}
+              className="border-l-2 border-ink-rule pl-4"
+            >
+              <div className="mb-3 flex items-center justify-between">
+                <span className="font-mono text-[11px] text-ink-faint">target #{rowIdx + 1}</span>
+                {rows.length > 1 && (
+                  <Button variant="ghost" size="sm" onClick={() => removeRow(rowIdx)}>
+                    <Trash2 size={12} />
+                  </Button>
+                )}
+              </div>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                {schema.fields.map((f) =>
+                  f.type === "textarea" ? (
+                    <Field
+                      key={f.key}
+                      label={f.label + (f.required ? " *" : "")}
+                      hint={f.hint ?? ""}
+                      className="md:col-span-2"
+                    >
+                      <Textarea
+                        required={!!f.required}
+                        placeholder={f.placeholder ?? ""}
+                        value={row[f.key] ?? ""}
+                        onChange={(e) => updateRow(rowIdx, f.key, e.target.value)}
+                        rows={3}
+                      />
+                    </Field>
+                  ) : (
+                    <Field
+                      key={f.key}
+                      label={f.label + (f.required ? " *" : "")}
+                      hint={f.hint ?? ""}
+                    >
+                      <Input
+                        type={f.type}
+                        required={!!f.required}
+                        placeholder={f.placeholder ?? ""}
+                        value={row[f.key] ?? ""}
+                        onChange={(e) => updateRow(rowIdx, f.key, e.target.value)}
+                      />
+                    </Field>
+                  ),
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </RunLedgerSection>
+
+      <section
+        className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 border-b border-t border-ink-rule bg-ink-bg/90 px-6 py-3 backdrop-blur-[2px]"
+        data-foot-bar
+      >
+        {mode === "edit" && (
+          <button
+            type="button"
+            onClick={() => setDryRun((d) => !d)}
+            className={cn(
+              "font-mono text-[11px] uppercase tracking-[0.14em] rounded-[var(--radius-sm)] border px-2.5 py-1 transition-colors",
+              dryRun
+                ? "border-ink-rule text-ink-muted hover:text-ink-cream-2"
+                : "border-[color:var(--ink-spend-2)] text-[color:var(--ink-spend-2)] hover:bg-[color:var(--ink-spend-2)]/10",
+            )}
+            title={
+              dryRun
+                ? "MODE: DRY RUN — drafts only, no SDK send. Click to switch to real send."
+                : "MODE: SEND FOR REAL — every drafted row will leave the inbox. Click to switch to dry run."
+            }
+          >
+            {dryRun ? "MODE: DRY RUN" : "MODE: SEND FOR REAL"}
+          </button>
+        )}
+        <div className="flex items-center gap-4 font-mono text-[11.5px] text-ink-faint">
+          {aggregate.drafts > 0 && (
+            <>
+              <span>
+                <span className="text-ink-cream-2">{aggregate.drafts}</span> drafted
+              </span>
+              {aggregate.flagged > 0 && (
+                <span className="text-[color:var(--ink-blocked-2)]">
+                  · {aggregate.flagged} lint
+                </span>
+              )}
+              <span>
+                ·{" "}
+                <span
+                  className={
+                    aggregate.sent > 0 ? "text-[color:var(--ink-receipt-2)]" : "text-ink-muted"
+                  }
+                >
+                  {aggregate.sent}
+                </span>{" "}
+                sent
+              </span>
+              {doneEvent?.kind === "done" && <span className="text-ink-muted">· done</span>}
+              {returnIn != null && (
+                <span className="text-ink-muted">
+                  · back to queue in {Math.max(returnIn, 0)}s ·{" "}
+                  <button
+                    type="button"
+                    onClick={() => setReturnIn(null)}
+                    className="underline decoration-ink-faint underline-offset-2 hover:text-ink-cream"
+                  >
+                    stay
+                  </button>
+                </span>
+              )}
+              {cancelledEvent?.kind === "cancelled" && (
+                <span className="text-ink-muted">· cancelled</span>
+              )}
+            </>
+          )}
+          {running && aggregate.drafts === 0 && (
+            <span>{latestStage?.kind === "stage" ? `${latestStage.stage}…` : "preparing…"}</span>
+          )}
+        </div>
+        {mode === "edit" && (
+          <Button onClick={submit} disabled={running || resolvingContacts} {...readOnly}>
+            <Play size={14} />
+            {running
+              ? "Running…"
+              : dryRun
+                ? `Generate ${rows.length} draft${rows.length === 1 ? "" : "s"}`
+                : `Send ${rows.length} draft${rows.length === 1 ? "" : "s"} for real`}
+          </Button>
+        )}
+        {mode === "progress" && (
+          <div className="flex items-center gap-2 text-[12px] text-ink-muted">
+            <Loader2 size={14} className="animate-spin" />
+            <span>
+              Run #{search.runId} in progress · your progress is saved · closing or reloading this
+              tab stops the run.
+            </span>
+            <Button
+              variant="ghost"
+              disabled={cancelling}
+              onClick={() => {
+                if (search.runId == null) return;
+                setCancelling(true);
+                // Targets already drafted keep their rows; the ones behind the
+                // abort simply never bill. Refetch so the banner flips to the
+                // cancelled state as soon as the row lands.
+                void api
+                  .cancelRun(search.runId, "cancelled from the dashboard")
+                  .catch((e: unknown) => fail((e as Error).message))
+                  .finally(() => {
+                    setCancelling(false);
+                    void runQuery.refetch();
+                  });
+              }}
+            >
+              <X size={14} />
+              {cancelling ? "Stopping…" : "Stop run"}
+            </Button>
+          </div>
+        )}
+        {(mode === "done" || mode === "interrupted" || mode === "cancelled") && (
+          <div className="flex items-center gap-2">
+            {search.runId != null && (runRecord?.sentCount ?? 0) > 0 && (
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  if (search.runId == null) return;
+                  // TanStack navigate keeps the SPA mounted: no full reload,
+                  // dev state intact, instant route swap.
+                  void globalNavigate({
+                    to: "/cadences",
+                    search: { sinceRun: search.runId },
+                  });
+                }}
+              >
+                <CheckCircle2 size={14} />
+                View {runRecord?.sentCount} just-sent in cadences
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              disabled={running || resolvingContacts}
+              onClick={() => {
+                setReturnIn(null);
+                setEvents([]);
+                setError(null);
+                if (runRecord?.targets) {
+                  const restoredRows = runRecord.targets.map((target) => {
+                    const row: Record<string, string> = {};
+                    if (!target || typeof target !== "object" || Array.isArray(target)) return row;
+                    for (const [key, value] of Object.entries(target)) {
+                      row[key] =
+                        value == null
+                          ? ""
+                          : typeof value === "string"
+                            ? value
+                            : JSON.stringify(value);
+                    }
+                    return row;
+                  });
+                  const restoredKeys = restoredRows.map(
+                    (_, index) => runRecord.dedupeKeys[index] ?? null,
+                  );
+                  const mappedEvents = remapFilteredEventIndexes(runRecord.events, restoredRows);
+                  const retryable = pruneSentRows(mappedEvents, restoredRows, restoredKeys);
+                  setRows(retryable.rows.length > 0 ? retryable.rows : [{ ...schema.defaultRow }]);
+                  setDedupeKeys(retryable.rows.length > 0 ? retryable.dedupeKeys : [null]);
+                }
+                void navigate({ search: (prev) => ({ ...prev, runId: undefined }) });
+              }}
+            >
+              <RefreshCw size={14} />
+              Run again
+            </Button>
+          </div>
+        )}
+      </section>
+
+      {error && (
+        <section className="border-b border-ink-rule border-l-2 border-l-[color:var(--ink-blocked)] bg-[color:var(--ink-blocked)]/8 px-6 py-3">
+          <div className="flex items-start gap-2">
+            <Badge tone="blocked">error</Badge>
+            <span className="font-mono text-[12px] text-[color:var(--ink-blocked-2)]">{error}</span>
+          </div>
+        </section>
+      )}
+
+      {verifyEvent && verifyEvent.kind === "verify" && verifyEvent.dropped.length > 0 && (
+        <section className="border-b border-ink-rule border-l-2 border-l-ink-rule bg-ink-surface/40 px-6 py-3">
+          <div className="font-mono text-[11.5px] text-ink-faint">
+            verify · {verifyEvent.verified} of {verifyEvent.total} deliverable
+            {" · "}
+            {verifyEvent.dropped.length} dropped
+          </div>
+          <div className="mt-1 font-mono text-[11px] text-ink-muted">
+            {verifyEvent.dropped.map((d) => (
+              <div key={d.index ?? `${d.email}:${d.reason}`}>
+                {d.email ? mask("email", d.email) : "(missing)"} — {d.reason}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {(events.length > 0 || running) && (
+        <RunLedgerSection eyebrow="Output">
+          <div className="flex flex-col gap-4">
+            {Array.from(draftedByIndex.entries())
+              .toSorted((a, b) => a[0] - b[0])
+              .map(([idx, d]) => (
+                <div
+                  key={idx}
+                  className={cn(
+                    "relative border-l-2 pl-4",
+                    d.flags.length > 0
+                      ? "border-[color:var(--ink-blocked)]"
+                      : d.receiptIds
+                        ? "border-[color:var(--ink-receipt)]"
+                        : "border-ink-rule",
+                  )}
+                >
+                  {d.receiptIds && d.receiptIds.length > 0 && (
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute right-0 top-1 -rotate-[8deg] select-none font-mono text-[9.5px] uppercase tracking-[0.2em] text-[color:var(--ink-receipt-2)]"
+                    >
+                      <span className="inline-flex items-center gap-1 rounded-[var(--radius-xs)] border border-[color:var(--ink-receipt)]/50 px-1.5 py-0.5">
+                        ✓ signed
+                      </span>
+                    </span>
+                  )}
+                  <div className="mb-1 flex items-center gap-2">
+                    <span className="font-mono text-[11px] text-ink-faint">#{idx + 1}</span>
+                    {d.flags.length === 0 && d.receiptIds && <Badge tone="receipt">sent</Badge>}
+                    {d.flags.length === 0 && !d.receiptIds && dryRun && <Badge>dry-run</Badge>}
+                    {d.flags.length > 0 && <Badge tone="blocked">lint</Badge>}
+                  </div>
+                  <div className="ln-eyebrow mt-1" style={{ fontSize: 10 }}>
+                    subject
+                  </div>
+                  <div
+                    className="mt-0.5 text-ink-cream"
+                    style={{
+                      fontFamily: "var(--font-display)",
+                      fontSize: 18,
+                      fontWeight: 400,
+                      letterSpacing: "-0.005em",
+                    }}
+                  >
+                    {d.subject}
+                  </div>
+                  <div className="ln-eyebrow mt-3" style={{ fontSize: 10 }}>
+                    body
+                  </div>
+                  <pre className="mt-0.5 ln-prose whitespace-pre-wrap text-[13.5px] text-ink-cream-2">
+                    {d.body}
+                  </pre>
+                  {d.flags.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {d.flags.map((f) => (
+                        <span
+                          key={f}
+                          className="rounded-[var(--radius-xs)] border border-[color:var(--ink-blocked)]/40 bg-[color:var(--ink-blocked)]/10 px-1.5 py-0.5 font-mono text-[10.5px] text-[color:var(--ink-blocked-2)]"
+                        >
+                          {f}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {d.receiptIds && d.receiptIds.length > 0 && (
+                    <div className="mt-2 flex items-center gap-2 font-mono text-[11px]">
+                      <span className="text-ink-faint">receipts</span>
+                      {d.receiptIds.map((rid) => (
+                        <Link
+                          key={rid}
+                          to="/receipts"
+                          className="text-[color:var(--ink-receipt-2)] hover:underline"
+                        >
+                          #{rid}
+                        </Link>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            {errorEvents.map((e) =>
+              e.kind === "error" ? (
+                <div
+                  key={`${e.index}-${e.message}`}
+                  className="font-mono text-[11.5px] text-[color:var(--ink-blocked-2)]"
+                >
+                  error · {e.message}
+                </div>
+              ) : null,
+            )}
+            {doneEvent && doneEvent.kind === "done" && (
+              <div className="font-mono text-[11.5px] text-ink-muted">
+                done · {doneEvent.sent} of {doneEvent.total} sent
+              </div>
+            )}
+          </div>
+        </RunLedgerSection>
+      )}
+    </div>
+  );
+}
+
+function RunLedgerSection({
+  eyebrow,
+  action,
+  children,
+}: {
+  eyebrow: string;
+  action?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="border-b border-ink-rule px-6 py-6">
+      <div className="mb-4 flex items-center justify-between">
+        <div className="ln-eyebrow">{eyebrow}</div>
+        {action}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function stripEmpty(row: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (v.trim().length > 0) out[k] = v.trim();
+  }
+  return out;
+}

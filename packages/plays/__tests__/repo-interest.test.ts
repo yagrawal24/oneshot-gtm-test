@@ -1,0 +1,217 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Verifies the repo-interest play drafts a complementary intro: the inputBlock
+// carries the STARRED REPO + yourEdge (+ optional repoEdge), and it enrolls a
+// 2-touch cadence (intro + one soft day-3 value follow-up) on a real send.
+
+const calls = { llmInputBlocks: [] as string[], enrolled: 0 };
+
+vi.mock("@oneshot-gtm/core", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/core")>("@oneshot-gtm/core");
+  return {
+    ...actual,
+    loadConfig: () => ({
+      llmProvider: "anthropic",
+      llmModel: "test",
+      founderName: "Founder",
+      productOneLiner: "thing",
+      productDomain: null,
+      founderCredentials: null,
+      productPortfolio: null,
+      partners: null,
+      mobileSignature: false,
+      clientId: "test",
+    }),
+    enrichProfile: async () => ({ result: { profile: {} }, receiptId: 1 }),
+    sendEmail: async () => ({ receiptId: 3 }),
+    getLedger: () => ({
+      getCadence: () => null,
+      upsertProspect: () => 1,
+      recordSequenceEvent: () => 1,
+      hasSentSequenceEvent: () => false,
+      // After a real send the prospect exists, so the enroll lookup resolves:
+      // repo-interest is 2-touch and must enroll a cadence here. [] prior events
+      // means no step-0 yet, so sendDraftedEmail's dedup lets the send proceed.
+      findProspectByEmail: () => ({ id: 1 }),
+      // sendDraftedEmail reads the stored ICP verdict before a first touch.
+      getProspectById: () => null,
+      listSequenceEventsForProspectPlay: () => [],
+      prospectHasFirstTouch: () => false,
+      getCachedEnrichment: () => null,
+      setCachedEnrichment: () => {},
+      enrollCadence: () => {
+        calls.enrolled++;
+      },
+    }),
+    receiptUrlForId: (id: number) => `oneshot://receipt/${id}`,
+  };
+});
+
+vi.mock("@oneshot-gtm/intel", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/intel")>("@oneshot-gtm/intel");
+  return {
+    ...actual,
+    loadPrompt: () => "system",
+    complete: async (input: { messages: Array<{ role: string; content: string }> }) => {
+      calls.llmInputBlocks.push(input.messages.find((m) => m.role === "user")?.content ?? "");
+      return { content: JSON.stringify({ subject: "s", body: "b" }), provider: "t", model: "t" };
+    },
+  };
+});
+
+const { runRepoInterest } = await import("../src/repo-interest.ts");
+
+const base = { name: "Ada", email: "ada@acme.dev", company: "Acme" } as const;
+
+beforeEach(() => {
+  calls.llmInputBlocks = [];
+  calls.enrolled = 0;
+});
+afterEach(() => vi.clearAllMocks());
+
+describe("runRepoInterest", () => {
+  it("drafts with the starred repo (label) + yourEdge in the input block", async () => {
+    await runRepoInterest({
+      dryRun: true,
+      targets: [
+        {
+          ...base,
+          repo: "modelcontextprotocol/servers",
+          repoLabel: "MCP servers",
+          yourEdge: "one SDK for the tools they wire up",
+        },
+      ],
+    });
+    expect(calls.llmInputBlocks[0]).toContain("STARRED REPO: MCP servers");
+    expect(calls.llmInputBlocks[0]).toContain("YOUR EDGE: one SDK for the tools they wire up");
+  });
+
+  it("falls back to the raw repo when no label is set", async () => {
+    await runRepoInterest({
+      dryRun: true,
+      targets: [{ ...base, repo: "owner/name", yourEdge: "x" }],
+    });
+    expect(calls.llmInputBlocks[0]).toContain("STARRED REPO: owner/name");
+  });
+
+  it("includes a CANDIDATE REPOS block when candidateRepos is set, with name/[language]/desc", async () => {
+    await runRepoInterest({
+      dryRun: true,
+      targets: [
+        {
+          ...base,
+          repo: "owner/name",
+          yourEdge: "x",
+          candidateLogin: "ada",
+          candidateRepos: [
+            { name: "agent-loop", description: "self-rewriting skills", language: "Python" },
+            { name: "tiny-llm", description: null, language: "Rust" },
+          ],
+        },
+      ],
+    });
+    const block = calls.llmInputBlocks[0] ?? "";
+    expect(block).toContain("CANDIDATE REPOS");
+    expect(block).toContain("- agent-loop [Python]: self-rewriting skills");
+    expect(block).toContain("- tiny-llm [Rust]: (no description)");
+  });
+
+  it("omits the CANDIDATE REPOS block entirely when absent or empty", async () => {
+    await runRepoInterest({
+      dryRun: true,
+      targets: [{ ...base, repo: "owner/name", yourEdge: "x" }],
+    });
+    expect(calls.llmInputBlocks[0]).not.toContain("CANDIDATE REPOS");
+
+    calls.llmInputBlocks = [];
+    await runRepoInterest({
+      dryRun: true,
+      targets: [{ ...base, repo: "owner/name", yourEdge: "x", candidateRepos: [] }],
+    });
+    expect(calls.llmInputBlocks[0]).not.toContain("CANDIDATE REPOS");
+  });
+
+  it("degrades gracefully (no crash) when candidateRepos is a non-array — e.g. a legacy string payload", async () => {
+    // A stale/legacy payload once stored candidateRepos as a string; the old
+    // `.length > 0` guard let it through and `.map` threw, blocking the draft.
+    // It must now just skip the block, not error.
+    await runRepoInterest({
+      dryRun: true,
+      targets: [
+        {
+          ...base,
+          repo: "owner/name",
+          yourEdge: "x",
+          candidateRepos: "owner/repo-a, owner/repo-b" as unknown as never,
+        },
+      ],
+    });
+    expect(calls.llmInputBlocks[0]).not.toContain("CANDIDATE REPOS");
+  });
+
+  it("includes the per-repo repoEdge line when set, omits it when absent", async () => {
+    await runRepoInterest({
+      dryRun: true,
+      targets: [{ ...base, repo: "owner/name", yourEdge: "x", repoEdge: "writes its own skills" }],
+    });
+    expect(calls.llmInputBlocks[0]).toContain("WHY THIS REPO IS NOTABLE");
+    expect(calls.llmInputBlocks[0]).toContain("writes its own skills");
+
+    calls.llmInputBlocks = [];
+    await runRepoInterest({
+      dryRun: true,
+      targets: [{ ...base, repo: "owner/name", yourEdge: "x" }],
+    });
+    expect(calls.llmInputBlocks[0]).not.toContain("WHY THIS REPO IS NOTABLE");
+  });
+
+  it("adds the brief FORMAT block and reader seniority only in the brief arm", async () => {
+    const out = await runRepoInterest({
+      dryRun: true,
+      targets: [
+        {
+          ...base,
+          repo: "owner/name",
+          yourEdge: "x",
+          title: "VP Engineering",
+          firstTouchFormat: "brief",
+        } as Parameters<typeof runRepoInterest>[0]["targets"][number],
+      ],
+    });
+    expect(calls.llmInputBlocks[0]).toContain("READER SENIORITY: exec");
+    expect((out.drafted[0] as { formatKey?: string } | undefined)?.formatKey).toBe("brief");
+  });
+
+  it("leaves the input block untouched and the draft untracked when no format is set", async () => {
+    await runRepoInterest({
+      dryRun: true,
+      targets: [{ ...base, repo: "owner/name", yourEdge: "x" }],
+    });
+    const untouched = calls.llmInputBlocks[0];
+    calls.llmInputBlocks = [];
+    const out = await runRepoInterest({
+      dryRun: true,
+      targets: [
+        {
+          ...base,
+          repo: "owner/name",
+          yourEdge: "x",
+          firstTouchFormat: "standard",
+        } as Parameters<typeof runRepoInterest>[0]["targets"][number],
+      ],
+    });
+    expect(calls.llmInputBlocks[0]).toBe(untouched);
+    expect(untouched).not.toContain("READER SENIORITY");
+    expect((out.drafted[0] as { formatKey?: string } | undefined)?.formatKey).toBe("standard");
+  });
+
+  it("is 2-touch: enrolls a cadence on a real send", async () => {
+    const out = await runRepoInterest({
+      dryRun: false,
+      targets: [{ ...base, repo: "owner/name", yourEdge: "x" }],
+    });
+    expect(out.drafted).toHaveLength(1);
+    expect(out.drafted[0]?.sent).toBe(true);
+    expect(calls.enrolled).toBe(1);
+  });
+});

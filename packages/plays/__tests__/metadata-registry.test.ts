@@ -1,0 +1,147 @@
+import { describe, expect, it } from "vitest";
+import {
+  acceleratorBatchMetadata,
+  civicPilotMetadata,
+  designPartnerLoiMetadata,
+  lumaEventsMetadata,
+  playMetadata,
+  postFundingMetadata,
+  repoInterestMetadata,
+  sourcesSoughtMetadata,
+} from "../src/_metadata.ts";
+
+// Queue send-draft and runEmailPlay must stamp the same step-0 metadata
+// so evidence keys remain available for downstream routing.
+
+describe("playMetadata — lookup by play name", () => {
+  it("produces the evidence key from a raw queue payload", () => {
+    expect(playMetadata("repo-interest", { repo: "ComposioHQ/trustclaw", name: "Ada" })).toEqual({
+      repo: "ComposioHQ/trustclaw",
+    });
+    expect(
+      playMetadata("luma-events", {
+        eventTitle: "Memory & Mayhem",
+        eventUrl: "https://luma.com/x",
+        eventDate: "2026-08-30",
+      }),
+    ).toEqual({
+      eventTitle: "Memory & Mayhem",
+      eventUrl: "https://luma.com/x",
+      eventDate: "2026-08-30",
+    });
+    expect(playMetadata("stack-consolidation", { vendorStack: "Playwright, Tavily" })).toEqual({
+      vendorStack: "Playwright, Tavily",
+    });
+  });
+
+  it("returns {} for plays with no evidence metadata", () => {
+    // profile-intro / breakup-revive define no metadata; unknown names are the
+    // same case. {subject, body} still lands via sendDraftedEmail's base.
+    expect(playMetadata("profile-intro", { name: "Ada" })).toEqual({});
+    expect(playMetadata("not-a-play", {})).toEqual({});
+  });
+
+  it("strips missing keys instead of storing JSON nulls", () => {
+    // Downstream readers (expandi-sync buildSignal, the cadence sweep) test
+    // key PRESENCE; a stored null would read as "evidence exists but is null".
+    expect(playMetadata("repo-interest", { name: "Ada" })).toEqual({});
+    expect(playMetadata("post-funding", { round: "Seed" })).toEqual({ round: "Seed" });
+  });
+
+  it("keeps numeric fields numeric", () => {
+    expect(playMetadata("post-funding", { round: "A", amountUsd: 12_000_000 })).toEqual({
+      round: "A",
+      amountUsd: 12_000_000,
+    });
+  });
+});
+
+describe("shared fns are what the play defs reference", () => {
+  // The defs import these exact functions, so equality here is equality there.
+  // These assertions pin the shape a typed target produces: if a play's
+  // target fields are renamed, this fails alongside the def's typecheck.
+  it("repo-interest", () => {
+    expect(repoInterestMetadata({ repo: "a/b" })).toEqual({ repo: "a/b" });
+  });
+  it("luma-events tolerates a target with extra fields", () => {
+    expect(
+      lumaEventsMetadata({
+        name: "Ada",
+        email: "a@b.c",
+        eventTitle: "T",
+        eventUrl: "u",
+        eventDate: "d",
+        yourEdge: "e",
+      }),
+    ).toEqual({ eventTitle: "T", eventUrl: "u", eventDate: "d" });
+  });
+  it("post-funding null-fills absent fields at the fn level (registry strips them)", () => {
+    expect(postFundingMetadata({ round: "Seed" })).toEqual({
+      round: "Seed",
+      amountUsd: null,
+      leadInvestor: null,
+    });
+  });
+  // Never the SENDER's cohort, even when an old payload still carries one:
+  // that is founder truth the play reads from config at draft time.
+  it("accelerator-batch reads only the prospect's cohort and its demo-day month off the payload", () => {
+    expect(acceleratorBatchMetadata({ senderCohort: "yc-w26", cohort: "spc-1" })).toEqual({
+      prospectCohort: "spc-1",
+      demoDayMonth: null,
+    });
+    expect(acceleratorBatchMetadata({ cohort: "yc-w26", demoDayMonth: "2026-03" })).toEqual({
+      prospectCohort: "yc-w26",
+      demoDayMonth: "2026-03",
+    });
+  });
+  it("sources-sought", () => {
+    expect(
+      sourcesSoughtMetadata({
+        agency: "GSA",
+        noticeNumber: "W912DY-26-R-0042",
+        noticeType: "Sources Sought",
+      }),
+    ).toEqual({
+      agency: "GSA",
+      noticeNumber: "W912DY-26-R-0042",
+      noticeType: "Sources Sought",
+      responseDeadline: null,
+    });
+  });
+  // finding PRRT_kwDOSKzrBs6ewQdC / issue #463: responseDeadline persists so
+  // the day-5 follow-up can skip once the notice's response window closes.
+  it("sources-sought carries responseDeadline when set", () => {
+    expect(
+      sourcesSoughtMetadata({
+        agency: "GSA",
+        noticeNumber: "W912DY-26-R-0042",
+        noticeType: "Sources Sought",
+        responseDeadline: "2026-07-01",
+      }),
+    ).toEqual({
+      agency: "GSA",
+      noticeNumber: "W912DY-26-R-0042",
+      noticeType: "Sources Sought",
+      responseDeadline: "2026-07-01",
+    });
+  });
+  it("civic-pilot", () => {
+    expect(
+      civicPilotMetadata({
+        city: "Austin",
+        agendaItemTitle: "AI vendor pilot budget",
+        meetingDate: "2026-06-10",
+      }),
+    ).toEqual({
+      city: "Austin",
+      agendaItemTitle: "AI vendor pilot budget",
+      meetingDate: "2026-06-10",
+    });
+  });
+  it("design-partner-loi", () => {
+    expect(designPartnerLoiMetadata({ buyerType: "enterprise", company: "Acme Corp" })).toEqual({
+      buyerType: "enterprise",
+      company: "Acme Corp",
+    });
+  });
+});

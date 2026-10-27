@@ -1,0 +1,380 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Routing is the crux: a stargazer of a `competitor` repo → competitor-switch,
+// of an `adjacent` repo → repo-interest. Mock the module boundaries the finder
+// calls (stargazer fetch, user resolution, ICP, enrich, SDK, ledger).
+
+interface EnqueuedRow {
+  playName: string;
+  payload: Record<string, unknown>;
+  dedupeKey: string;
+  source: string;
+  initialStatus?: string;
+  notes?: string;
+}
+const enqueued: EnqueuedRow[] = [];
+let icpMatch: boolean | null = true;
+let personVerdict: "pass" | "reject" | "unclear" | "transient" = "pass";
+let stargazersByRepo: Record<
+  string,
+  Array<{ login: string; userUrl: string; starredAt: string }>
+> = {};
+let newestSeenByRepo: Record<string, string | null> = {};
+// Per-test override of what fetchTopRepos returns. `null` simulates an API
+// failure / rate-limit; `[]` simulates a user with no public repos. The call
+// tracker doubles as a regression guard: repos are fetched exactly once per
+// candidate (for the ICP evidence block), and only repo-interest rows carry them.
+let nextFetchTopReposResult: Array<{
+  name: string;
+  description: string | null;
+  language: string | null;
+}> | null = [{ name: "agent-loop", description: "self-rewriting skills", language: "Python" }];
+const fetchTopReposCalls: string[] = [];
+const icpCalls: Array<{ candidate: { title: string; url?: string; summary?: string } }> = [];
+
+vi.mock("../src/_stargazers.ts", () => ({
+  recentStargazers: async (repo: string) => ({
+    stargazers: stargazersByRepo[repo] ?? [],
+    newestSeen: newestSeenByRepo[repo] ?? null,
+  }),
+}));
+vi.mock("../src/_github-user.ts", () => ({
+  fetchGitHubUser: async (login: string) => ({
+    login,
+    name: login,
+    email: `${login}@acme.dev`,
+    blogDomain: "acme.dev",
+    company: "Acme",
+    bio: `${login} builds agent tooling`,
+    accountType: "User",
+    createdAt: "2019-03-01T00:00:00Z",
+    publicRepos: 12,
+    followers: 40,
+  }),
+  fetchTopRepos: async (login: string) => {
+    fetchTopReposCalls.push(login);
+    return nextFetchTopReposResult;
+  },
+}));
+vi.mock("../src/_filter.ts", () => ({
+  resolveIcp: () => "icp",
+  icpFilter: async (args: { candidate: { title: string; url?: string; summary?: string } }) => {
+    icpCalls.push(args);
+    return {
+      match: icpMatch,
+      reason: icpMatch === null ? "icp classifier unavailable" : icpMatch ? "fits" : "nope",
+    };
+  },
+  // Person-level gate. These tests cover stargazer routing and contact
+  // resolution, not qualification, so everyone passes by default; the staging
+  // itself is covered by qualify-staging.test.ts.
+  hasRoleText: (p: { roleText?: string | null }) => (p.roleText ?? "").trim().length > 0,
+  qualifyPerson: async () => ({ verdict: personVerdict, reason: "stub" }),
+}));
+// Tier 2. `linkedinUrl: null` is the common case for a stargazer the SDK can't
+// resolve, which is exactly what tier 3 exists to rescue.
+let enrichLinkedinUrl: string | null = null;
+vi.mock("../src/_enrich.ts", () => ({
+  enrichVerifiedContact: async () => ({
+    phone: null,
+    linkedinUrl: enrichLinkedinUrl,
+    title: null,
+    summary: null,
+    costUsd: 0.005,
+    receiptId: 1,
+  }),
+}));
+vi.mock("../src/_dedupe.ts", () => ({ isDuplicate: () => false }));
+vi.mock("../src/_findemail-prescreen.ts", () => ({ shouldSkipFindEmail: () => ({ ok: true }) }));
+vi.mock("@oneshot-gtm/core", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/core")>("@oneshot-gtm/core");
+  return {
+    ...actual,
+    logEvent: () => {},
+    findEmail: async () => ({
+      result: { found: true, email: "x@acme.dev", cost: 0.01 },
+      receiptId: 1,
+    }),
+    verifyEmail: async () => ({ result: { deliverable: true, cost: 0.005 }, receiptId: 1 }),
+    // Tier 3 (findLinkedInUrl). Stubbed so the finder's lookup never reaches the
+    // real search backend from a unit test; per-test overrides drive the shape.
+    webSearch: async (input: { query: string }) => {
+      webSearchQueries.push(input.query);
+      return { result: { results: nextWebSearchResults, cost: 0.01 }, receiptId: 0 };
+    },
+    getLedger: () => ({
+      findContactReceipt: () => null,
+      isQueueDuplicate: () => false,
+      getCachedLinkedIn: () => null,
+      setCachedLinkedIn: () => {},
+      enqueueTarget: (row: EnqueuedRow) => {
+        enqueued.push(row);
+        return enqueued.length;
+      },
+    }),
+  };
+});
+
+const webSearchQueries: string[] = [];
+let nextWebSearchResults: Array<{ url: string }> = [];
+
+const { runGitHubStarsFinder } = await import("../src/github-stars.ts");
+const { _resetLinkedInCache } = await import("../src/_linkedin.ts");
+
+beforeEach(() => {
+  enqueued.length = 0;
+  icpMatch = true;
+  personVerdict = "pass";
+  enrichLinkedinUrl = null;
+  webSearchQueries.length = 0;
+  nextWebSearchResults = [];
+  // The lookup cache is a module-level Map, so without this every case after
+  // the first would read the previous case's answer.
+  _resetLinkedInCache();
+  newestSeenByRepo = {};
+  fetchTopReposCalls.length = 0;
+  icpCalls.length = 0;
+  nextFetchTopReposResult = [
+    { name: "agent-loop", description: "self-rewriting skills", language: "Python" },
+  ];
+  stargazersByRepo = {
+    "apollographql/router": [
+      { login: "alice", userUrl: "https://github.com/alice", starredAt: "2026-06-01T00:00:00Z" },
+    ],
+    "modelcontextprotocol/servers": [
+      { login: "bob", userUrl: "https://github.com/bob", starredAt: "2026-06-01T00:00:00Z" },
+    ],
+  };
+});
+afterEach(() => vi.clearAllMocks());
+
+describe("runGitHubStarsFinder — per-repo rel routing", () => {
+  it("routes a competitor repo's stargazer to competitor-switch and an adjacent repo's to repo-interest", async () => {
+    const out = await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "one SDK for the tools they wire up",
+      repos: [
+        { repo: "apollographql/router", rel: "competitor", label: "Apollo" },
+        { repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" },
+      ],
+    });
+
+    expect(out.candidates).toBe(2);
+    expect(out.enqueued).toBe(2);
+
+    const comp = enqueued.find((r) => r.playName === "competitor-switch");
+    expect(comp).toBeDefined();
+    expect(comp?.payload["competitor"]).toBe("Apollo");
+    expect(String(comp?.payload["evidenceText"])).toContain(
+      "Starred Apollo's repo (apollographql/router)",
+    );
+    expect(comp?.payload["yourEdge"]).toBe("one SDK for the tools they wire up");
+    // #592: the company-gate reason rides on the row as its fit sentence.
+    expect(typeof comp?.payload["fitReason"]).toBe("string");
+    expect(comp?.payload["fitReasonSource"]).toBe("company-gate");
+
+    const adj = enqueued.find((r) => r.playName === "repo-interest");
+    expect(adj).toBeDefined();
+    expect(adj?.payload["repo"]).toBe("modelcontextprotocol/servers");
+    expect(adj?.payload["repoLabel"]).toBe("MCP");
+    // candidate-repo enrichment: present on repo-interest payloads, never on
+    // competitor-switch (the head-on pitch leans on the starred repo alone).
+    expect(adj?.payload["candidateLogin"]).toBeTruthy();
+    expect(adj?.payload["candidateRepos"]).toEqual([
+      { name: "agent-loop", description: "self-rewriting skills", language: "Python" },
+    ]);
+    expect(comp?.payload["candidateLogin"]).toBeUndefined();
+    expect(comp?.payload["candidateRepos"]).toBeUndefined();
+    // Call-count guard: every candidate's repos are fetched exactly once (they
+    // feed the ICP evidence block), and only the repo-interest row carries them.
+    expect(fetchTopReposCalls.toSorted()).toEqual(["alice", "bob"]);
+    expect(
+      enqueued.find((r) => r.playName === "competitor-switch")?.payload["candidateRepos"],
+    ).toBeUndefined();
+  });
+
+  it("enqueues the repo-interest row without candidateRepos when fetchTopRepos returns null (rate-limited)", async () => {
+    nextFetchTopReposResult = null;
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    expect(enqueued).toHaveLength(1);
+    const row = enqueued[0]!;
+    expect(row.playName).toBe("repo-interest");
+    expect(row.payload["candidateLogin"]).toBeTruthy();
+    expect("candidateRepos" in row.payload).toBe(false);
+  });
+
+  it("keeps an empty candidateRepos array on the payload when the user has no public repos", async () => {
+    nextFetchTopReposResult = [];
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    expect(enqueued).toHaveLength(1);
+    const row = enqueued[0]!;
+    expect(row.payload["candidateRepos"]).toEqual([]);
+  });
+
+  it("enqueues an ICP-rejected row instead of a target when the filter misses", async () => {
+    icpMatch = false;
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "apollographql/router", rel: "competitor", label: "Apollo" }],
+    });
+    expect(enqueued).toHaveLength(1);
+    expect(enqueued[0]?.initialStatus).toBe("rejected");
+    expect(enqueued[0]?.playName).toBe("competitor-switch");
+  });
+
+  it("judges ICP on the GitHub profile evidence, not just the star", async () => {
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    const summary = icpCalls[0]?.candidate.summary ?? "";
+    expect(summary).toContain("Bio: bob builds agent tooling");
+    expect(summary).toContain("account created 2019-03-01T00:00:00Z");
+    expect(summary).toContain("- agent-loop (Python) — self-rewriting skills");
+    expect(summary).toContain("Starred: modelcontextprotocol/servers");
+    expect(enqueued[0]?.payload["githubEvidence"]).toContain("Bio: bob builds agent tooling");
+  });
+
+  it("persists the login, profile URL and evidence on an ICP rejection", async () => {
+    icpMatch = false;
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    const row = enqueued[0]!;
+    expect(row.initialStatus).toBe("rejected");
+    expect(row.payload["candidateLogin"]).toBe("bob");
+    expect(row.payload["sourceProfileUrl"]).toBe("https://github.com/bob");
+    expect(String(row.payload["githubEvidence"])).toContain("Bio: bob builds agent tooling");
+  });
+
+  it("drops, never persists, an ICP reject judged without the repo list (fetch failed)", async () => {
+    icpMatch = false;
+    nextFetchTopReposResult = null;
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    expect(enqueued).toHaveLength(0);
+  });
+
+  it("retains the verified email when the later role gate rejects", async () => {
+    personVerdict = "reject";
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "apollographql/router", rel: "competitor", label: "Apollo" }],
+    });
+    expect(enqueued).toHaveLength(1);
+    expect(enqueued[0]?.initialStatus).toBe("rejected");
+    expect(enqueued[0]?.payload["email"]).toBeTruthy();
+  });
+
+  it("does NOT persist a rejected row when classifier is transiently unavailable (match=null)", async () => {
+    // Regression guard for ultrareview bug 003. With the old behavior, a
+    // transient classifier failure persisted a rejected row keyed by
+    // dedupeKey, and isQueueDuplicate (no status filter) would lock the
+    // candidate out of every future tick. The fix: callers drop on
+    // match=null instead of persisting.
+    icpMatch = null;
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "apollographql/router", rel: "competitor", label: "Apollo" }],
+    });
+    expect(enqueued).toHaveLength(0);
+  });
+
+  it("falls back to a LinkedIn webSearch when enrichment returns no profile", async () => {
+    // The gap this finder had: capture stopped at tier 2, so a stargazer the
+    // SDK couldn't resolve had no LinkedIn URL at all: 17 of 334 emailed
+    // repo-interest prospects had one.
+    nextWebSearchResults = [{ url: "https://www.linkedin.com/in/bob-builder" }];
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    expect(enqueued[0]?.payload["linkedinUrl"]).toBe("https://www.linkedin.com/in/bob-builder");
+    // Both the GitHub handle and the company narrow the query. A bare name
+    // search is far too weak to trust.
+    expect(webSearchQueries[0]).toContain('"bob"');
+    expect(webSearchQueries[0]).toContain('"Acme"');
+    expect(webSearchQueries[0]).toContain("site:linkedin.com/in");
+  });
+
+  it("keeps the enrichment URL and skips the search when tier 2 already resolved one", async () => {
+    enrichLinkedinUrl = "https://www.linkedin.com/in/authoritative";
+    nextWebSearchResults = [{ url: "https://www.linkedin.com/in/fuzzy-guess" }];
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    expect(enqueued[0]?.payload["linkedinUrl"]).toBe("https://www.linkedin.com/in/authoritative");
+    expect(webSearchQueries).toHaveLength(0);
+  });
+
+  it("enqueues without a LinkedIn URL when the search misses too", async () => {
+    nextWebSearchResults = [{ url: "https://twitter.com/bob" }];
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    expect(enqueued).toHaveLength(1);
+    expect("linkedinUrl" in (enqueued[0]?.payload ?? {})).toBe(false);
+  });
+
+  it("records the GitHub profile as the source URL so a later re-enrichment has a key", async () => {
+    await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      repos: [{ repo: "modelcontextprotocol/servers", rel: "adjacent", label: "MCP" }],
+    });
+    expect(enqueued[0]?.payload["sourceProfileUrl"]).toBe("https://github.com/bob");
+  });
+
+  it("respects the enqueue limit", async () => {
+    stargazersByRepo = {
+      "o/r": Array.from({ length: 5 }, (_, i) => ({
+        login: `u${i}`,
+        userUrl: `https://github.com/u${i}`,
+        starredAt: "2026-06-01T00:00:00Z",
+      })),
+    };
+    const out = await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      limit: 2,
+      concurrency: 1, // deterministic cap (parallel runs allow soft-cap overshoot)
+      repos: [{ repo: "o/r", rel: "adjacent" }],
+    });
+    expect(out.enqueued).toBe(2);
+  });
+
+  it("halts with the newest-star age when the window is empty", async () => {
+    stargazersByRepo = { "o/r": [] };
+    newestSeenByRepo = { "o/r": new Date(Date.now() - 55 * 86_400_000).toISOString() };
+    const out = await runGitHubStarsFinder({
+      dryRun: false,
+      yourEdge: "x",
+      sinceDays: 30,
+      repos: [{ repo: "o/r", rel: "adjacent" }],
+    });
+    expect(out.candidates).toBe(0);
+    expect(out.halted).toMatch(/no stars in last 30d — newest was 5[45]d ago/);
+  });
+});

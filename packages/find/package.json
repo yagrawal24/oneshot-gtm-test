@@ -1,0 +1,21 @@
+{
+  "name": "@oneshot-gtm/find",
+  "version": "0.10.0",
+  "homepage": "https://oneshot-gtm.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oneshot-agent/oneshot-gtm",
+    "directory": "packages/find"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@oneshot-gtm/core": "workspace:*",
+    "@oneshot-gtm/intel": "workspace:*",
+    "@oneshot-gtm/plays": "workspace:*",
+    "@oneshot-gtm/shared-types": "workspace:*"
+  }
+}

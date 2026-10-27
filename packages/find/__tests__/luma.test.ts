@@ -1,0 +1,1231 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Integration test for runLumaFinder: mocks the SDK + helper boundaries the
+// finder calls (webSearch, webRead, LLM extract, enrichProfile, findEmail,
+// verifyEmail, enrichVerifiedContact, findLinkedInUrl, ICP filter, ledger).
+//
+// Each case drives a specific scenario by mutating the shared state vars in
+// beforeEach + per-test setup. Concurrency = 1 isn't a knob here: runLumaFinder
+// is parallel by design at 3, but the helpers are deterministic per-call so
+// ordering doesn't matter for the assertions below.
+
+interface EnqueuedRow {
+  playName: string;
+  payload: Record<string, unknown>;
+  dedupeKey: string;
+  source: string;
+  initialStatus?: string;
+  notes?: string;
+  channel?: string;
+}
+
+const enqueued: EnqueuedRow[] = [];
+let icpMatch = true;
+let personVerdict: "pass" | "reject" | "unclear" | "transient" = "pass";
+let webSearchResults: Array<{ url: string; title: string; description: string }> = [];
+let webReadMarkdownByUrl: Record<string, string> = {};
+let webReadThrowsForUrl: Set<string> = new Set();
+let llmExtractByUrl: Record<string, string> = {}; // raw JSON string per URL
+let enrichByLinkedinUrl: Record<
+  string,
+  {
+    company?: string | null;
+    company_domain?: string | null;
+    email?: string | null;
+    best_work_email?: string | null;
+  }
+> = {};
+let findEmailReturn: { found: boolean; email: string | null } = {
+  found: true,
+  email: "x@acme.dev",
+};
+let verifyDeliverable = true;
+let shouldSkipFindEmailResult: { ok: boolean; reason?: string } = { ok: true };
+const sdkCalls = {
+  webSearch: 0,
+  webRead: 0,
+  enrichProfile: 0,
+  findEmail: 0,
+  verifyEmail: 0,
+  enrichVerifiedContact: 0,
+  findLinkedInUrl: 0,
+};
+
+// City-page discovery. Default: null → finder falls back to webSearch (so the
+// existing webSearch-driven cases below are unaffected). Discovery cases set
+// `discoveredEvents`. cityToSlug maps the baseConfig city so discovery is tried.
+type DiscoveredEventFixture = {
+  slug: string;
+  name: string;
+  startAtIso: string;
+  city: string | null;
+};
+let discoveredEvents: DiscoveredEventFixture[] | null = null;
+let discoveredEventsBySlug: Record<string, DiscoveredEventFixture[]> = {};
+// Per-event structured details (api.lu.ma/url). Default: null → finder falls
+// back to the webRead + LLM extract path the existing cases below exercise.
+type EventDetailsFixture = {
+  eventTitle: string | null;
+  eventDateIso: string | null;
+  eventTimezone?: string | null;
+  eventCity: string | null;
+  attendees: Array<Record<string, unknown>>;
+};
+let eventDetails: EventDetailsFixture | null = null;
+let eventDetailsBySlug: Record<string, EventDetailsFixture> = {};
+const fetchedCitySlugs: string[] = [];
+const fetchedDetailSlugs: string[] = [];
+const personGateCalls: Array<Record<string, unknown>> = [];
+let findEmailThrows: Error | null = null;
+const { pendingRows, retryHandlers } = vi.hoisted(() => ({
+  pendingRows: [] as Array<{ raw: unknown }>,
+  retryHandlers: new Map<string, (raw: unknown) => Promise<string>>(),
+}));
+vi.mock("../src/_pending.ts", () => ({
+  persistPending: (row: { raw: unknown }) => pendingRows.push(row),
+  registerPendingRetry: (play: string, handler: (raw: unknown) => Promise<string>) =>
+    retryHandlers.set(play, handler),
+}));
+vi.mock("../src/_luma-discover.ts", () => ({
+  cityToSlug: (city: string) =>
+    ({ "san francisco": "sf", "new york": "nyc", london: "london" })[city.trim().toLowerCase()] ??
+    null,
+  fetchCityEvents: async (slug: string) => {
+    fetchedCitySlugs.push(slug);
+    return discoveredEventsBySlug[slug] ?? discoveredEvents;
+  },
+  fetchEventDetails: async (slug: string) => {
+    fetchedDetailSlugs.push(slug);
+    return eventDetailsBySlug[slug] ?? eventDetails;
+  },
+  // Keyword pre-filter is unit-tested in luma-discover.test.ts; let it pass here
+  // so these integration cases exercise the event-level ICP gate + extract.
+  eventNameMatchesTopics: () => true,
+}));
+
+vi.mock("../src/_filter.ts", () => ({
+  resolveIcp: () => "icp",
+  icpFilter: async () => ({ match: icpMatch, reason: icpMatch ? "fits" : "nope" }),
+  // Person-level gate. These tests cover discovery/contact plumbing, not
+  // qualification, so the classifier passes everyone; `_qualify.ts` staging
+  // itself stays REAL here and is covered by qualify-staging.test.ts.
+  hasRoleText: (p: { roleText?: string | null }) => (p.roleText ?? "").trim().length > 0,
+  qualifyPerson: async (input: { person: Record<string, unknown> }) => {
+    personGateCalls.push(input.person);
+    return { verdict: personVerdict, reason: "stub" };
+  },
+}));
+vi.mock("../src/_enrich.ts", () => ({
+  enrichVerifiedContact: async () => {
+    sdkCalls.enrichVerifiedContact++;
+    return {
+      phone: "+15555550100",
+      linkedinUrl: null,
+      title: null,
+      summary: null,
+      costUsd: 0.005,
+      receiptId: 1,
+    };
+  },
+}));
+vi.mock("../src/_dedupe.ts", async () => {
+  const actual = await vi.importActual<typeof import("../src/_dedupe.ts")>("../src/_dedupe.ts");
+  return {
+    ...actual,
+    isDuplicate: () => false,
+  };
+});
+vi.mock("../src/_findemail-prescreen.ts", () => ({
+  shouldSkipFindEmail: () => shouldSkipFindEmailResult,
+}));
+vi.mock("../src/_linkedin.ts", () => ({
+  isLinkedInProfileUrl: (u: string | null | undefined) =>
+    typeof u === "string" && /linkedin\.com\/in\//i.test(u),
+  findLinkedInUrl: async () => {
+    sdkCalls.findLinkedInUrl++;
+    return null;
+  },
+}));
+
+vi.mock("@oneshot-gtm/core", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/core")>("@oneshot-gtm/core");
+  return {
+    ...actual,
+    logEvent: () => {},
+    parallelMap: actual.parallelMap, // real impl preserves ordering
+    webSearch: async () => {
+      sdkCalls.webSearch++;
+      return { result: { results: webSearchResults, cost: 0.01 }, receiptId: 1 };
+    },
+    webRead: async ({ url }: { url: string }) => {
+      sdkCalls.webRead++;
+      if (webReadThrowsForUrl.has(url)) throw new Error("transient webRead failure");
+      return { result: { markdown: webReadMarkdownByUrl[url] ?? "", cost: 0.005 }, receiptId: 1 };
+    },
+    enrichProfile: async (input: { linkedinUrl?: string; email?: string }) => {
+      sdkCalls.enrichProfile++;
+      if (input.linkedinUrl) {
+        const profile = enrichByLinkedinUrl[input.linkedinUrl] ?? {};
+        return {
+          result: { profile, cost: 0.005 },
+          receiptId: 1,
+        };
+      }
+      return { result: { profile: {}, cost: 0.005 }, receiptId: 1 };
+    },
+    findEmail: async () => {
+      sdkCalls.findEmail++;
+      if (findEmailThrows) throw findEmailThrows;
+      return { result: { ...findEmailReturn, cost: 0.05 }, receiptId: 1 };
+    },
+    verifyEmail: async () => {
+      sdkCalls.verifyEmail++;
+      return { result: { deliverable: verifyDeliverable, cost: 0.005 }, receiptId: 1 };
+    },
+    getLedger: () => ({
+      findContactReceipt: () => null,
+      isQueueDuplicate: () => false,
+      isPendingResolution: () => false,
+      isLinkedInProfileKnown: () => false,
+      upsertPendingResolution: () => {},
+      setCachedEnrichment: () => {},
+      enqueueTarget: (row: EnqueuedRow) => {
+        enqueued.push(row);
+        return enqueued.length;
+      },
+    }),
+  };
+});
+
+// LLM extract: the mock returns whatever raw JSON the test seeded for the URL
+// (matched on `payload.url`). Default: empty fallback (the parser will accept
+// `{}` and the finder treats it as a non-event page → skip).
+vi.mock("@oneshot-gtm/intel", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/intel")>("@oneshot-gtm/intel");
+  return {
+    ...actual,
+    loadPrompt: () => "system",
+    complete: async (opts: { messages: Array<{ role: string; content: string }> }) => {
+      const userMsg = opts.messages.find((m) => m.role === "user")?.content ?? "{}";
+      const parsed = JSON.parse(userMsg) as { url?: string };
+      const url = parsed.url ?? "";
+      const raw = llmExtractByUrl[url] ?? "{}";
+      return { content: raw, provider: "t", model: "t" };
+    },
+  };
+});
+
+const { runLumaFinder } = await import("../src/luma.ts");
+
+function futureIso(days: number): string {
+  return new Date(Date.now() + days * 24 * 3600 * 1000).toISOString();
+}
+function pastIso(days: number): string {
+  return new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+}
+
+beforeEach(() => {
+  // Default to public-only mode regardless of the developer's local
+  // LUMA_SESSION_COOKIE (applySecretsToEnv loads ~/.oneshot-gtm/.env on core
+  // import). Otherwise fetchAuthedGuestList makes REAL network calls per
+  // event. The auth-mode describe sets the cookie explicitly per test.
+  delete process.env["LUMA_SESSION_COOKIE"];
+  enqueued.length = 0;
+  personGateCalls.length = 0;
+  pendingRows.length = 0;
+  findEmailThrows = null;
+  icpMatch = true;
+  personVerdict = "pass";
+  webSearchResults = [];
+  webReadMarkdownByUrl = {};
+  webReadThrowsForUrl = new Set();
+  llmExtractByUrl = {};
+  enrichByLinkedinUrl = {};
+  findEmailReturn = { found: true, email: "x@acme.dev" };
+  verifyDeliverable = true;
+  shouldSkipFindEmailResult = { ok: true };
+  discoveredEvents = null;
+  discoveredEventsBySlug = {};
+  eventDetails = null;
+  eventDetailsBySlug = {};
+  fetchedCitySlugs.length = 0;
+  fetchedDetailSlugs.length = 0;
+  for (const k of Object.keys(sdkCalls)) {
+    (sdkCalls as Record<string, number>)[k] = 0;
+  }
+});
+afterEach(() => vi.clearAllMocks());
+
+const baseConfig = {
+  dryRun: false,
+  topics: ["AI"],
+  cities: ["San Francisco"],
+  yourEdge: "a 30-second teardown of how X handles Y",
+  sinceDays: 30,
+  limit: 25,
+};
+
+function event(
+  url: string,
+  override: Partial<{
+    eventTitle: string;
+    eventDateIso: string;
+    eventTimezone: string | null;
+    eventCity: string;
+    eventHasPassed: boolean;
+    publicAttendees: Array<Record<string, unknown>>;
+  }> = {},
+): void {
+  webSearchResults.push({ url, title: "AI Meetup", description: "..." });
+  webReadMarkdownByUrl[url] = "# markdown body";
+  const extract = {
+    eventTitle: override.eventTitle ?? "SF AI Builders Meetup",
+    eventDateIso: override.eventDateIso ?? futureIso(7),
+    eventTimezone: override.eventTimezone ?? null,
+    eventCity: override.eventCity ?? "San Francisco",
+    eventHasPassed: override.eventHasPassed ?? false,
+    publicAttendees: override.publicAttendees ?? [
+      {
+        name: "Alice",
+        profileUrl: null,
+        websiteUrl: "https://alice.dev",
+        linkedinUrl: null,
+        twitterUrl: null,
+        bio: "Founder @ Acme",
+        role: "Speaker",
+      },
+      {
+        name: "Bob",
+        profileUrl: null,
+        websiteUrl: "https://bob.dev",
+        linkedinUrl: null,
+        twitterUrl: null,
+        bio: null,
+        role: null,
+      },
+    ],
+  };
+  llmExtractByUrl[url] = JSON.stringify(extract);
+}
+
+describe("runLumaFinder — city-page discovery", () => {
+  it("uses discovered upcoming events and skips webSearch when the city page yields in-window hits", async () => {
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+      { slug: "sf-evt-old", name: "Past Meetup", startAtIso: pastIso(10), city: "San Francisco" },
+    ];
+    // Phase 2 read/extract for the in-window discovered event (its canonical URL).
+    event("https://luma.com/sf-evt-1");
+
+    const out = await runLumaFinder(baseConfig);
+
+    // Discovery covered the city → webSearch never runs.
+    expect(sdkCalls.webSearch).toBe(0);
+    // The past event is window-filtered BEFORE Phase 2 → only one page is read.
+    expect(sdkCalls.webRead).toBe(1);
+    expect(out.enqueued).toBe(2); // 2 attendees on the in-window event
+  });
+
+  it("uses structured event details (hosts+guests with linkedin/website) and skips webRead entirely", async () => {
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    eventDetails = {
+      eventTitle: "SF AI Builders",
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: [
+        {
+          name: "Dana Host",
+          profileUrl: null,
+          websiteUrl: null,
+          linkedinUrl: "https://www.linkedin.com/in/dana",
+          twitterUrl: null,
+          bio: "Organizer",
+          role: "Host",
+        },
+        {
+          name: "Gabe Guest",
+          profileUrl: null,
+          websiteUrl: "https://gabe.dev",
+          linkedinUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: "Guest",
+        },
+      ],
+    };
+    // The host's linkedin enrichment surfaces a work email directly → no findEmail.
+    enrichByLinkedinUrl["https://www.linkedin.com/in/dana"] = {
+      best_work_email: "dana@org.com",
+      company_domain: "org.com",
+    };
+
+    const out = await runLumaFinder(baseConfig);
+
+    expect(sdkCalls.webRead).toBe(0); // structured details replaced the paid read+extract
+    expect(out.enqueued).toBe(2);
+    expect(enqueued).toHaveLength(2);
+    const dana = enqueued.find((r) => r.payload["name"] === "Dana Host");
+    expect(dana?.payload["email"]).toBe("dana@org.com");
+    // Role surfaces in the payload (queue review) and flips the notes verb.
+    expect(dana?.payload["role"]).toBe("Host");
+    expect(dana?.notes).toContain("hosting");
+    const gabe = enqueued.find((r) => r.payload["name"] === "Gabe Guest");
+    expect(gabe?.payload["role"]).toBe("Guest");
+    expect(gabe?.notes).toContain("going to");
+    expect(sdkCalls.enrichProfile).toBe(1); // linkedin attendee only
+    expect(sdkCalls.findEmail).toBe(1); // website attendee only
+  });
+
+  it("falls back to webSearch when discovery returns null", async () => {
+    discoveredEvents = null;
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(sdkCalls.webSearch).toBe(1);
+    expect(out.enqueued).toBe(2);
+  });
+
+  it("round-robins events and attendees so a high-volume first city cannot crowd out later cities", async () => {
+    const sfEvents = Array.from({ length: 20 }, (_, i) => ({
+      slug: `sf-${i}`,
+      name: `AI SF ${i}`,
+      startAtIso: futureIso(3),
+      city: "San Francisco",
+    }));
+    discoveredEventsBySlug = {
+      sf: sfEvents,
+      nyc: [{ slug: "ny-1", name: "AI NY", startAtIso: futureIso(3), city: "New York" }],
+      london: [{ slug: "ldn-1", name: "AI London", startAtIso: futureIso(3), city: "London" }],
+    };
+    const details = (city: string, prefix: string): EventDetailsFixture => ({
+      eventTitle: `${city} AI Meetup`,
+      eventDateIso: futureIso(3),
+      eventCity: city,
+      attendees: [
+        { name: `${prefix} One`, websiteUrl: `https://${prefix.toLowerCase()}1.dev`, role: "Host" },
+        {
+          name: `${prefix} Two`,
+          websiteUrl: `https://${prefix.toLowerCase()}2.dev`,
+          role: "Guest",
+        },
+      ],
+    });
+    eventDetailsBySlug = {
+      ...Object.fromEntries(
+        sfEvents.map((event) => [event.slug, details("San Francisco", event.slug)]),
+      ),
+      "ny-1": details("New York", "NY"),
+      "ldn-1": details("London", "LDN"),
+    };
+
+    const out = await runLumaFinder({
+      ...baseConfig,
+      cities: ["San Francisco", "New York", "London"],
+      limit: 6,
+    });
+
+    expect(out.candidates).toBe(18);
+    expect(fetchedDetailSlugs.slice(0, 3)).toEqual(["sf-0", "ny-1", "ldn-1"]);
+    expect(enqueued).toHaveLength(6);
+    const byCity = enqueued.reduce<Record<string, number>>((counts, row) => {
+      const city = String(row.payload["eventCity"]);
+      counts[city] = (counts[city] ?? 0) + 1;
+      return counts;
+    }, {});
+    expect(byCity).toEqual({ "San Francisco": 2, "New York": 2, London: 2 });
+  });
+
+  it("redistributes sparse-city capacity, dedupes configured cities, and reads cross-listed events once", async () => {
+    const sfEvents = Array.from({ length: 12 }, (_, i) => ({
+      slug: `shared-${i}`,
+      name: `AI SF ${i}`,
+      startAtIso: futureIso(3),
+      city: "San Francisco",
+    }));
+    discoveredEventsBySlug = {
+      sf: sfEvents,
+      nyc: [sfEvents[0]!],
+      london: [{ slug: "ldn-only", name: "AI London", startAtIso: futureIso(3), city: "London" }],
+    };
+    const details = (city: string): EventDetailsFixture => ({
+      eventTitle: `${city} AI Meetup`,
+      eventDateIso: futureIso(3),
+      eventCity: city,
+      attendees: [
+        { name: `${city} One`, websiteUrl: "https://one.dev" },
+        { name: `${city} Two`, websiteUrl: "https://two.dev" },
+      ],
+    });
+    eventDetails = details("San Francisco");
+    eventDetailsBySlug["ldn-only"] = details("London");
+
+    const out = await runLumaFinder({
+      ...baseConfig,
+      cities: [" San Francisco ", "san francisco", "New York", "London"],
+      limit: 3,
+    });
+
+    expect(fetchedCitySlugs).toEqual(["sf", "nyc", "london"]);
+    expect(out.candidates).toBe(9);
+    expect(fetchedDetailSlugs.filter((slug) => slug === "shared-0")).toHaveLength(1);
+    expect(enqueued.filter((row) => row.payload["eventCity"] === "London")).toHaveLength(1);
+  });
+
+  it("round-robins attendees across events within the same city", async () => {
+    discoveredEventsBySlug.sf = [
+      { slug: "large", name: "AI Large", startAtIso: futureIso(3), city: "San Francisco" },
+      { slug: "small", name: "AI Small", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    const details = (title: string, count: number): EventDetailsFixture => ({
+      eventTitle: title,
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: Array.from({ length: count }, (_, i) => ({
+        name: `${title} ${i}`,
+        websiteUrl: `https://${title.toLowerCase()}-${i}.dev`,
+      })),
+    });
+    eventDetailsBySlug = {
+      large: details("Large", 10),
+      small: details("Small", 2),
+    };
+
+    await runLumaFinder({ ...baseConfig, limit: 4 });
+
+    expect(enqueued.filter((row) => row.payload["eventTitle"] === "Large")).toHaveLength(2);
+    expect(enqueued.filter((row) => row.payload["eventTitle"] === "Small")).toHaveLength(2);
+  });
+});
+
+describe("runLumaFinder — happy path", () => {
+  it("enqueues each attendee once, with the event context stamped onto the row", async () => {
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(2);
+    expect(out.droppedEnrichment).toBe(0);
+    expect(out.droppedIcp).toBe(0);
+    expect(enqueued).toHaveLength(2);
+    expect(enqueued[0]?.payload["eventTitle"]).toBe("SF AI Builders Meetup");
+    expect(enqueued[0]?.payload["eventCity"]).toBe("San Francisco");
+    expect(enqueued[0]?.payload["yourEdge"]).toBe(baseConfig.yourEdge);
+    // 1 webSearch (1 topic × 1 city), 1 webRead, 2 attendees → 2 findEmail (no LinkedIn), 2 verifyEmail.
+    expect(sdkCalls.findEmail).toBe(2);
+    expect(sdkCalls.verifyEmail).toBe(2);
+    expect(sdkCalls.enrichVerifiedContact).toBe(2);
+  });
+
+  // The finder is where an event instant stops being an instant. It resolves
+  // the zone once (explicit → city → install) and stamps the rendered string on
+  // the row, so the play and the prompt never see `2026-08-27T02:30:00Z`. The
+  // shape that makes a model call a Wednesday SF evening "Thursday".
+  describe("event zone resolution onto the queued row", () => {
+    // 7:30pm Wednesday in San Francisco; "now" is the Monday before, so the
+    // event lands inside the finder's upcoming window.
+    const SF_EVENING = "2026-08-27T02:30:00Z";
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-08-24T19:00:00Z"));
+    });
+    afterEach(() => vi.useRealTimers());
+
+    it("uses the zone the event page stated", async () => {
+      event("https://luma.com/abc", {
+        eventDateIso: SF_EVENING,
+        eventTimezone: "America/Los_Angeles",
+        // A contradictory city must not win over the page's own zone.
+        eventCity: "London",
+      });
+      await runLumaFinder(baseConfig);
+      expect(enqueued[0]?.payload["eventTimezone"]).toBe("America/Los_Angeles");
+      expect(enqueued[0]?.payload["eventDateLocal"]).toBe("Wednesday, August 26, 7:30 PM PDT");
+    });
+
+    it("derives the zone from the event's city when the page stated none", async () => {
+      event("https://luma.com/abc", { eventDateIso: SF_EVENING, eventTimezone: null });
+      await runLumaFinder(baseConfig);
+      expect(enqueued[0]?.payload["eventTimezone"]).toBe("America/Los_Angeles");
+      expect(enqueued[0]?.payload["eventDateLocal"]).toBe("Wednesday, August 26, 7:30 PM PDT");
+    });
+
+    it("keeps the raw instant on eventDate for the play's own date math", async () => {
+      // The machine field stays. The play still needs a real instant to decide
+      // upcoming/past/stale. It just never reaches the prompt.
+      event("https://luma.com/abc", {
+        eventDateIso: SF_EVENING,
+        eventTimezone: "America/Los_Angeles",
+      });
+      await runLumaFinder(baseConfig);
+      expect(enqueued[0]?.payload["eventDate"]).toBe(SF_EVENING);
+    });
+
+    it("carries the zone through the structured-details path too", async () => {
+      discoveredEvents = [
+        {
+          slug: "sf-evt-1",
+          name: "SF AI Builders",
+          startAtIso: SF_EVENING,
+          city: "San Francisco",
+        },
+      ];
+      eventDetails = {
+        eventTitle: "SF AI Builders",
+        eventDateIso: SF_EVENING,
+        eventTimezone: "America/Los_Angeles",
+        eventCity: "San Francisco",
+        attendees: [
+          {
+            name: "Dana Host",
+            profileUrl: null,
+            websiteUrl: null,
+            linkedinUrl: "https://www.linkedin.com/in/dana",
+            twitterUrl: null,
+            bio: "Organizer",
+            role: "Host",
+          },
+          // The finder requires 2+ attendees before it will spend on an event.
+          {
+            name: "Gabe Guest",
+            profileUrl: null,
+            websiteUrl: "https://gabe.dev",
+            linkedinUrl: null,
+            twitterUrl: null,
+            bio: null,
+            role: "Guest",
+          },
+        ],
+      };
+      enrichByLinkedinUrl["https://www.linkedin.com/in/dana"] = {
+        best_work_email: "dana@org.com",
+        company_domain: "org.com",
+      };
+      await runLumaFinder(baseConfig);
+      expect(enqueued[0]?.payload["eventTimezone"]).toBe("America/Los_Angeles");
+      expect(enqueued[0]?.payload["eventDateLocal"]).toBe("Wednesday, August 26, 7:30 PM PDT");
+    });
+  });
+
+  it("filters non-event URLs (e.g. /discover, ?k=t) out before webRead", async () => {
+    webSearchResults = [
+      { url: "https://luma.com/discover", title: "Discover", description: "" },
+      { url: "https://luma.com/ai?k=t", title: "AI category", description: "" },
+      { url: "https://luma.com/abc", title: "Event", description: "" },
+    ];
+    webReadMarkdownByUrl["https://luma.com/abc"] = "# event";
+    llmExtractByUrl["https://luma.com/abc"] = JSON.stringify({
+      eventTitle: "X",
+      eventDateIso: futureIso(3),
+      eventCity: "SF",
+      eventHasPassed: false,
+      publicAttendees: [
+        { name: "Alice", websiteUrl: "https://alice.dev" },
+        { name: "Bob", websiteUrl: "https://bob.dev" },
+      ],
+    });
+    const out = await runLumaFinder(baseConfig);
+    expect(sdkCalls.webRead).toBe(1); // only the event page
+    expect(out.candidates).toBe(1);
+    expect(out.enqueued).toBe(2);
+  });
+});
+
+describe("runLumaFinder — event-level drops", () => {
+  it("drops events the LLM marks eventHasPassed: true", async () => {
+    event("https://luma.com/past", { eventHasPassed: true });
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(0);
+    expect(sdkCalls.findEmail).toBe(0);
+  });
+
+  it("drops events with a past eventDateIso even when LLM says not-passed (defense)", async () => {
+    event("https://luma.com/past", { eventHasPassed: false, eventDateIso: pastIso(7) });
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(0);
+  });
+
+  it("drops events with no parseable eventDateIso", async () => {
+    event("https://luma.com/nodate", { eventHasPassed: false, eventDateIso: "" });
+    const out = await runLumaFinder({ ...baseConfig, topics: ["AI"], cities: ["SF"] });
+    expect(out.enqueued).toBe(0);
+  });
+
+  it("drops events further out than sinceDays (forward-window cap)", async () => {
+    event("https://luma.com/far", { eventDateIso: futureIso(90) });
+    const out = await runLumaFinder({ ...baseConfig, sinceDays: 14 });
+    expect(out.enqueued).toBe(0);
+  });
+
+  it("drops events with fewer than 2 publicAttendees (organizer didn't enable 'Show Who's Coming')", async () => {
+    event("https://luma.com/private", {
+      publicAttendees: [{ name: "Solo", websiteUrl: "https://solo.dev" }],
+    });
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(0);
+  });
+});
+
+describe("runLumaFinder — contact resolution", () => {
+  it("skips findEmail when LinkedIn enrichProfile surfaces best_work_email directly (cost savings)", async () => {
+    enrichByLinkedinUrl["https://linkedin.com/in/alice"] = {
+      company: "Acme",
+      company_domain: "acme.dev",
+      best_work_email: "alice@acme.dev",
+    };
+    event("https://luma.com/abc", {
+      publicAttendees: [
+        {
+          name: "Alice",
+          linkedinUrl: "https://linkedin.com/in/alice",
+          websiteUrl: null,
+          profileUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: null,
+        },
+        {
+          name: "Bob",
+          linkedinUrl: null,
+          websiteUrl: "https://bob.dev",
+          profileUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: null,
+        },
+      ],
+    });
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(2);
+    // Alice: enrichProfile → surfaced email → skip findEmail.
+    // Bob: no LinkedIn, websiteUrl → findEmail uses websiteUrl.
+    expect(sdkCalls.findEmail).toBe(1);
+    expect(sdkCalls.enrichProfile).toBe(1);
+  });
+
+  it("falls back to findEmail with LinkedIn-resolved company_domain when email isn't surfaced", async () => {
+    enrichByLinkedinUrl["https://linkedin.com/in/alice"] = {
+      company: "Acme",
+      company_domain: "acme.dev",
+      best_work_email: null,
+      email: null,
+    };
+    event("https://luma.com/abc", {
+      publicAttendees: [
+        {
+          name: "Alice",
+          linkedinUrl: "https://linkedin.com/in/alice",
+          websiteUrl: null,
+          profileUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: null,
+        },
+        {
+          name: "Bob",
+          linkedinUrl: null,
+          websiteUrl: "https://bob.dev",
+          profileUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: null,
+        },
+      ],
+    });
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(2);
+    expect(sdkCalls.findEmail).toBe(2);
+  });
+
+  it("drops an attendee with no LinkedIn AND no website (no contact domain)", async () => {
+    event("https://luma.com/abc", {
+      publicAttendees: [
+        {
+          name: "Ghost",
+          linkedinUrl: null,
+          websiteUrl: null,
+          profileUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: null,
+        },
+        // Need a second attendee to clear the <2 gate; this one is fine.
+        {
+          name: "Bob",
+          linkedinUrl: null,
+          websiteUrl: "https://bob.dev",
+          profileUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: null,
+        },
+      ],
+    });
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(1);
+    expect(out.droppedEnrichment).toBe(1);
+  });
+});
+
+describe("runLumaFinder — per-attendee filters", () => {
+  it("drops the whole event at the ICP/topic gate, before any webRead", async () => {
+    // ICP filter now runs at the EVENT level (on the name), not per-attendee.
+    icpMatch = false;
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(0);
+    expect(out.droppedIcp).toBe(1); // one EVENT dropped (not per-attendee)
+    expect(enqueued).toHaveLength(0); // no rejected rows persisted
+    expect(sdkCalls.webRead).toBe(0); // gated before any webRead spend
+    expect(sdkCalls.findEmail).toBe(0);
+  });
+
+  it("drops attendees that shouldSkipFindEmail rejects (handle-looking name, blocked domain)", async () => {
+    shouldSkipFindEmailResult = { ok: false, reason: "handle-looking" };
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(0);
+    expect(out.droppedEnrichment).toBe(2);
+    expect(sdkCalls.findEmail).toBe(0);
+  });
+
+  it("drops attendees whose verifyEmail says undeliverable", async () => {
+    verifyDeliverable = false;
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(0);
+    expect(out.droppedEnrichment).toBe(2);
+    expect(sdkCalls.verifyEmail).toBe(2);
+  });
+});
+
+describe("runLumaFinder — error resilience", () => {
+  it("swallows a webRead throw for one event and still processes the others", async () => {
+    event("https://luma.com/good");
+    event("https://luma.com/bad");
+    webReadThrowsForUrl.add("https://luma.com/bad");
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(2); // both attendees of /good still enqueued
+  });
+});
+
+describe("runLumaFinder — limits", () => {
+  it("respects the enqueue limit across events", async () => {
+    // 3 events × 2 attendees = 6 candidates; cap to 4.
+    event("https://luma.com/e1");
+    event("https://luma.com/e2");
+    event("https://luma.com/e3");
+    const out = await runLumaFinder({ ...baseConfig, limit: 4 });
+    expect(out.enqueued).toBe(4);
+  });
+
+  it("limit stays exact even when it is smaller than the phase-3 concurrency", async () => {
+    // 6 candidates race through 3 parallel workers; the synchronous
+    // pre-enqueue re-check must keep the cap exact (spend may overshoot,
+    // the queue may not).
+    event("https://luma.com/e1");
+    event("https://luma.com/e2");
+    event("https://luma.com/e3");
+    const out = await runLumaFinder({ ...baseConfig, limit: 1 });
+    expect(out.enqueued).toBe(1);
+    expect(enqueued).toHaveLength(1);
+  });
+
+  it("dry-run mode short-circuits enqueue (counts as enqueued but no SDK fan-out)", async () => {
+    event("https://luma.com/abc");
+    const out = await runLumaFinder({ ...baseConfig, dryRun: true });
+    expect(out.enqueued).toBe(2);
+    expect(sdkCalls.findEmail).toBe(0);
+    expect(sdkCalls.verifyEmail).toBe(0);
+    expect(enqueued).toHaveLength(0);
+  });
+});
+
+describe("runLumaFinder — auth mode (LUMA_SESSION_COOKIE)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalCookieEnv: string | undefined;
+  let fetchCalls: Array<{ url: string; cookie: string }> = [];
+
+  function stubFetch(responses: Array<{ status: number; body?: unknown; throws?: Error }>): void {
+    let i = 0;
+    fetchCalls = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      fetchCalls.push({
+        url: typeof input === "string" ? input : (input as URL).toString(),
+        cookie: (init?.headers as Record<string, string> | undefined)?.["Cookie"] ?? "",
+      });
+      const r = responses[i++];
+      if (!r) throw new Error("no more responses queued");
+      if (r.throws) throw r.throws;
+      return new Response(r.body != null ? JSON.stringify(r.body) : null, {
+        status: r.status,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof globalThis.fetch;
+  }
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalCookieEnv = process.env["LUMA_SESSION_COOKIE"];
+    fetchCalls = [];
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalCookieEnv == null) delete process.env["LUMA_SESSION_COOKIE"];
+    else process.env["LUMA_SESSION_COOKIE"] = originalCookieEnv;
+  });
+
+  it("with cookie unset, fetch is never called and public-only path runs (regression)", async () => {
+    delete process.env["LUMA_SESSION_COOKIE"];
+    // Stub fetch anyway: if anything calls it, we'd see calls > 0.
+    stubFetch([]);
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(fetchCalls).toHaveLength(0);
+    expect(out.enqueued).toBe(2);
+  });
+
+  it("with cookie set + 200 OK, merges auth'd guests into the public list", async () => {
+    process.env["LUMA_SESSION_COOKIE"] = "test-cookie";
+    stubFetch([
+      {
+        status: 200,
+        body: {
+          entries: [
+            { user: { name: "Carol", website: "https://carol.dev" } },
+            { user: { name: "Dan", website: "https://dan.dev" } },
+            { user: { name: "Eve", website: "https://eve.dev" } },
+          ],
+        },
+      },
+    ]);
+    // Public extract: Alice + Bob. Auth'd: Carol/Dan/Eve. Merge: 5 unique.
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]?.url).toBe(
+      "https://api.lu.ma/event/admin/get-guest-list?event_api_id=abc",
+    );
+    expect(fetchCalls[0]?.cookie).toBe("luma.auth-session-key=test-cookie");
+    // 2 public + 3 auth'd = 5 unique attendees → 5 enqueued.
+    expect(out.enqueued).toBe(5);
+  });
+
+  it("falls back to public-only on 401 (expired cookie)", async () => {
+    process.env["LUMA_SESSION_COOKIE"] = "expired";
+    stubFetch([{ status: 401 }]);
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(2); // only the 2 public attendees
+  });
+
+  it("falls back to public-only when both candidate endpoints 404", async () => {
+    process.env["LUMA_SESSION_COOKIE"] = "test-cookie";
+    stubFetch([{ status: 404 }, { status: 404 }]);
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(fetchCalls).toHaveLength(2);
+    expect(out.enqueued).toBe(2);
+  });
+
+  it("uses the bare endpoint after 404 on /admin/", async () => {
+    process.env["LUMA_SESSION_COOKIE"] = "test-cookie";
+    stubFetch([
+      { status: 404 },
+      {
+        status: 200,
+        body: { entries: [{ user: { name: "Carol", website: "https://carol.dev" } }] },
+      },
+    ]);
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[1]?.url).toBe("https://api.lu.ma/event/get-guest-list?event_api_id=abc");
+    expect(out.enqueued).toBe(3); // 2 public + 1 auth'd
+  });
+
+  it("falls back to public-only when fetch throws (network blip)", async () => {
+    process.env["LUMA_SESSION_COOKIE"] = "test-cookie";
+    stubFetch([
+      { status: 0, throws: new Error("ECONNRESET") },
+      { status: 0, throws: new Error("ECONNRESET") },
+    ]);
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    expect(out.enqueued).toBe(2);
+  });
+
+  it("auth'd attendee dedupes against public one with the same name", async () => {
+    process.env["LUMA_SESSION_COOKIE"] = "test-cookie";
+    // Auth surfaces "Alice" again: same person, should NOT double-enqueue.
+    stubFetch([
+      {
+        status: 200,
+        body: {
+          entries: [
+            { user: { name: "Alice", website: "https://alice.dev" } },
+            { user: { name: "Carol", website: "https://carol.dev" } },
+          ],
+        },
+      },
+    ]);
+    event("https://luma.com/abc");
+    const out = await runLumaFinder(baseConfig);
+    // Public: Alice + Bob. Auth'd: Alice + Carol. Merged unique: Alice + Bob + Carol = 3.
+    expect(out.enqueued).toBe(3);
+  });
+});
+
+describe("runLumaFinder — person-level ICP gate", () => {
+  /** Two attendees, both carrying a bio: stage A can judge without spending. */
+  const withBios = [
+    {
+      name: "Alice",
+      profileUrl: null,
+      websiteUrl: "https://alice.dev",
+      linkedinUrl: null,
+      twitterUrl: null,
+      bio: "GTM @AhaCreator",
+      role: "Guest",
+    },
+    {
+      name: "Dave",
+      profileUrl: null,
+      websiteUrl: "https://dave.dev",
+      linkedinUrl: null,
+      twitterUrl: null,
+      bio: "Head of Growth",
+      role: "Guest",
+    },
+  ];
+  /** Two attendees with no bio at all: ~31% of real Luma candidates. */
+  const withoutBios = withBios.map((a) => ({ ...a, bio: null, role: null }));
+
+  it("rejects on the attendee bio at stage A, before paying for anything", async () => {
+    // The point of stage A: the bio is already on the payload, so a clear miss
+    // costs $0 to drop: no findEmail, no verify, no enrich.
+    personVerdict = "reject";
+    event("https://luma.com/abc", { publicAttendees: withBios });
+    const out = await runLumaFinder(baseConfig);
+
+    expect(out.droppedRole).toBe(2);
+    expect(out.enqueued).toBe(0);
+    expect(sdkCalls.findEmail).toBe(0);
+    expect(sdkCalls.verifyEmail).toBe(0);
+    expect(sdkCalls.enrichVerifiedContact).toBe(0);
+  });
+
+  it("persists an auditable rejected row so the founder can override the call", async () => {
+    personVerdict = "reject";
+    event("https://luma.com/abc", { publicAttendees: withBios });
+    await runLumaFinder(baseConfig);
+
+    expect(enqueued).toHaveLength(2);
+    for (const row of enqueued) {
+      expect(row.initialStatus).toBe("rejected");
+      expect(row.notes).toMatch(/^auto: role — /);
+    }
+  });
+
+  it("does NOT reject at stage A when the attendee has no bio — it escalates", async () => {
+    // Missing data must take the same path as ambiguous data. Treating a blank
+    // bio as a rejection would silently drop a third of every Luma event.
+    personVerdict = "reject";
+    event("https://luma.com/abc", { publicAttendees: withoutBios });
+    const out = await runLumaFinder(baseConfig);
+
+    // Stage A could not judge, so contact resolution ran and the rejection
+    // happened later, at the post-enrich stage.
+    expect(sdkCalls.findEmail).toBe(2);
+    expect(sdkCalls.enrichVerifiedContact).toBe(2);
+    expect(out.droppedRole).toBe(2);
+    expect(out.enqueued).toBe(0);
+  });
+
+  it("enqueues normally when the person passes", async () => {
+    personVerdict = "pass";
+    event("https://luma.com/abc", { publicAttendees: withBios });
+    const out = await runLumaFinder(baseConfig);
+
+    expect(out.droppedRole).toBe(0);
+    expect(out.enqueued).toBe(2);
+  });
+});
+
+describe("luma-events personGate", () => {
+  function setupEvent(): void {
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    eventDetails = {
+      eventTitle: "SF AI Builders",
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: [
+        {
+          name: "Dana Host",
+          profileUrl: null,
+          websiteUrl: null,
+          linkedinUrl: "https://www.linkedin.com/in/dana",
+          twitterUrl: null,
+          bio: "Account Executive",
+          role: "Host",
+        },
+        // The finder skips events with fewer than two public attendees.
+        {
+          name: "Gabe Guest",
+          profileUrl: null,
+          websiteUrl: "https://gabe.dev",
+          linkedinUrl: null,
+          twitterUrl: null,
+          bio: "Marketing ops",
+          role: "Guest",
+        },
+      ],
+    };
+    enrichByLinkedinUrl["https://www.linkedin.com/in/dana"] = {
+      best_work_email: "dana@org.com",
+      company_domain: "org.com",
+    };
+  }
+
+  it("affinity mode marks every gate call and stamps the row for re-judging", async () => {
+    setupEvent();
+    await runLumaFinder({ ...baseConfig, personGate: "affinity" });
+    expect(personGateCalls.length).toBeGreaterThan(0);
+    for (const person of personGateCalls) expect(person["affinity"]).toBe(true);
+    expect(enqueued.length).toBeGreaterThan(0);
+    for (const row of enqueued) expect(row.payload["icpAffinity"]).toBe(true);
+  });
+
+  it("the default role mode sends no affinity and stamps nothing", async () => {
+    setupEvent();
+    await runLumaFinder(baseConfig);
+    expect(personGateCalls.length).toBeGreaterThan(0);
+    for (const person of personGateCalls) expect(person).not.toHaveProperty("affinity");
+    expect(enqueued.length).toBeGreaterThan(0);
+    for (const row of enqueued) expect(row.payload).not.toHaveProperty("icpAffinity");
+  });
+});
+
+describe("luma-events outage retry", () => {
+  it("keeps the trigger's affinity gate across a persisted retry", async () => {
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    eventDetails = {
+      eventTitle: "SF AI Builders",
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: ["Gabe Guest", "Hana Guest"].map((name) => ({
+        name,
+        profileUrl: null,
+        websiteUrl: "https://guest.dev",
+        linkedinUrl: null,
+        twitterUrl: null,
+        bio: null,
+        role: "Guest",
+      })),
+    };
+    findEmailThrows = new Error("Tool request failed");
+    await runLumaFinder({ ...baseConfig, personGate: "affinity" });
+    expect(pendingRows.length).toBeGreaterThan(0);
+    expect(pendingRows[0]!.raw).toMatchObject({ personGate: "affinity" });
+
+    findEmailThrows = null;
+    personGateCalls.length = 0;
+    const retry = retryHandlers.get("luma-events")!;
+    await retry(JSON.parse(JSON.stringify(pendingRows[0]!.raw)));
+    expect(personGateCalls.length).toBeGreaterThan(0);
+    for (const person of personGateCalls) expect(person["affinity"]).toBe(true);
+  });
+});
+
+describe("luma-events channels", () => {
+  it("queues an attendee with no email on LinkedIn when the run allows it", async () => {
+    const { withFinderChannels } = await import("../src/_channels-context.ts");
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    eventDetails = {
+      eventTitle: "SF AI Builders",
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: [
+        {
+          name: "Dana Host",
+          profileUrl: null,
+          websiteUrl: null,
+          linkedinUrl: "https://www.linkedin.com/in/dana",
+          twitterUrl: null,
+          bio: "Founder",
+          role: "Host",
+        },
+        {
+          name: "Gabe Guest",
+          profileUrl: null,
+          websiteUrl: null,
+          linkedinUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: "Guest",
+        },
+      ],
+    };
+    // Enrichment by LinkedIn gives a company domain but no email, and findEmail misses.
+    enrichByLinkedinUrl["https://www.linkedin.com/in/dana"] = { company_domain: "org.com" };
+    findEmailReturn = { found: false, email: null };
+
+    await withFinderChannels(["email", "linkedin"], () => runLumaFinder(baseConfig));
+
+    const dana = enqueued.find((r) => r.payload["name"] === "Dana Host");
+    expect(dana).toMatchObject({ channel: "linkedin" });
+    expect(dana!.payload["linkedinUrl"]).toBe("https://www.linkedin.com/in/dana");
+    expect(dana!.payload["email"]).toBe("");
+    // Without an address on either channel, Gabe is not queued.
+    expect(enqueued.find((r) => r.payload["name"] === "Gabe Guest")).toBeUndefined();
+  });
+});
+
+describe("luma-events X channel", () => {
+  it("queues an attendee with no email on X when Luma lists their X profile", async () => {
+    const { withFinderChannels } = await import("../src/_channels-context.ts");
+    discoveredEvents = [
+      { slug: "sf-evt-1", name: "SF AI Builders", startAtIso: futureIso(3), city: "San Francisco" },
+    ];
+    eventDetails = {
+      eventTitle: "SF AI Builders",
+      eventDateIso: futureIso(3),
+      eventCity: "San Francisco",
+      attendees: [
+        {
+          name: "Xena Host",
+          profileUrl: null,
+          websiteUrl: "https://xena.dev",
+          linkedinUrl: null,
+          twitterUrl: "https://x.com/xena_dev",
+          bio: "Founder",
+          role: "Host",
+        },
+        {
+          name: "Gabe Guest",
+          profileUrl: null,
+          websiteUrl: null,
+          linkedinUrl: null,
+          twitterUrl: null,
+          bio: null,
+          role: "Guest",
+        },
+      ],
+    };
+    findEmailReturn = { found: false, email: null };
+
+    await withFinderChannels(["email", "x"], () => runLumaFinder(baseConfig));
+
+    const xena = enqueued.find((r) => r.payload["name"] === "Xena Host");
+    expect(xena).toMatchObject({ channel: "x" });
+    expect(xena!.payload).toMatchObject({
+      handle: "xena_dev",
+      twitterUrl: "https://x.com/xena_dev",
+    });
+  });
+});

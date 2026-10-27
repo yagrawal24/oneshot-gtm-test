@@ -1,0 +1,313 @@
+import { getLedger, logEvent, webRead } from "@oneshot-gtm/core";
+import { resolveVerifyEnrichQualify, icpFields } from "./_contact.ts";
+import { enqueueScoredTarget } from "./_priority-adapters.ts";
+import { persistRoleRejection } from "./_qualify.ts";
+import type { ShowHnTarget } from "@oneshot-gtm/plays";
+import { icpFilter, resolveIcp } from "./_filter.ts";
+import { isDuplicate, urlDomain } from "./_dedupe.ts";
+import { findLinkedInUrl } from "./_linkedin.ts";
+import { parallelMap } from "./_parallel.ts";
+import { persistPending, registerPendingRetry } from "./_pending.ts";
+import type { FinderResult, RunOpts, ShowHnHit } from "./_types.ts";
+
+const HN_ALGOLIA = "https://hn.algolia.com/api/v1/search_by_date";
+const PLAY_NAME = "show-hn";
+const SOURCE = "find:show-hn";
+
+export interface ShowHnFinderOpts extends RunOpts {
+  /** Look back this many days. Default 1. */
+  sinceDays?: number;
+  /** Skip posts with fewer points than this. Default 5. */
+  minPoints?: number;
+  /** Max per-candidate pipelines in flight at once. Default 3. */
+  concurrency?: number;
+}
+
+interface SearchHitsResponse {
+  hits: ShowHnHit[];
+}
+
+/**
+ * Pulls Show HN posts from HN Algolia, ICP-filters them, enriches founder
+ * contact via OneShot, dedupes against the ledger, and enqueues into target_queue.
+ */
+export async function runShowHnFinder(opts: ShowHnFinderOpts): Promise<FinderResult> {
+  const sinceDays = opts.sinceDays ?? 1;
+  const minPoints = opts.minPoints ?? 5;
+  const limit = opts.limit ?? 25;
+  const icp = resolveIcp(opts.icpOverride);
+  const ledger = getLedger();
+
+  const result: FinderResult = {
+    source: SOURCE,
+    candidates: 0,
+    droppedIcp: 0,
+    droppedDuplicate: 0,
+    droppedEnrichment: 0,
+    droppedLowSignal: 0,
+    enqueued: 0,
+    costUsd: 0,
+  };
+
+  logEvent("finder.start", { name: PLAY_NAME, since_days: sinceDays, limit });
+  const sinceUnix = Math.floor((Date.now() - sinceDays * 24 * 3600 * 1000) / 1000);
+  const url = `${HN_ALGOLIA}?tags=show_hn&numericFilters=created_at_i>${sinceUnix}&hitsPerPage=${Math.min(50, limit * 2)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`HN Algolia fetch failed: ${res.status} ${res.statusText}`);
+  }
+  const data = (await res.json()) as SearchHitsResponse;
+  result.candidates = data.hits.length;
+  logEvent("finder.fetched", { name: PLAY_NAME, candidates: result.candidates });
+
+  // Per-candidate pipeline runs at `concurrency` (mirrors accelerator-batch /
+  // github-topics). The serial version spent ~70s on 50 candidates waiting on
+  // findEmail/verify/enrich one at a time. `halted` is a soft cap: workers in
+  // flight when the limit/cost-cap trips may overshoot by up to
+  // (concurrency - 1) candidates. The `result.*` accumulators are mutated in
+  // place; safe because JS interleaves (never truly parallel) between awaits.
+  const concurrency = opts.concurrency ?? 3;
+  let halted = false;
+
+  await parallelMap(data.hits, concurrency, async (hit) => {
+    if (halted) return;
+    if (result.enqueued >= limit) {
+      halted = true;
+      return;
+    }
+    if (opts.maxCostUsd != null && result.costUsd >= opts.maxCostUsd) {
+      result.halted = `max-cost cap (${opts.maxCostUsd})`;
+      halted = true;
+      return;
+    }
+    if (hit.points < minPoints) {
+      result.droppedLowSignal = (result.droppedLowSignal ?? 0) + 1;
+      return;
+    }
+
+    // Dedupe BEFORE any LLM/OneShot spend: against the queue AND the
+    // pending-retry table (so a re-scan doesn't recreate a candidate already
+    // awaiting outage retry).
+    if (
+      ledger.isQueueDuplicate(PLAY_NAME, hit.objectID) ||
+      ledger.isPendingResolution(PLAY_NAME, hit.objectID)
+    ) {
+      result.droppedDuplicate++;
+      return;
+    }
+
+    // ICP filter.
+    const filter = await icpFilter({
+      icp,
+      candidate: {
+        title: hit.title,
+        url: hit.url,
+        summary: hit.story_text?.slice(0, 800) ?? null,
+        author: hit.author,
+      },
+    });
+    // Rough cost: ~$0.001 per filter call (LLM tokens; not OneShot $).
+    if (filter.match === null) {
+      // Transient classifier failure (Anthropic 5xx, timeout, rate limit):
+      // drop without persisting. A rejection would burn the dedupeKey for
+      // every future watch tick since isQueueDuplicate ignores status.
+      result.droppedEnrichment++;
+      return;
+    }
+    if (!filter.match) {
+      result.droppedIcp++;
+      // Persist the auto-rejection so the founder can review what got
+      // dropped, override (set to approved) if it was a false negative,
+      // and so the future learning loop has labeled examples.
+      if (!opts.dryRun) {
+        ledger.enqueueTarget({
+          playName: PLAY_NAME,
+          payload: { postTitle: hit.title, postUrl: hit.url, founderName: hit.author },
+          dedupeKey: hit.objectID,
+          source: SOURCE,
+          initialStatus: "rejected",
+          notes: `auto: ICP — ${filter.reason}`,
+        });
+      }
+      return;
+    }
+
+    if (opts.dryRun) {
+      // Just count: don't enrich or enqueue.
+      result.enqueued++;
+      return;
+    }
+
+    // Shared resolve→enqueue spine (also used by the pending-retry handler).
+    const outcome = await resolveAndEnqueueShowHn(
+      hit,
+      filter.reason,
+      (c) => {
+        result.costUsd += c;
+      },
+      {
+        icp,
+        fillGaps: opts.qualifyFillGaps ?? true,
+        onRoleReject: (reason) => {
+          persistRoleRejection({
+            playName: PLAY_NAME,
+            dedupeKey: hit.objectID,
+            payload: { name: hit.author, postTitle: hit.title },
+            source: SOURCE,
+            reason,
+            dryRun: opts.dryRun,
+          });
+        },
+      },
+    );
+    if (outcome === "enqueued") result.enqueued++;
+    else if (outcome === "duplicate") result.droppedDuplicate++;
+    else if (outcome === "role-rejected") result.droppedRole = (result.droppedRole ?? 0) + 1;
+    else if (outcome === "platform-error") {
+      // Backend outage: don't lose the candidate (the HN post ages out of the
+      // Algolia window, so a re-scan can't recover it). Persist for retry.
+      persistPending({
+        playName: PLAY_NAME,
+        dedupeKey: hit.objectID,
+        source: SOURCE,
+        raw: { hit, filterReason: filter.reason },
+      });
+      result.droppedEnrichment++;
+    } else result.droppedEnrichment++;
+  });
+
+  logEvent("finder.done", {
+    name: PLAY_NAME,
+    candidates: result.candidates,
+    enqueued: result.enqueued,
+    dropped_icp: result.droppedIcp,
+    dropped_dup: result.droppedDuplicate,
+    dropped_enrich: result.droppedEnrichment,
+    dropped_low_signal: result.droppedLowSignal ?? 0,
+    cost_usd: result.costUsd,
+    halted: result.halted ?? null,
+  });
+  return result;
+}
+
+/**
+ * Resolve + enrich + enqueue one already-ICP-passed Show HN candidate. Shared
+ * by the live run loop and the outage retry handler. `costSink` accumulates
+ * spend into the caller's running total (a no-op for retries). Returns a coarse
+ * outcome the caller maps to counters / pending persistence.
+ */
+async function resolveAndEnqueueShowHn(
+  hit: ShowHnHit,
+  filterReason: string,
+  costSink: (c: number) => void,
+  /** Person-level ICP gate context. Omitted on retry -> gate is pass-through. */
+  gate?: {
+    icp: string | null;
+    fillGaps: boolean;
+    onRoleReject?: (reason: string) => void;
+  },
+): Promise<"enqueued" | "duplicate" | "dropped" | "platform-error" | "role-rejected"> {
+  const ledger = getLedger();
+  const domain = urlDomain(hit.url);
+  if (!domain) return "dropped";
+
+  const fullName = hit.author && hit.author.length > 0 ? hit.author : null;
+  const contact = await resolveVerifyEnrichQualify({
+    playName: PLAY_NAME,
+    fullName,
+    companyDomain: domain,
+    isDuplicate: (email) =>
+      isDuplicate({ playName: PLAY_NAME, dedupeKey: hit.objectID, prospectEmail: email }),
+    errKindPrefix: "show-hn",
+    icp: gate ? gate.icp : null,
+    // Hacker News exposes no role for the poster, so the gate decides on the
+    // enriched title (stage B, free).
+    person: {
+      name: fullName,
+      company: domain,
+      evidence: `posted Show HN: ${hit.title}`,
+    },
+    fillGaps: gate?.fillGaps ?? false,
+  });
+  costSink(contact.costUsd);
+  if (!contact.ok) {
+    if (contact.reason === "role") {
+      gate?.onRoleReject?.(contact.detail ?? "off-ICP role");
+      return "role-rejected";
+    }
+    if (contact.reason === "platform-error") return "platform-error";
+    if (contact.reason === "duplicate") return "duplicate";
+    return "dropped";
+  }
+  // "" on a LinkedIn-channel contact: the row's channel decides how it is sent.
+  const email = contact.email ?? "";
+  const founderName = contact.fullName ?? hit.author;
+  const enr = { phone: contact.phone, linkedinUrl: contact.linkedinUrl };
+
+  // Optional: read the landing page for a richer hookSummary.
+  let hookSummary = (hit.story_text ?? "").trim().slice(0, 280);
+  if (hookSummary.length < 40 && hit.url) {
+    try {
+      const read = await webRead({ url: hit.url }, { playName: PLAY_NAME });
+      costSink(read.result.cost ?? 0);
+      hookSummary = (read.result.markdown ?? "").trim().slice(0, 280);
+    } catch (err) {
+      logEvent(
+        "error.swallowed",
+        {
+          kind: "show-hn.hookSummary.webRead",
+          message_120: ((err as Error).message ?? "").slice(0, 120),
+        },
+        "warn",
+      );
+    }
+  }
+  if (!hookSummary || hookSummary.length < 20) {
+    hookSummary = `Show HN post: ${hit.title}. ${hit.points} points.`;
+  }
+
+  const phone = enr.phone;
+  let linkedinUrl: string | null = enr.linkedinUrl;
+  if (!linkedinUrl) {
+    linkedinUrl = await findLinkedInUrl({
+      fullName: founderName,
+      disambiguators: ["hacker news", domain],
+      accumCost: (c) => costSink(c ?? 0),
+      errKindPrefix: "show-hn",
+    });
+  }
+
+  const target: ShowHnTarget = {
+    postTitle: hit.title,
+    postUrl: `https://news.ycombinator.com/item?id=${hit.objectID}`,
+    founderName,
+    founderEmail: email,
+    hookSummary,
+    ...(linkedinUrl ? { linkedinUrl } : {}),
+    ...(phone ? { phone } : {}),
+    ...(contact.title ? { title: contact.title } : {}),
+    ...icpFields(contact),
+  };
+  const id = enqueueScoredTarget(ledger, {
+    playName: PLAY_NAME,
+    payload: target,
+    dedupeKey: hit.objectID,
+    source: SOURCE,
+    fitReason: filterReason,
+    notes: filterReason,
+    channel: contact.channel,
+  });
+  return id != null ? "enqueued" : "duplicate";
+}
+
+// Outage retry: re-run the resolve→enqueue spine for a persisted candidate.
+// "enqueued" → done; "platform-error" → keep for the next tick; dup/dropped → drop.
+registerPendingRetry(PLAY_NAME, async (raw) => {
+  const { hit, filterReason } = raw as { hit: ShowHnHit; filterReason: string };
+  const outcome = await resolveAndEnqueueShowHn(hit, filterReason, () => {});
+  return outcome === "enqueued"
+    ? "enqueued"
+    : outcome === "platform-error"
+      ? "platform-error"
+      : "dropped";
+});

@@ -1,0 +1,2724 @@
+import { FitHold } from "../components/queue/FitHold.tsx";
+import {
+  DeliveryBadge,
+  DeliveryWarning,
+  deliveryWarningText,
+} from "../components/queue/DeliveryWarning.tsx";
+import { PersonDossier } from "../components/queue/PersonDossier.tsx";
+import { ProductResearch } from "../components/queue/ProductResearch.tsx";
+import { Explain } from "../components/primitives/Explain.tsx";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  ExternalLink,
+  Loader2,
+  Pencil,
+  Play,
+  RotateCw,
+  Send,
+  Target,
+  UserPlus,
+  X,
+} from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import {
+  blockingFlags,
+  isQueueImportInProgress,
+  isRunnablePlay,
+  type PackApplyResult,
+  type QueueRowView,
+  type QueueStatusView,
+  type TriggerView,
+} from "@oneshot-gtm/shared-types";
+import { api } from "../api/client.ts";
+import { Badge } from "../components/primitives/Badge.tsx";
+import { Button } from "../components/primitives/Button.tsx";
+import { EmptyNote } from "../components/primitives/EmptyNote.tsx";
+import { Field, Input, Select, Textarea } from "../components/primitives/Field.tsx";
+import { Modal } from "../components/primitives/Modal.tsx";
+import { AddProspectForm } from "../components/queue/AddProspectForm.tsx";
+import { AngleUsagePanel } from "../components/queue/AngleUsagePanel.tsx";
+import { MoveToWorkspace } from "../components/queue/MoveToWorkspace.tsx";
+import { moveTargets, movedRowUrl, type MoveTarget } from "../lib/moveTargets.ts";
+import { DraftHistory } from "../components/ledger/DraftHistory.tsx";
+import { neverSentAngles, removeAngleFromConfigText } from "../lib/angleRetire.ts";
+import { useMask, usePrivacy } from "../lib/privacy.tsx";
+import { SkeletonRow } from "../components/primitives/Skeleton.tsx";
+import { Toggle } from "../components/primitives/Toggle.tsx";
+import {
+  cn,
+  eventIsPast,
+  formatCount,
+  formatSendsToday,
+  humanizeEventDate,
+  timeAgo,
+} from "../lib/cn.ts";
+import {
+  bulkApprovalIds,
+  drainButtonState,
+  drainSelectionState,
+  isQueueFilterActive,
+  mergeRowMeta,
+  queuePlayList,
+  queueRequest,
+  queueSelectionState,
+  selectVisibleQueueRows,
+  toggleQueueSelection,
+  type RowMeta,
+} from "../lib/queue-helpers.ts";
+import { humanInterval } from "../lib/humanInterval.ts";
+import { priorityBreakdown, priorityChip } from "../lib/priorityChip.ts";
+import { fitReasonFor } from "../lib/queueRationale.ts";
+import {
+  appendReason,
+  REJECT_REASON_CHIPS,
+  suggestRejectReason,
+  type RejectReasonSource,
+} from "../lib/rejectReason.ts";
+import { queueEvidence } from "../lib/queueEvidence.ts";
+import {
+  CHANNEL_LABELS,
+  CHANNEL_MAX_CHARS,
+  reachableChannels,
+  xHandleFrom,
+} from "../lib/channels.ts";
+import { heldSummary } from "../lib/flagLabels.ts";
+import {
+  caseRows,
+  personResearchBadge,
+  personResearchRows,
+  researchEmptyState,
+} from "../lib/queueCase.ts";
+import { IdentityCell, SignalLabel } from "../components/ledger/IdentityCell.tsx";
+import { CaseSection, Rule, Sheet } from "../components/ledger/Sheet.tsx";
+import {
+  CaseList,
+  Disclosure,
+  PayloadJson,
+  type CaseListRow,
+} from "../components/ledger/CaseList.tsx";
+import { DraftStateLine, LetterCard, LetterEmpty } from "../components/ledger/LetterCard.tsx";
+import {
+  companyFor,
+  emailFor,
+  linkedinUrlFor,
+  nameFor,
+  phoneFor,
+  sourceDetail,
+  titleFor,
+} from "../lib/payloadIdentity.ts";
+import { INTERVAL_PRESETS_MS, withIntervalOverride } from "../lib/triggerInterval.ts";
+import { summarizeTriggers } from "../lib/triggerSummary.ts";
+import { useLocalStorage } from "../lib/useLocalStorage.ts";
+import {
+  hasQueueFilters,
+  loadQueueFilters,
+  loadQueueScroll,
+  queueFiltersKey,
+  type QueueSearch,
+  saveQueueFilters,
+  saveQueueScroll,
+  validateQueueSearch,
+} from "../lib/queueSearch.ts";
+import {
+  clearDraftGenerating,
+  markDraftGenerating,
+  useGeneratingDrafts,
+} from "../lib/draftRunState.ts";
+import { summarizeRun } from "../lib/summarizeRun.ts";
+import { READ_ONLY, readOnly } from "../lib/readOnly.ts";
+import {
+  clearTriggerRunning,
+  hasAnyRunningTrigger,
+  humanDuration,
+  markTriggerRunning,
+  useRunningTriggers,
+} from "../lib/triggerRunState.ts";
+
+export const Route = createFileRoute("/queue")({
+  staticData: { title: "Queue" },
+  validateSearch: validateQueueSearch,
+  component: QueuePage,
+});
+
+/** Stable empty page: see `fetchedRows` below. */
+const EMPTY_ROWS: QueueRowView[] = [];
+
+/**
+ * Rows rendered before the "show all" disclosure. The API hands back up to 200
+ * (`queue-helpers.ts`), which at ~70px each is ~14,000px of uninterrupted
+ * table, and `rejected` alone holds thousands.
+ */
+const ROW_CAP = 50;
+
+const STATUSES: Array<QueueStatusView | "all"> = [
+  "all",
+  "pending",
+  "approved",
+  "rejected",
+  "sent",
+  "expired",
+];
+
+function statusTone(
+  status: QueueStatusView,
+): "receipt" | "spend" | "blocked" | "signal" | "neutral" {
+  switch (status) {
+    case "pending":
+      return "spend";
+    case "approved":
+      return "receipt";
+    case "rejected":
+      return "blocked";
+    case "sent":
+      return "signal";
+    case "expired":
+      return "neutral";
+  }
+}
+
+/**
+ * One modal for both the row button and the bulk bar. `suggested` is what the
+ * box opens with. The row's own evidence, computed at open time so the box
+ * belongs to THIS row and not to whichever one was cancelled before it.
+ */
+interface RejectModalState {
+  ids: number[];
+  email: string | null;
+  suggested: string;
+  source: RejectReasonSource;
+  /**
+   * Opened under privacy mode: nothing is prefilled and the LLM fallback is
+   * not asked, for the same reason the sheet hides `fitReason` and `notes`
+   * there. A gate's reason routinely names the person.
+   */
+  privacy: boolean;
+}
+
+interface DrainModalState {
+  playName: string;
+  approvedCount: number;
+  /**
+   * Set when draining an explicit selection: /run hydrates exactly these rows
+   * and the modal's limit field steps aside (the pick IS the limit).
+   */
+  ids?: number[];
+}
+
+interface EditingState {
+  name: string;
+  text: string;
+  defaultConfig: Record<string, unknown> | null;
+}
+
+function QueuePage() {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  // Filters live in the URL; a bare /queue restores the last set (see queueSearch.ts).
+  const search = Route.useSearch();
+  const queueNavigate = Route.useNavigate();
+  const statusFilter: QueueStatusView | "all" = search.status ?? "pending";
+  const playFilter = search.play ?? "all";
+  const orderOverride = search.order ?? null;
+  const setFilters = (patch: QueueSearch): void => {
+    void queueNavigate({ search: (prev) => ({ ...prev, ...patch }), replace: true });
+  };
+  const setStatusFilter = (status: QueueStatusView | "all"): void =>
+    setFilters({ status: status === "pending" ? undefined : status });
+  const setPlayFilter = (play: string): void =>
+    setFilters({ play: play === "all" ? undefined : play });
+  const setOrderOverride = (order: "ranked" | "newest"): void => setFilters({ order });
+  // `settled` flips once the URL holds the filters this visit will show: at
+  // once when the link carried some, else after the stored set is restored.
+  const [settled, setSettled] = useState(() => hasQueueFilters(search));
+  useEffect(() => {
+    if (settled) return;
+    const stored = loadQueueFilters();
+    if (!hasQueueFilters(stored)) {
+      setSettled(true);
+      return;
+    }
+    void queueNavigate({ search: stored, replace: true }).finally(() => setSettled(true));
+    // Mount-only: later filter changes save below instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    if (!settled) return;
+    saveQueueFilters({ status: search.status, play: search.play, order: search.order });
+  }, [settled, search.status, search.play, search.order]);
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [rejectModal, setRejectModal] = useState<RejectModalState | null>(null);
+  const [rejectReason, setRejectReason] = useState("");
+  // True while the LLM fallback is drafting a sentence for a row that had
+  // nothing to prefill from. The box is editable throughout; a reply only
+  // lands if the founder hasn't typed yet.
+  const [rejectDrafting, setRejectDrafting] = useState(false);
+  const [rejectDraftOutcome, setRejectDraftOutcome] = useState<"idle" | "empty" | "error">("idle");
+  const [rejectDraftAttempt, setRejectDraftAttempt] = useState(0);
+  useEffect(() => {
+    setRejectDraftOutcome("idle");
+    if (!rejectModal) {
+      setRejectReason("");
+      setRejectDrafting(false);
+      return;
+    }
+    setRejectReason(rejectModal.suggested);
+    const single = rejectModal.ids.length === 1 ? rejectModal.ids[0] : undefined;
+    if (single === undefined || rejectModal.suggested || rejectModal.privacy) {
+      setRejectDrafting(false);
+      return;
+    }
+    let live = true;
+    setRejectDrafting(true);
+    api
+      .suggestRejectReason(single)
+      .then((r) => {
+        if (!live) return;
+        setRejectDrafting(false);
+        if (r.reason) setRejectReason((cur) => (cur.trim() ? cur : r.reason!));
+        else setRejectDraftOutcome("empty");
+      })
+      .catch(() => {
+        if (live) {
+          setRejectDrafting(false);
+          setRejectDraftOutcome("error");
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [rejectModal, rejectDraftAttempt]);
+  const [drainModal, setDrainModal] = useState<DrainModalState | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [drainLimit, setDrainLimit] = useState(10);
+  const [drainDryRun, setDrainDryRun] = useState(true);
+  // null = follow the configured default; the server echoes what it used.
+
+  const queueQuery = useQuery({
+    queryKey: ["queue", statusFilter, playFilter, orderOverride],
+    queryFn: () => api.queue(queueRequest({ statusFilter, playFilter, orderOverride })),
+    refetchInterval: 20_000,
+  });
+  const effectiveOrder = queueQuery.data?.order ?? orderOverride ?? "newest";
+
+  // Scroll position survives a round trip away from /queue, but only back onto
+  // the same filters: arriving on a different view starts at the top.
+  const filtersKey = queueFiltersKey(search);
+  const filtersKeyRef = useRef(filtersKey);
+  filtersKeyRef.current = filtersKey;
+  // Read during the first render, before any unmount save (StrictMode's
+  // dev-only remount included) can overwrite it.
+  const [savedScroll] = useState(loadQueueScroll);
+  useEffect(() => {
+    // Tracked live: by the time an unmount cleanup runs, the next route has
+    // already replaced the content and `<main>` has clamped back to the top.
+    // That clamp fires its own scroll event, after the URL has moved on.
+    const main = document.querySelector("main");
+    if (!main) return;
+    let top = main.scrollTop;
+    const onScroll = (): void => {
+      if (window.location.pathname.endsWith("/queue")) top = main.scrollTop;
+    };
+    main.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      main.removeEventListener("scroll", onScroll);
+      saveQueueScroll(top, filtersKeyRef.current);
+    };
+  }, []);
+  const scrollRestored = useRef(false);
+  useEffect(() => {
+    if (scrollRestored.current || !settled || !queueQuery.isSuccess) return;
+    scrollRestored.current = true;
+    if (!savedScroll || savedScroll.filters !== filtersKey || savedScroll.top <= 0) return;
+    // After the root layout's own scroll-to-top on route change.
+    requestAnimationFrame(() => document.querySelector("main")?.scrollTo({ top: savedScroll.top }));
+  }, [settled, queueQuery.isSuccess, filtersKey, savedScroll]);
+
+  const invalidate = (): void => {
+    void qc.invalidateQueries({ queryKey: ["queue"] });
+  };
+
+  const approve = useMutation({
+    mutationFn: (id: number) => api.approveQueue(id),
+    onSuccess: invalidate,
+    onError: (err) => toast.error(`couldn't approve · ${err.message}`),
+  });
+
+  // The other workspaces on this machine, for "move →" on each row. Same
+  // roster the masthead switcher polls, so the cache is shared.
+  const workspaceRoster = useQuery({
+    queryKey: ["workspace"],
+    queryFn: api.workspace,
+    staleTime: 60_000,
+  });
+  const targets = moveTargets(workspaceRoster.data);
+
+  const move = useMutation({
+    mutationFn: (vars: { id: number; workspace: string }) =>
+      api.moveQueueRow(vars.id, vars.workspace),
+    onSuccess: (res, vars) => {
+      // The row is rejected here now; leaving it selected would let a bulk
+      // approve re-open it while the destination holds the live copy.
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(vars.id);
+        return next;
+      });
+      const { name, port, reused } = res.destination;
+      toast.success(reused ? `re-opened their existing row in ${name}` : `moved to ${name}`, {
+        description: "This row is now rejected here.",
+        action: {
+          label: "open",
+          onClick: () => window.open(movedRowUrl(port), "_blank", "noopener"),
+        },
+      });
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+    },
+    onError: (err) => toast.error(`couldn't move · ${err.message}`),
+  });
+  const reject = useMutation({
+    mutationFn: (vars: { id: number; reason: string }) => api.rejectQueue(vars.id, vars.reason),
+    onSuccess: () => {
+      setRejectModal(null);
+      invalidate();
+    },
+    onError: (err) => toast.error(`couldn't reject · ${err.message}`),
+  });
+  const approveAll = useMutation({
+    mutationFn: (play?: string) => api.approveAllQueue(play),
+    onSuccess: (data) => {
+      invalidate();
+      toast.success(`approved ${data.approved} pending`);
+    },
+    onError: (err) => toast.error(`couldn't approve all · ${err.message}`),
+  });
+
+  // Bulk selection mutations: operate over the current `selected` set.
+  const bulkApprove = useMutation({
+    mutationFn: async (ids: number[]) => {
+      let ok = 0;
+      for (const id of ids) {
+        try {
+          await api.approveQueue(id);
+          ok++;
+        } catch {
+          // continue the batch; surface the count at the end
+        }
+      }
+      return { ok, total: ids.length };
+    },
+    onSuccess: ({ ok, total }) => {
+      setSelected(new Set());
+      invalidate();
+      toast.success(`approved ${ok} of ${total}`);
+    },
+  });
+  const bulkReject = useMutation({
+    mutationFn: async (vars: { ids: number[]; reason: string }) => {
+      let ok = 0;
+      for (const id of vars.ids) {
+        try {
+          // The one reason lands on every row; "" leaves each row's own note.
+          await api.rejectQueue(id, vars.reason || undefined);
+          ok++;
+        } catch {
+          /* ignore */
+        }
+      }
+      return { ok, total: vars.ids.length };
+    },
+    onSuccess: ({ ok, total }) => {
+      setSelected(new Set());
+      setRejectModal(null);
+      invalidate();
+      toast.success(`rejected ${ok} of ${total}`);
+    },
+  });
+  // Drain modal submit → navigate to /run/<play>?fromQueue=1&… instead of
+  // hitting POST /api/queue/drain. The drain endpoint dropped draft content
+  // on the floor (counts only); the /run page streams every draft live with
+  // its lint flags so partial batches and lint-blocked sends are visible.
+  // Both dryRun and real-send paths route through here. The founder picks
+  // mode via the modal toggle and /run honors it via the URL param.
+  const submitDrainViaRun = (): void => {
+    if (!drainModal) return;
+    const search: Record<string, string> = {
+      fromQueue: "1",
+      limit: String(drainModal.ids ? drainModal.ids.length : drainLimit),
+      dryRun: drainDryRun ? "1" : "0",
+    };
+    if (drainModal.ids) search["ids"] = drainModal.ids.join(",");
+    void navigate({
+      to: "/run/$playName",
+      params: { playName: drainModal.playName },
+      search,
+    });
+  };
+
+  const counts = queueQuery.data?.counts ?? {
+    pending: 0,
+    approved: 0,
+    rejected: 0,
+    sent: 0,
+    expired: 0,
+  };
+  // Keep the fetched array's identity around: `?? []` allocates a fresh array
+  // every render, which would re-fire the rowMeta effect on each one.
+  const fetchedRows = queueQuery.data?.rows;
+  const rows = fetchedRows ?? EMPTY_ROWS;
+  /*
+   * Rows render capped, with a "show all" row at the end. Deliberately NOT
+   * persisted: lifting the cap for one look at the 7,600 rejected rows should
+   * not follow you back here tomorrow. Reset whenever the filters change, so
+   * "show all" never silently carries across a filter switch.
+   */
+  const [showAllRows, setShowAllRows] = useState(false);
+  const visibleRows = showAllRows ? rows : rows.slice(0, ROW_CAP);
+  // Whole-queue approved counts per play: NOT scoped to the current filters,
+  // so the drain button works from the default `pending` view too.
+  const approvedByPlay = queueQuery.data?.approvedByPlay ?? {};
+  // Play/status of every row seen this session. Rows can only be selected while
+  // visible, so every selected id has an entry, and it stays correct after the
+  // filters hide the row. Refreshed whenever a row reappears in a fetch, so a
+  // status that moved on (someone else sent it) is picked up.
+  const [rowMeta, setRowMeta] = useState<RowMeta>(new Map());
+  useEffect(() => {
+    if (!fetchedRows) return;
+    setRowMeta((prev) => mergeRowMeta(prev, fetchedRows));
+  }, [fetchedRows]);
+  const mask = useMask();
+  const { masked } = usePrivacy();
+
+  // Per-row "generating draft" spinners, reconstructed from localStorage so they
+  // survive navigating away + back (the regenerate mutation's isPending is local
+  // to the row and dies on unmount). Cleared when `lastDraftedAt` advances.
+  const generating = useGeneratingDrafts(
+    rows.map((r) => r.id),
+    new Map(rows.map((r) => [r.id, r.lastDraftedAt])),
+  );
+
+  // Plays on the visible page, plus any play holding approved rows anywhere:
+  // the chip both filters the table and scopes the drain button, so a play with
+  // drainable rows must stay selectable even when the page shows none of them.
+  const playList = queuePlayList(rows, approvedByPlay);
+  // Keep the selected option visible while a new filter request is loading.
+  if (playFilter !== "all" && !playList.includes(playFilter)) playList.push(playFilter);
+  const drain = drainButtonState({ playFilter, approvedByPlay, isRunnable: isRunnablePlay });
+  // Selection outlives the filters, so read each selected row from the session
+  // map rather than the visible page. Otherwise filtering to one play makes a
+  // cross-play selection look single-play and drains only what's on screen.
+  const drainSelected = drainSelectionState({
+    selected: [...selected].map((id) => {
+      const meta = rowMeta.get(id);
+      return { id, playName: meta?.playName ?? "", status: meta?.status ?? "" };
+    }),
+    isRunnable: isRunnablePlay,
+  });
+
+  // Select only rendered rows; fetched rows beyond the display cap must not
+  // become invisible targets of bulk approval or rejection.
+  const { someSelected, allSelected } = queueSelectionState(visibleRows, selected);
+
+  return (
+    <div className="-mx-6 -my-6 flex flex-col">
+      <section className="flex flex-wrap items-center justify-between gap-4 border-b border-ink-rule px-6 py-5">
+        <h1
+          className="m-0 text-[32px] font-semibold leading-none tracking-[-0.025em] text-ink-cream"
+          style={{ fontFamily: "var(--font-display)" }}
+        >
+          Queue
+        </h1>
+        <div className="flex items-center gap-4">
+          {queueQuery.data?.sendsToday && (
+            <span className="font-mono text-[11px] text-ink-muted">
+              Sent today {formatSendsToday(queueQuery.data.sendsToday)}
+            </span>
+          )}
+          <Button variant="secondary" size="sm" onClick={() => setAddOpen(true)} {...readOnly}>
+            <UserPlus size={13} /> Add prospect
+          </Button>
+        </div>
+      </section>
+
+      <IcpBanner />
+      <IcpProposalsCard />
+      <TriggersCard queueEmpty={queueQuery.isLoading ? null : rows.length === 0} />
+
+      <section>
+        <div
+          className="flex flex-wrap items-center gap-1 px-6 pt-3"
+          role="group"
+          aria-label="Queue status"
+        >
+          {STATUSES.map((status) => (
+            <Button
+              key={status}
+              variant={statusFilter === status ? "secondary" : "ghost"}
+              size="sm"
+              aria-pressed={statusFilter === status}
+              onClick={() => {
+                setStatusFilter(status);
+                setShowAllRows(false);
+                setExpanded(null);
+              }}
+            >
+              <span className="capitalize">{status}</span>
+              {status !== "all" && (
+                <span className="ml-1 font-mono text-[10px] text-ink-muted">
+                  {formatCount(counts[status])}
+                </span>
+              )}
+            </Button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-3 border-b border-ink-rule/60 px-6 py-3">
+          <Select
+            aria-label="Filter by play"
+            className="w-auto max-w-[240px] [&>select]:h-8 [&>select]:text-[12px]"
+            value={playFilter}
+            onChange={(e) => {
+              setPlayFilter(e.target.value);
+              setShowAllRows(false);
+              setExpanded(null);
+            }}
+          >
+            <option value="all">All plays</option>
+            {playList.map((play) => (
+              <option key={play} value={play}>
+                {play}
+              </option>
+            ))}
+          </Select>
+          {statusFilter === "pending" && (
+            <Select
+              aria-label="Queue order"
+              className="w-auto [&>select]:h-8 [&>select]:text-[12px]"
+              value={effectiveOrder}
+              onChange={(e) => setOrderOverride(e.target.value as "newest" | "ranked")}
+            >
+              <option value="newest">Newest first</option>
+              <option value="ranked">Highest score first</option>
+            </Select>
+          )}
+          <span className="font-mono text-[11px] text-ink-faint">
+            {queueQuery.data
+              ? `${visibleRows.length}${visibleRows.length < rows.length ? ` of ${rows.length}` : ""} shown`
+              : "Loading…"}
+          </span>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={approveAll.isPending || counts.pending === 0}
+              title={
+                playFilter === "all"
+                  ? "Approve all pending prospects"
+                  : `Approve pending prospects in ${playFilter}`
+              }
+              onClick={() => approveAll.mutate(playFilter === "all" ? undefined : playFilter)}
+              {...readOnly}
+            >
+              <Check size={12} /> Approve pending
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={!drain.enabled}
+              title={drain.label}
+              onClick={() => {
+                if (drain.playName)
+                  setDrainModal({ playName: drain.playName, approvedCount: drain.approvedCount });
+              }}
+              {...readOnly}
+            >
+              <Send size={12} /> Send approved{drain.enabled ? ` (${drain.approvedCount})` : ""}
+            </Button>
+          </div>
+        </div>
+
+        {queueQuery.isLoading ? (
+          Array.from({ length: 5 }, (_, i) => <SkeletonRow key={i} />)
+        ) : rows.length === 0 ? (
+          <EmptyQueueHelp filterActive={isQueueFilterActive(statusFilter, playFilter)} />
+        ) : (
+          <table className="w-full text-[13px]">
+            <thead className="sticky top-0 z-10 bg-ink-bg">
+              <tr className="border-b border-ink-rule text-[10px] uppercase tracking-[0.14em] text-ink-faint">
+                <th className="w-8 min-w-8 py-2" />
+                <th className="w-8 min-w-8 py-2">
+                  <label className="inline-flex cursor-pointer items-center">
+                    <input
+                      type="checkbox"
+                      className="h-[13px] w-[13px] rounded-[var(--radius-xs)] border border-ink-rule bg-ink-bg-deep accent-[color:var(--ink-signal)]"
+                      checked={allSelected}
+                      ref={(el) => {
+                        if (el) el.indeterminate = someSelected && !allSelected;
+                      }}
+                      onChange={(e) =>
+                        setSelected(new Set(selectVisibleQueueRows(visibleRows, e.target.checked)))
+                      }
+                      aria-label={allSelected ? "deselect all" : "select all"}
+                    />
+                  </label>
+                </th>
+                <th className="py-2 text-left font-medium">prospect</th>
+                <th className="py-2 text-left font-medium">play</th>
+                <th className="py-2 text-left font-medium">status</th>
+                <th className="py-2 text-right font-medium">found</th>
+                <th className="px-6 py-2 text-right font-medium">actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleRows.map((row, i) => (
+                <QueueRow
+                  key={row.id}
+                  row={row}
+                  ranked={effectiveOrder === "ranked"}
+                  zebra={i % 2 === 1}
+                  expanded={expanded === row.id}
+                  selected={selected.has(row.id)}
+                  anySelected={someSelected}
+                  onToggleSelect={() => {
+                    setSelected((prev) => new Set(toggleQueueSelection(prev, row.id)));
+                  }}
+                  onToggle={() => setExpanded(expanded === row.id ? null : row.id)}
+                  generating={generating.has(row.id)}
+                  onApprove={() => approve.mutate(row.id)}
+                  onMove={(workspace) => move.mutate({ id: row.id, workspace })}
+                  moveTargets={targets}
+                  onReject={() => {
+                    const s = masked
+                      ? { text: "", source: null }
+                      : suggestRejectReason({ payload: row.payload, notes: row.notes });
+                    setRejectModal({
+                      ids: [row.id],
+                      email: emailFor(row.payload),
+                      suggested: s.text,
+                      source: s.source,
+                      privacy: masked,
+                    });
+                  }}
+                  busy={approve.isPending || reject.isPending || move.isPending}
+                />
+              ))}
+              {/* The fetch returns up to 200 rows (queue-helpers.ts `limit`)
+                  and every one used to render into this tbody: ~14,000px of
+                  table. Same one-quiet-row disclosure the inactive finders use
+                  in the Triggers panel, colSpan trick included so the shared
+                  column widths hold. */}
+              {rows.length > visibleRows.length && (
+                <tr className="border-b border-ink-rule/60">
+                  <td colSpan={7} className="px-6 py-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowAllRows(true)}
+                      className="flex items-center gap-1.5 font-mono text-[11px] text-ink-faint transition-colors hover:text-ink-cream-2"
+                    >
+                      <ChevronDown size={11} />
+                      {formatCount(rows.length - visibleRows.length)} more · show all{" "}
+                      {formatCount(rows.length)}
+                    </button>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      {someSelected && (
+        <div
+          className="sticky bottom-0 z-20 flex items-center justify-between gap-4 border-b border-t border-ink-rule bg-ink-bg/95 px-6 py-3 backdrop-blur-[2px]"
+          data-foot-bar
+        >
+          <div className="flex items-center gap-3">
+            <span className="inline-flex h-6 min-w-[24px] items-center justify-center rounded-full bg-[color:var(--ink-signal)]/20 px-2 font-mono text-[12px] text-[color:var(--ink-signal-2)]">
+              {selected.size}
+            </span>
+            <span className="text-[13px] text-ink-cream-2">
+              {selected.size === 1 ? "row selected" : "rows selected"}
+            </span>
+            <button
+              type="button"
+              onClick={() => setSelected(new Set())}
+              className="font-mono text-[11px] text-ink-faint underline decoration-ink-rule underline-offset-2 hover:text-ink-cream hover:decoration-ink-cream-2"
+            >
+              clear
+            </button>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={bulkApprove.isPending || selected.size === 0}
+              onClick={() => bulkApprove.mutate(bulkApprovalIds(selected))}
+              {...readOnly}
+            >
+              <Check size={12} /> approve {selected.size}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={bulkReject.isPending || selected.size === 0}
+              onClick={() =>
+                setRejectModal({
+                  ids: [...selected],
+                  email: null,
+                  suggested: "",
+                  source: null,
+                  privacy: masked,
+                })
+              }
+              {...readOnly}
+            >
+              <X size={12} /> reject {selected.size}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={!drainSelected.enabled}
+              onClick={() => {
+                if (!drainSelected.playName) return;
+                setDrainModal({
+                  playName: drainSelected.playName,
+                  approvedCount: drainSelected.ids.length,
+                  ids: drainSelected.ids,
+                });
+              }}
+            >
+              <Send size={12} /> {drainSelected.label}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <Modal
+        open={addOpen}
+        title="Add a prospect"
+        subtitle="Paste a profile. We research the person, pick the angle against your ICP, and draft an intro for review here."
+        onClose={() => setAddOpen(false)}
+      >
+        <AddProspectForm onQueued={() => setAddOpen(false)} />
+      </Modal>
+
+      <Modal
+        open={rejectModal != null}
+        onClose={() => setRejectModal(null)}
+        title={
+          rejectModal && rejectModal.ids.length > 1
+            ? `Reject ${rejectModal.ids.length} rows`
+            : `Reject #${rejectModal?.ids[0]} — ${mask("auto", rejectModal?.email ?? `#${rejectModal?.ids[0]}`)}`
+        }
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setRejectModal(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                if (!rejectModal) return;
+                const reason = rejectReason.trim();
+                if (rejectModal.ids.length === 1) {
+                  reject.mutate({ id: rejectModal.ids[0]!, reason });
+                } else {
+                  bulkReject.mutate({ ids: rejectModal.ids, reason });
+                }
+              }}
+              disabled={reject.isPending || bulkReject.isPending}
+              {...readOnly}
+            >
+              {reject.isPending || bulkReject.isPending
+                ? "Rejecting…"
+                : rejectModal && rejectModal.ids.length > 1
+                  ? `Reject ${rejectModal.ids.length}`
+                  : "Reject"}
+            </Button>
+          </>
+        }
+      >
+        <div role="status" aria-live="polite" aria-atomic="true">
+          {rejectDrafting ? (
+            <div className="mb-3 flex items-start gap-3 rounded-[var(--radius-sm)] border border-ink-rule bg-ink-bg-deep p-3">
+              <Loader2
+                size={18}
+                aria-hidden="true"
+                className="mt-0.5 shrink-0 animate-spin text-ink-cream-2 motion-reduce:animate-none"
+              />
+              <div>
+                <p className="m-0 text-[13px] font-medium text-ink-cream">
+                  Drafting rejection reason…
+                </p>
+                <p className="mt-1 text-[12px] leading-5 text-ink-muted">
+                  Checking the available prospect evidence. You can write your own reason while this
+                  runs.
+                </p>
+              </div>
+            </div>
+          ) : !rejectReason.trim() && rejectDraftOutcome !== "idle" ? (
+            <div className="mb-3 rounded-[var(--radius-sm)] border border-ink-rule bg-ink-bg-deep p-3">
+              <p className="m-0 text-[13px] text-ink-cream-2">
+                {rejectDraftOutcome === "error"
+                  ? "Couldn’t generate a suggestion."
+                  : "No suggestion returned."}
+              </p>
+              <p className="mt-1 text-[12px] leading-5 text-ink-muted">
+                Write your own reason or choose one below.
+              </p>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="mt-2"
+                onClick={() => setRejectDraftAttempt((n) => n + 1)}
+                {...readOnly}
+              >
+                <RotateCw size={12} aria-hidden="true" /> Try again
+              </Button>
+            </div>
+          ) : null}
+        </div>
+        <Field label="Reason (optional — kept on the prospect's timeline)">
+          <Textarea
+            rows={3}
+            autoFocus
+            value={rejectReason}
+            onChange={(e) => setRejectReason(e.target.value)}
+            placeholder={
+              rejectDrafting
+                ? "drafting a reason from the row's evidence…"
+                : "e.g. wrong stage, wrong industry, already a customer"
+            }
+          />
+        </Field>
+        {rejectModal?.source === "person-gate" && (
+          <p className="mt-1 text-xs text-ink-muted">
+            Prefilled from the ICP gate's verdict — edit freely, or clear it.
+          </p>
+        )}
+        {rejectModal?.source === "notes" && (
+          <p className="mt-1 text-xs text-ink-muted">
+            Prefilled from the finder's note — edit freely, or clear it.
+          </p>
+        )}
+        {rejectModal?.privacy && (
+          <p className="mt-1 text-xs text-ink-faint">Privacy mode — nothing prefilled.</p>
+        )}
+        <div className="mt-2 flex flex-wrap gap-1">
+          {REJECT_REASON_CHIPS.map((chip) => (
+            <Button
+              key={chip}
+              variant="ghost"
+              size="sm"
+              onClick={() => setRejectReason((cur) => appendReason(cur, chip))}
+            >
+              {chip}
+            </Button>
+          ))}
+        </div>
+      </Modal>
+
+      <Modal
+        open={drainModal != null}
+        onClose={() => setDrainModal(null)}
+        title={
+          drainModal?.ids
+            ? `Drain ${drainModal.playName} (${drainModal.ids.length} selected)`
+            : `Drain ${drainModal?.playName ?? ""} (${drainModal?.approvedCount ?? 0} approved)`
+        }
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setDrainModal(null)}>
+              Cancel
+            </Button>
+            <Button onClick={submitDrainViaRun}>
+              <Send size={12} />
+              {drainDryRun
+                ? "Preview drafts (no send)"
+                : `Send ${drainModal?.ids ? `the ${drainModal.ids.length} selected` : `up to ${drainLimit}`}`}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-3">
+          {/* A selection IS the limit. Never show a second, contradictory number. */}
+          <p className="text-[13px] text-ink-muted">
+            Drain approved rows <Explain concept="drain" />
+          </p>
+          {drainModal?.ids ? (
+            <p className="text-[13px] text-ink-cream-2">
+              Draining the {drainModal.ids.length} approved{" "}
+              {drainModal.ids.length === 1 ? "row" : "rows"} you selected — nothing else in the
+              queue is touched.
+            </p>
+          ) : (
+            <Field label="Limit">
+              <Input
+                type="number"
+                min={1}
+                value={drainLimit}
+                onChange={(e) =>
+                  setDrainLimit(Math.max(1, Number.parseInt(e.target.value, 10) || 1))
+                }
+              />
+            </Field>
+          )}
+          <label className="inline-flex cursor-pointer items-center gap-2.5 text-[13px] text-ink-cream-2 hover:text-ink-cream">
+            <Toggle checked={drainDryRun} onChange={setDrainDryRun} label="dry run" />
+            <span>Dry run — preview drafts only, no send (a one-time enrich lookup may apply)</span>
+          </label>
+          <p className="font-mono text-[11px] text-ink-faint">
+            Drafts stream live on the next page — every lint flag and send confirmation is visible
+            per row.
+          </p>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+export function QueueRow({
+  row,
+  ranked,
+  zebra,
+  expanded,
+  selected,
+  anySelected,
+  onToggleSelect,
+  onToggle,
+  generating,
+  onApprove,
+  onReject,
+  onMove,
+  moveTargets: targets,
+  busy,
+}: {
+  row: QueueRowView;
+  ranked: boolean;
+  zebra: boolean;
+  expanded: boolean;
+  selected: boolean;
+  anySelected: boolean;
+  onToggleSelect: () => void;
+  onToggle: () => void;
+  generating: boolean;
+  onApprove: () => void;
+  onReject: () => void;
+  /** Hand the row to another workspace (components/queue/MoveToWorkspace.tsx). */
+  onMove: (workspace: string) => void;
+  /** The other workspaces on this machine; empty hides the move button. */
+  moveTargets: MoveTarget[];
+  busy: boolean;
+}) {
+  const canApproveFit = row.status === "approved" && row.sendHold != null;
+  const email = emailFor(row.payload);
+  const name = nameFor(row.payload);
+  const company = companyFor(row.payload);
+  const title = titleFor(row.payload);
+  const linkedinUrl = linkedinUrlFor(row.payload);
+  const phone = phoneFor(row.payload);
+  const eventTitle = eventTitleFor(row.payload);
+  const eventDate = eventDateFor(row.payload);
+  const eventCity = eventCityFor(row.payload);
+  const eventUrl = eventUrlFor(row.payload);
+  const eventRole = eventRoleFor(row.payload);
+  const eventPassed = eventDate != null && eventIsPast(eventDate);
+  // Privacy mode suppresses the rationale. Both halves are freeform text
+  // that can name a person or a company, which the structured <Pii> masking
+  // cannot reach inside. The row keeps its height so the list does not jump.
+  const { masked } = usePrivacy();
+  // Show identity, finder signal, and fit reason consistently across plays.
+  // Event dates stay on the signal label to make timing visible.
+  const signal = queueEvidence(row.playName, row.payload);
+  const fitReason = fitReasonFor(row.payload);
+  const emptyResearch = !fitReason ? researchEmptyState(row.payload) : null;
+  const when = eventDate
+    ? `${humanizeEventDate(eventDate)}${eventPassed ? " · passed" : ""}`
+    : null;
+  const signalLabel = signal && when ? `${signal} · ${when}` : (signal ?? when);
+  const prio = priorityChip(row.priority, masked, { shadow: !ranked });
+  const held = row.lastDraft && !row.lastDraft.sent ? heldSummary(row.lastDraft.flags) : null;
+  const detail = sourceDetail(row.source);
+  const researchRows = masked ? [] : personResearchRows(row.payload);
+  const profileHistory = researchRows.filter((r) => r.key === "listed as" || r.key === "formerly");
+  const scoreReasons = !masked && row.priority ? caseRows(row.priority.reasons) : [];
+  const sheetRows: CaseListRow[] = [
+    ...researchRows.filter((r) => r.key !== "listed as" && r.key !== "formerly"),
+    ...(eventTitle
+      ? [{ key: "event", value: eventRole ? `${eventTitle} · ${eventRole}` : eventTitle }]
+      : []),
+    ...(eventCity ? [{ key: "where", value: eventCity }] : []),
+    ...(eventDate
+      ? [
+          {
+            key: "when",
+            value: `${humanizeEventDate(eventDate)} (${timeAgo(eventDate)})${eventPassed ? " · passed" : ""}`,
+            ...(eventPassed ? { tone: "blocked" as const } : {}),
+          },
+        ]
+      : []),
+    ...(eventUrl ? [{ key: "link", value: "event page", href: eventUrl }] : []),
+  ];
+  return (
+    <>
+      <tr
+        className={cn(
+          "group cursor-pointer border-b border-ink-rule/60",
+          "transition-colors duration-[var(--dur-stamp)]",
+          "hover:bg-ink-surface/60",
+          zebra && "bg-ink-surface/20",
+          expanded && "bg-ink-surface",
+          selected && "bg-[color:var(--ink-signal)]/8",
+        )}
+        onClick={onToggle}
+      >
+        <td className="w-8 min-w-8 py-[10px] pl-4 pr-0 text-ink-faint">
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        </td>
+        <td className="w-8 min-w-8 py-[10px]" onClick={(e) => e.stopPropagation()}>
+          <label className="inline-flex cursor-pointer items-center">
+            <input
+              type="checkbox"
+              className={cn(
+                "h-[13px] w-[13px] rounded-[var(--radius-xs)]",
+                "border border-ink-rule bg-ink-bg-deep accent-[color:var(--ink-signal)]",
+                // Keep checkboxes visible during batch selection, otherwise show on hover.
+                "transition-opacity duration-[var(--dur-stamp)]",
+                selected || anySelected
+                  ? "opacity-100"
+                  : "opacity-0 group-hover:opacity-100 focus:opacity-100",
+              )}
+              checked={selected}
+              onChange={onToggleSelect}
+              aria-label={selected ? `deselect #${row.id}` : `select #${row.id}`}
+            />
+          </label>
+        </td>
+        {/* Line 2 is the signal alone (#600); the fit sentence lives in the
+            sheet, where there is room to read it. */}
+        <IdentityCell
+          identity={{ name, email, title, company, linkedinUrl, phone }}
+          line2={
+            signalLabel ? (
+              <SignalLabel tone={eventPassed ? "blocked" : "muted"}>{signalLabel}</SignalLabel>
+            ) : (
+              <span className="text-ink-faint">no signal on this row</span>
+            )
+          }
+        />
+        <td className="whitespace-nowrap py-[10px] pr-6 leading-4 text-ink-cream-2">
+          {row.playName}
+          {/* The source column is gone (redundant with play), but its meaningful
+              suffix (which repo / cohort the finder matched) survives here. */}
+          {detail && <div className="font-mono text-[10.5px] text-ink-faint">{detail}</div>}
+        </td>
+        <td className="whitespace-nowrap py-[10px] pr-6">
+          <div className="flex items-center gap-1.5">
+            <Badge tone={statusTone(row.status)}>{row.status}</Badge>
+            {row.sendHold && <Badge tone="blocked">held · fit review</Badge>}
+            <DeliveryBadge delivery={row.delivery} />
+            {!expanded &&
+              row.status !== "sent" &&
+              row.lastDraft &&
+              (row.lastDraft.sent ? (
+                <Badge tone="receipt">sent</Badge>
+              ) : held ? (
+                <Badge tone={held.kind === "lint" ? "blocked" : "spend"} title={held.text}>
+                  held · {row.lastDraft.flags.length} flag
+                  {row.lastDraft.flags.length === 1 ? "" : "s"}
+                </Badge>
+              ) : (
+                <Badge tone="neutral" title="draft preview">
+                  draft
+                </Badge>
+              ))}
+            {prio && (
+              <Badge tone={prio.tone} title={prio.title}>
+                {prio.label}
+              </Badge>
+            )}
+          </div>
+        </td>
+        <td className="whitespace-nowrap py-[10px] text-right font-mono text-[12px] text-ink-muted">
+          {timeAgo(row.foundAt)}
+        </td>
+        <td className="px-6 py-[10px] text-right" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center justify-end gap-1.5">
+            {(canApproveFit ||
+              row.status === "pending" ||
+              row.status === "rejected" ||
+              (row.status === "expired" && !isQueueImportInProgress(row))) && (
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={busy}
+                onClick={onApprove}
+                title={
+                  canApproveFit
+                    ? "Override the saved fit rejection and approve this prospect for sending"
+                    : undefined
+                }
+                {...readOnly}
+              >
+                <Check size={12} />
+                {canApproveFit ? "Approve fit" : "approve"}
+              </Button>
+            )}
+            {(row.status === "pending" || row.status === "approved") && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                onClick={onReject}
+                {...readOnly}
+                className="text-[color:var(--ink-blocked-2)]"
+              >
+                <X size={12} />
+                reject
+              </Button>
+            )}
+            {(row.status === "pending" ||
+              row.status === "approved" ||
+              row.status === "rejected") && (
+              <MoveToWorkspace targets={targets} disabled={busy} onMove={onMove} />
+            )}
+          </div>
+        </td>
+      </tr>
+      {expanded && (
+        <Sheet
+          colSpan={7}
+          theCase={
+            <CaseSection>
+              {emptyResearch && (
+                <div role="note" className="text-[12px] leading-5 text-ink-muted">
+                  <p className="m-0 font-medium">{emptyResearch}</p>
+                  <p className="m-0">
+                    {emptyResearch === "Not researched yet"
+                      ? "No person or product research is saved for this row."
+                      : "No usable person or product research is saved for this row."}
+                  </p>
+                </div>
+              )}
+              {!masked && fitReason && (
+                <p className="m-0 text-[13px] leading-5 text-ink-cream-2 [text-wrap:pretty]">
+                  {fitReason}
+                </p>
+              )}
+              {sheetRows.length > 0 && (
+                <>
+                  <Rule />
+                  <CaseList rows={sheetRows} />
+                </>
+              )}
+              <PersonDossier rowId={row.id} />
+              <ProductResearch payload={row.payload} />
+              {profileHistory.length > 0 && (
+                <Disclosure label="Profile history">
+                  <CaseList rows={profileHistory} className="mt-3" />
+                </Disclosure>
+              )}
+              {/* `notes` is the pre-#592 rationale; once a row has its fit
+                  line the note only repeats it (or a diagnostic). */}
+              {!masked && !fitReason && row.notes && (
+                <div className="text-[11.5px] leading-4 text-ink-faint">{row.notes}</div>
+              )}
+              {row.priority && prio && (
+                <>
+                  <Rule />
+                  {/* The row owns the score; its reasons and breakdown live here. */}
+                  <Disclosure label="explain score">
+                    <div className="mt-2 flex flex-col gap-2 border-l border-ink-rule pl-3">
+                      <div className="flex items-center leading-4 text-ink-muted">
+                        {ranked
+                          ? "Ranked review uses it to order candidates. It never approves or sends."
+                          : "Experimental. It does not affect ordering or sending."}
+                        <Explain concept="shadowScore" />
+                      </div>
+                      {scoreReasons.length > 0 && <CaseList rows={scoreReasons} />}
+                      <div className="grid max-w-[420px] grid-cols-2 gap-x-6 gap-y-1 font-mono text-[11px] leading-4 text-ink-cream-2">
+                        {priorityBreakdown(row.priority).map((b) => (
+                          <div key={b.component} className="flex justify-between gap-2">
+                            <span>{b.component}</span>
+                            <span>
+                              <span className="text-ink-cream">{b.score}</span>
+                              <span className="text-ink-faint"> ·{b.weightPct}%</span>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </Disclosure>
+                </>
+              )}
+              <PayloadJson value={row.payload} />
+            </CaseSection>
+          }
+          theLetter={
+            <DraftSection
+              id={row.id}
+              channel={row.channel}
+              sender={row.sender}
+              payload={row.payload}
+              status={row.status}
+              sendHold={row.sendHold}
+              delivery={row.delivery ?? null}
+              draft={row.lastDraft}
+              draftedAt={row.lastDraftedAt}
+              generating={generating}
+              isSending={row.isSending}
+              prospectId={row.prospectId}
+            />
+          }
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * Persisted draft with receipt links, send state, and generate/regenerate actions.
+ * Both draft actions use the preview-only endpoint and never send. Each finder
+ * stores its pitch angle on the row so drafts can be generated inline.
+ */
+function DraftSection({
+  id,
+  channel,
+  sender,
+  payload,
+  status,
+  draft,
+  draftedAt,
+  generating,
+  isSending,
+  prospectId,
+  sendHold,
+  delivery,
+}: {
+  id: number;
+  channel: QueueRowView["channel"];
+  sender: QueueRowView["sender"];
+  payload: unknown;
+  status: QueueStatusView;
+  sendHold?: QueueRowView["sendHold"];
+  /** Sent-folder delivery check of this row's send, when one ran. */
+  delivery?: QueueRowView["delivery"];
+  draft: QueueRowView["lastDraft"];
+  draftedAt: string | null;
+  generating: boolean;
+  /** Set once the send has created a prospect row; null before that. */
+  prospectId: number | null;
+  /**
+   * True when the server's `target_queue.send_started_at` marker is set:
+   * survives nav-away-and-back AND `bun --watch` reloads, unlike the
+   * mutation's local `isPending`. Cleared on terminal status flip.
+   */
+  isSending: boolean;
+}): React.ReactElement {
+  const qc = useQueryClient();
+  const { masked } = usePrivacy();
+  const regenerate = useMutation({
+    mutationFn: (rotateAngle: boolean) => api.regenerateDraft(id, rotateAngle),
+    // Persist a localStorage marker so the spinner survives leaving + returning
+    // to /queue while the draft generates server-side; cleared on settle (and,
+    // for the unmounted case, reconciled away once lastDraftedAt advances).
+    onMutate: () => markDraftGenerating(id),
+    onSuccess: () => {
+      clearDraftGenerating(id);
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      toast.success("draft ready · preview only, not sent");
+    },
+    onError: (err) => {
+      clearDraftGenerating(id);
+      // Refetch on failure: a concurrent send may have made the cached approved row stale.
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      toast.error(`couldn't draft · ${err.message}`);
+    },
+  });
+  // Instant spinner while mounted (isPending) OR restored-from-localStorage
+  // after a remount (generating).
+  const isGenerating = generating || regenerate.isPending;
+  const send = useMutation({
+    mutationFn: () => api.sendDraft(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      void qc.invalidateQueries({ queryKey: ["home"] });
+      toast.success("sent · the reviewed draft went out as-is");
+    },
+    onError: (err) => {
+      // Refetch failed sends so rows claimed or sent elsewhere update their controls.
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      if (err.message.includes("already sent")) toast.success("already sent ✓");
+      else if (err.message.startsWith("Send held for fit review:"))
+        toast.error(
+          masked
+            ? "Send held for fit review. Review the saved assessment before sending."
+            : err.message,
+        );
+      else toast.error(`couldn't send · ${err.message}`);
+    },
+  });
+  // Combine local and persisted send state to survive remounts and cover the gap
+  // before the server marker is refetched. Use it for both send and regenerate
+  // controls; sent or in-flight drafts cannot be regenerated.
+  const sending = send.isPending || isSending;
+  const canDraft = status !== "sent" && !sending && !(draft?.sent ?? false);
+  const verb = draft ? "Regenerate draft" : "Generate draft";
+  const pendingVerb = draft ? "Regenerating…" : "Generating…";
+  const draftButton = canDraft ? (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button
+        variant="ghost"
+        size="sm"
+        disabled={isGenerating}
+        onClick={() => regenerate.mutate(false)}
+        {...readOnly}
+        title="Draft this row in preview mode — dry-run, never sends"
+      >
+        {isGenerating ? <Loader2 size={11} className="animate-spin" /> : <RotateCw size={11} />}
+        {isGenerating ? pendingVerb : verb}
+      </Button>
+      {draft && (
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={isGenerating}
+          onClick={() => regenerate.mutate(true)}
+          {...readOnly}
+          title="Try another angle and generate a new preview"
+        >
+          <RotateCw size={11} /> Rotate angle
+        </Button>
+      )}
+    </div>
+  ) : null;
+
+  // Hand-sent channel (X DMs today): there is no transport. The founder
+  // copies the text, sends it by hand, then records it here. "Mark sent"
+  // writes the step-0 event on the row's channel server-side.
+  const isManualPlay = sender === "manual";
+  const markSent = useMutation({
+    mutationFn: () => api.markSent(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      void qc.invalidateQueries({ queryKey: ["home"] });
+      toast.success(`recorded · hand-send logged on channel ${channel}`);
+    },
+    onError: (err) => {
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      toast.error(`couldn't record · ${err.message}`);
+    },
+  });
+  // LinkedIn invites can be withdrawn once sent; an unsent row can move to any
+  // channel its person has an address on (its draft is then rewritten).
+  const withdrawInvite = useMutation({
+    mutationFn: () => api.withdrawInvite(id),
+    onSuccess: (res) => {
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      toast.success(
+        `invite ${res.status === "not_pending" ? "already accepted or closed" : "withdrawn"}`,
+      );
+    },
+    onError: (err) => toast.error(`couldn't withdraw · ${err.message}`),
+  });
+  const switchChannel = useMutation({
+    mutationFn: (next: QueueRowView["channel"]) => api.setQueueChannel(id, next),
+    onSuccess: (res) => {
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      toast.success(`moved to ${res.channel} · regenerate to draft it`);
+    },
+    onError: (err) => toast.error(`couldn't switch channel · ${err.message}`),
+  });
+  const reachable = reachableChannels(payload);
+  const channelButtons = (
+    <>
+      {channel === "linkedin" && status === "sent" && (
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={withdrawInvite.isPending}
+          onClick={() => withdrawInvite.mutate()}
+          {...readOnly}
+          title="Withdraw the connection request (never removes an accepted connection)"
+        >
+          {withdrawInvite.isPending ? "Withdrawing…" : "Withdraw invite"}
+        </Button>
+      )}
+      {status !== "sent" && reachable.length > 1 && (
+        <select
+          aria-label="Channel"
+          className="rounded border border-ink-rule bg-transparent px-1 font-mono text-[11px] text-ink-cream-2"
+          value={channel}
+          disabled={switchChannel.isPending}
+          onChange={(e) => switchChannel.mutate(e.target.value as QueueRowView["channel"])}
+          title="Channel for this person's first touch"
+        >
+          {reachable.map((c) => (
+            <option key={c} value={c}>
+              {CHANNEL_LABELS[c]}
+            </option>
+          ))}
+        </select>
+      )}
+    </>
+  );
+  // Queue rows also cover one-touch plays without cadence_state, so they need
+  // their own action for recording LinkedIn replies.
+  const [linkedinBody, setLinkedinBody] = useState("");
+  const [linkedinOpen, setLinkedinOpen] = useState(false);
+  const markLinkedIn = useMutation({
+    mutationFn: () => api.markLinkedInReply(prospectId as number, linkedinBody),
+    onSuccess: (data) => {
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      void qc.invalidateQueries({ queryKey: ["cadences"] });
+      setLinkedinOpen(false);
+      setLinkedinBody("");
+      const warning = data.inFlightSends > 0 ? " · an in-flight email may still complete" : "";
+      toast.success(
+        `LinkedIn reply recorded · ${data.cadencesStopped} cadence(s) stopped${warning}`,
+      );
+    },
+    onError: (err) => toast.error(`couldn't record · ${err.message}`),
+  });
+  // Keep the trigger with row actions and give the textarea the full body width.
+  const canMarkLinkedIn = status === "sent" && prospectId != null;
+  const linkedinReplyButton =
+    canMarkLinkedIn && !linkedinOpen ? (
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => setLinkedinOpen(true)}
+        title="Record a LinkedIn reply and stop any email cadence for this prospect"
+      >
+        Record a LinkedIn reply
+      </Button>
+    ) : null;
+  const linkedinReplyEditor =
+    canMarkLinkedIn && linkedinOpen ? (
+      <div className="mt-3 flex flex-col gap-2 border-t border-ink-rule pt-3">
+        <label
+          className="font-mono text-[10px] uppercase tracking-[0.14em] text-ink-faint"
+          htmlFor={`li-reply-${id}`}
+        >
+          they replied on linkedin — paste what they said
+        </label>
+        <textarea
+          id={`li-reply-${id}`}
+          className="min-h-[72px] w-full rounded border border-ink-rule bg-transparent p-2 text-[12px]"
+          value={linkedinBody}
+          onChange={(e) => setLinkedinBody(e.currentTarget.value)}
+          placeholder="Optional, but it is what a reply gets drafted from later."
+        />
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={markLinkedIn.isPending}
+            onClick={() => markLinkedIn.mutate()}
+            {...readOnly}
+          >
+            {markLinkedIn.isPending ? "Recording…" : "Record reply"}
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => setLinkedinOpen(false)}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+    ) : null;
+
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const pstr = (k: string): string | null => (typeof p[k] === "string" ? (p[k] as string) : null);
+  const dmOpen = p["dmOpen"] === true;
+  const xHandle = xHandleFrom(pstr("handle")) ?? xHandleFrom(pstr("twitterUrl"));
+  const xUserId = pstr("xUserId");
+  const openOnXUrl = dmOpen
+    ? xUserId
+      ? `https://x.com/messages/compose?recipient_id=${xUserId}`
+      : (pstr("twitterUrl") ?? "")
+    : (pstr("tweetUrl") ?? pstr("twitterUrl") ?? "");
+  // Same review gate as the send button: a rejected (or still-pending) row
+  // must not offer Mark sent. The server refuses non-approved rows too.
+  const manualButtons =
+    isManualPlay && draft != null && status === "approved" && !draft.sent ? (
+      <>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            void navigator.clipboard.writeText(draft.body);
+            toast.success("copied — paste it into X");
+          }}
+          title="Copy the draft text to paste into X"
+        >
+          <Copy size={11} /> Copy text
+        </Button>
+        {openOnXUrl && (
+          <a
+            href={openOnXUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 font-mono text-[11px] text-ink-cream-2 underline decoration-ink-rule underline-offset-2 hover:text-ink-cream"
+            title={
+              dmOpen
+                ? `DM @${xHandle ?? ""} — their DMs are open`
+                : pstr("tweetUrl")
+                  ? "Their DMs are closed — reply under the repost instead"
+                  : "Open their X profile to send the DM"
+            }
+          >
+            <ExternalLink size={11} />{" "}
+            {dmOpen
+              ? `DM @${xHandle ?? ""}`
+              : pstr("tweetUrl")
+                ? "reply on their repost"
+                : `open @${xHandle ?? "profile"}`}
+          </a>
+        )}
+        <Button
+          variant="receipt"
+          size="sm"
+          disabled={markSent.isPending || isGenerating}
+          onClick={() => markSent.mutate()}
+          {...readOnly}
+          title="Record that you sent this by hand from the X app"
+        >
+          {markSent.isPending ? (
+            <Loader2 size={11} className="animate-spin" />
+          ) : (
+            <Check size={11} />
+          )}
+          {markSent.isPending ? "Recording…" : "Mark sent"}
+        </Button>
+      </>
+    ) : null;
+
+  // Send THIS prospect now, using the reviewed draft VERBATIM (no LLM re-roll).
+  // Enabled for an approved, not-yet-sent draft with no BLOCKING flags. Lint /
+  // dedup flags block (regenerate until clean, then send); soft review flags
+  // (e.g. stale-event) don't. This button IS their review-then-send override.
+  const blocking = draft ? blockingFlags(draft.flags) : [];
+  const cleanDraft = draft != null && blocking.length === 0 && !draft.sent && !sendHold;
+  // Soft-flagged but otherwise sendable: held for review, founder is overriding.
+  const softHold = cleanDraft && draft != null && draft.flags.length > 0;
+  const softHoldDetail = draft?.flags.includes("contacted-elsewhere")
+    ? "Held — another workspace emailed this person in the last 7 days. Send the reviewed draft as-is to override."
+    : draft?.flags.includes("ungrounded")
+      ? "Held — research found nothing on this person, so the draft leans on the company name. Read it once more; send as-is if it still holds up."
+      : "Held for review (event has passed) — send the reviewed draft as-is";
+  const showSend = sender === "api" && status === "approved" && !(draft?.sent ?? false);
+  const sendButton = showSend ? (
+    <Button
+      variant="receipt"
+      size="sm"
+      disabled={sending || isGenerating || !cleanDraft}
+      onClick={() => send.mutate()}
+      {...readOnly}
+      title={
+        sendHold
+          ? "Review this person’s fit before sending; regenerating will not clear this hold"
+          : softHold
+            ? softHoldDetail
+            : cleanDraft
+              ? "Send this prospect now — sends the reviewed draft, as-is"
+              : draft == null
+                ? "Generate a draft first, then send it"
+                : "Draft has lint flags — regenerate to clear them, then send"
+      }
+    >
+      {sending ? <Loader2 size={11} className="animate-spin" /> : <Send size={11} />}
+      {sending
+        ? "Sending…"
+        : sendHold
+          ? "Held · fit review"
+          : softHold
+            ? "Send anyway"
+            : "Send now"}
+    </Button>
+  ) : null;
+
+  if (!draft) {
+    return (
+      <LetterEmpty
+        note="No draft yet."
+        actions={
+          <>
+            {/* A sent row whose draft was never persisted used to return here
+                before the LinkedIn control rendered, so exactly the rows most
+                likely to have been replied to by hand could not record one. */}
+            {linkedinReplyButton}
+            {channelButtons}
+            {manualButtons}
+            {sendButton}
+            {draftButton}
+          </>
+        }
+        below={
+          <>
+            {" "}
+            {sendHold && <FitHold hold={sendHold} />} {linkedinReplyEditor}{" "}
+          </>
+        }
+      />
+    );
+  }
+
+  // Row was sent but lastDraft.sent is false → a post-send regenerate landed
+  // before the server-side guard was added. The card body is NOT the email
+  // that went out (the original is only in the prospect's inbox now).
+  const isStalePostSend = status === "sent" && !draft.sent;
+  // Research landed after this draft was written (or the draft was written
+  // while enrichment had failed): say so, in place of the "no enrichment" badge.
+  const researchBadge = personResearchBadge(payload, {
+    draftedAt,
+    ...(draft.enrichmentFailed ? { enrichmentFailed: true } : {}),
+  });
+  // The total line: green under a letter the founder can send right now.
+  const sendable = showSend && cleanDraft && !sending;
+  const researchWarning = researchBadge !== "researched" ? researchBadge : null;
+  const deliveryNote = deliveryWarningText(delivery);
+  const hasDraftDetails =
+    sendHold ||
+    deliveryNote ||
+    (!draft.sent && draft.flags.length > 0) ||
+    draft.receiptIds.length > 0 ||
+    isStalePostSend ||
+    researchWarning ||
+    (!researchBadge && draft.enrichmentFailed);
+  return (
+    <LetterCard
+      meta={
+        <span title={draftedAt ? `Drafted ${timeAgo(draftedAt)}` : undefined}>
+          {draft.sent ? "Sent" : "Draft"}
+          {CHANNEL_MAX_CHARS[channel] != null &&
+            ` · ${draft.body.length}/${CHANNEL_MAX_CHARS[channel]} characters`}
+        </span>
+      }
+      subject={draft.subject}
+      stateLine={
+        hasDraftDetails ? (
+          <>
+            {sendHold && <FitHold hold={sendHold} />}
+            {deliveryNote && <DeliveryWarning delivery={delivery} />}
+            {!draft.sent && draft.flags.length > 0 && (
+              <DraftStateLine sent={false} flags={draft.flags} />
+            )}
+            {softHold && <Explain concept="softHold" detail={softHoldDetail} />}
+            {draft.receiptIds.map((rid) => (
+              <Link
+                key={rid}
+                to="/receipts"
+                className="font-mono text-[11px] text-ink-muted underline decoration-ink-rule underline-offset-2 hover:text-ink-cream-2"
+              >
+                receipt #{rid}
+              </Link>
+            ))}
+            {isStalePostSend && <Badge tone="blocked">post-send regenerate · not sent</Badge>}
+            {researchWarning ? (
+              <span className="inline-flex items-center">
+                <Badge tone="spend">{researchWarning}</Badge>
+                <Explain concept="personResearch" />
+              </span>
+            ) : (
+              !researchBadge &&
+              draft.enrichmentFailed && (
+                <span className="inline-flex items-center">
+                  <Badge tone="spend">no enrichment</Badge>
+                  <Explain concept="enrichment" />
+                </span>
+              )
+            )}
+          </>
+        ) : undefined
+      }
+      body={draft.body}
+      afterBody={
+        <>
+          {draft.angle && (
+            <details className="mt-3 text-xs text-ink-muted">
+              <summary className="cursor-pointer">
+                {`Angle ${(draft.angle.index ?? 0) + 1} of ${draft.angle.count ?? 1}${draft.angle.origin === "generated" ? " · generated" : ""}`}
+              </summary>
+              <p className="mt-2">{draft.angle.text}</p>
+            </details>
+          )}
+          <DraftHistory queryKey={["queue-drafts", id]} load={() => api.queueDrafts(id)} />
+          {linkedinReplyEditor}
+        </>
+      }
+      foot={{
+        left: draftButton,
+        right: (
+          <>
+            {linkedinReplyButton}
+            {channelButtons}
+            {manualButtons}
+            {sendButton}
+          </>
+        ),
+      }}
+      sendable={sendable}
+    />
+  );
+}
+
+/** Per-browser memory of whether the panel is open. */
+const TRIGGERS_OPEN_KEY = "oneshot-gtm:queue-triggers-open";
+
+/**
+ * Applying a pack merges patches into trigger config and enables the triggers.
+ * Keep the picker in the Triggers panel, which opens when nothing is configured
+ * or the queue is empty.
+ */
+function PackPicker() {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const packsQuery = useQuery({ queryKey: ["packs"], queryFn: () => api.packs() });
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [lastResult, setLastResult] = useState<PackApplyResult | null>(null);
+
+  const applyPack = useMutation({
+    mutationFn: (id: string) => api.applyPack(id),
+    onSuccess: (result: PackApplyResult) => {
+      setLastResult(result);
+      const readyCount = result.applied.filter((t) => t.ready).length;
+      const notReadyCount = result.applied.length - readyCount;
+      toast.success(
+        notReadyCount > 0
+          ? `${result.id} · ${result.applied.length} triggers · ${notReadyCount} need config`
+          : `${result.id} · ${result.applied.length} triggers applied`,
+      );
+      if (result.skipped.length > 0) {
+        toast.info(`${result.id} · skipped ${result.skipped.map((s) => s.name).join(", ")}`);
+      }
+      void qc.invalidateQueries({ queryKey: ["triggers"] });
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  const packs = packsQuery.data?.packs ?? [];
+  if (packsQuery.isLoading || packs.length === 0) return null;
+
+  const selected = packs.find((p) => p.id === selectedId) ?? null;
+  const result = lastResult && selected && lastResult.id === selected.id ? lastResult : null;
+  const stillNeeded = result?.applied.filter((t) => !t.ready) ?? [];
+
+  return (
+    <div className="border-b border-ink-rule/60 px-6 py-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="ln-eyebrow">Start from a pack</div>
+        <select
+          value={selectedId}
+          aria-label="industry pack"
+          /*
+           * Lock selection during apply so the result stays attached to its pack
+           * and the list of triggers needing configuration remains visible.
+           */
+          disabled={applyPack.isPending}
+          onChange={(e) => {
+            setSelectedId(e.currentTarget.value);
+            // The previous pack's result must not read as this one's.
+            setLastResult(null);
+          }}
+          className="h-7 rounded-[var(--radius-sm)] border border-ink-rule bg-ink-bg px-2 text-[12px] text-ink-cream disabled:opacity-60"
+        >
+          <option value="">select a vertical…</option>
+          {packs.map((pack) => (
+            <option key={pack.id} value={pack.id}>
+              {pack.label}
+            </option>
+          ))}
+        </select>
+        {selected && (
+          <Button
+            size="sm"
+            disabled={applyPack.isPending || READ_ONLY}
+            onClick={() => applyPack.mutate(selected.id)}
+            {...readOnly}
+          >
+            {applyPack.isPending ? "Applying…" : "Apply"}
+          </Button>
+        )}
+      </div>
+
+      {selected && (
+        <div className="mt-2">
+          {/* `summary` is the founder-facing line; `buyerBrief` is the
+              provenance behind it and reads like the engineering note it is.
+              `summary` is optional, so the fallback is clamped, without it a
+              pack that omits one renders the whole paragraph inline, the exact
+              thing this picker exists to avoid. */}
+          <div className={cn("text-[12px] text-ink-cream-2", !selected.summary && "line-clamp-2")}>
+            {selected.summary ?? selected.buyerBrief}
+          </div>
+          <div className="mt-1.5 font-mono text-[11px] text-ink-faint">
+            triggers · {selected.triggers.join(", ")}
+          </div>
+          <div className="mt-1 font-mono text-[11px] text-ink-muted">
+            ICP · <span className="text-ink-cream-2">{selected.icpOneLiner}</span>
+          </div>
+          {/* Always available, including on the no-summary path. Otherwise the
+              clamp above would make the rest of the reasoning unreachable. */}
+          <details className="mt-1.5">
+            <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-[0.14em] text-ink-faint hover:text-ink-cream-2">
+              why these channels
+            </summary>
+            <div className="mt-1.5 text-[11.5px] leading-[1.55] text-ink-muted">
+              {selected.buyerBrief}
+            </div>
+          </details>
+        </div>
+      )}
+
+      {result && selected && (
+        <div className="mt-2.5 border-t border-ink-rule/60 pt-2.5 font-mono text-[11px]">
+          <div className="text-ink-receipt-2">
+            ✓ applied · {result.applied.map((t) => t.name).join(", ")}
+          </div>
+          {stillNeeded.length > 0 && (
+            <div className="mt-1 text-[color:var(--ink-blocked-2)]">
+              still needs: {stillNeeded.map((t) => `${t.name} (${t.notReadyReason})`).join(" · ")}
+            </div>
+          )}
+          {result.skipped.length > 0 && (
+            <div className="mt-1 text-ink-faint">
+              skipped: {result.skipped.map((s) => `${s.name} (${s.reason})`).join(" · ")}
+            </div>
+          )}
+          {/* Apply never touches icpOneLiner in config.json (see packs.ts):
+              the proposed ICP only reaches the founder's config if they
+              explicitly accept it from /setup. */}
+          <div className="mt-1.5 flex flex-wrap items-center gap-2 text-ink-muted">
+            <span>proposed ICP · {result.proposedIcpOneLiner}</span>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() =>
+                navigate({
+                  to: "/setup",
+                  search: { proposedIcp: result.proposedIcpOneLiner, packLabel: selected.label },
+                  // Land on the ICP section. The seeded field is the point.
+                  hash: "icp",
+                })
+              }
+            >
+              Accept in Setup
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TriggersCard({ queueEmpty }: { queueEmpty: boolean | null }) {
+  const qc = useQueryClient();
+  const triggersQuery = useQuery({
+    queryKey: ["triggers"],
+    queryFn: () => api.triggers(),
+    // Poll 5s while anything is running (local marker OR server `running`), 30s otherwise.
+    refetchInterval: (query) => {
+      if (hasAnyRunningTrigger()) return 5_000;
+      const data = query.state.data;
+      if (data?.triggers.some((t) => t.running)) return 5_000;
+      return 30_000;
+    },
+  });
+  const setEnabled = useMutation({
+    mutationFn: (vars: { name: string; enabled: boolean }) =>
+      api.setTriggerEnabled(vars.name, vars.enabled),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["triggers"] }),
+    onError: (err) => toast.error(err.message),
+  });
+  const setConfig = useMutation({
+    mutationFn: (vars: { name: string; config: unknown; source: "editor" | "inline" }) =>
+      api.setTriggerConfig(vars.name, vars.config),
+    onSuccess: (data, vars) => {
+      // Edge lint warns after saving; it cannot refuse a save that already succeeded.
+      if (data.warnings && data.warnings.length > 0) {
+        toast.warning(`${vars.name} · yourEdge: ${data.warnings.join(" · ")}`, {
+          duration: 9000,
+        });
+      }
+      // Close the JSON editor only when the save CAME from it. An inline
+      // interval change on another row must not discard unsaved editor text.
+      if (vars.source === "editor") {
+        setEditing(null);
+      } else {
+        const ms = (vars.config as Record<string, unknown> | null)?.["intervalMs"];
+        toast.success(
+          `${vars.name} · ${typeof ms === "number" ? `polls every ${humanInterval(ms)}` : "interval reset to default"}`,
+        );
+      }
+      void qc.invalidateQueries({ queryKey: ["triggers"] });
+    },
+    onError: (err) => toast.error(err.message),
+  });
+  const runTrigger = useMutation({
+    mutationFn: (name: string) => {
+      markTriggerRunning(name);
+      return api.runTrigger(name);
+    },
+    onSuccess: (data, name) => {
+      void qc.invalidateQueries({ queryKey: ["triggers"] });
+      if (data.pending) {
+        toast.success(`${name} · started`, {
+          description: "polling for results",
+        });
+        return;
+      }
+      clearTriggerRunning(name);
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+      if (data.error) {
+        toast.error(`${name} · ${data.error}`);
+        return;
+      }
+      const r = data.result;
+      if (!r) {
+        toast.success(`${name} · ran`);
+        return;
+      }
+      const parts = [
+        `${r.candidates} candidates`,
+        `${r.enqueued} kept`,
+        r.droppedIcp ? `${r.droppedIcp} icp-drop` : null,
+        r.droppedRole ? `${r.droppedRole} role-drop` : null,
+        r.droppedDuplicate ? `${r.droppedDuplicate} dup` : null,
+        r.droppedEnrichment ? `${r.droppedEnrichment} enrich-fail` : null,
+        `$${r.costUsd.toFixed(2)}`,
+        r.halted ? `halted: ${r.halted}` : null,
+      ].filter(Boolean);
+      toast.success(`${name} · ${parts.join(" · ")}`);
+    },
+    onError: (err, name) => {
+      // 409 = server already running it. Keep the local marker so the
+      // spinner stays lit until the authoritative `running` flag clears.
+      if (err.message.includes("already running")) {
+        void qc.invalidateQueries({ queryKey: ["triggers"] });
+        toast.info(`${name} · already running`);
+        return;
+      }
+      clearTriggerRunning(name);
+      toast.error(`${name} · ${err.message}`);
+    },
+  });
+
+  const [editing, setEditing] = useState<EditingState | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
+
+  const triggers = triggersQuery.data?.triggers ?? [];
+  // Disabled finders are dormant: collapsed behind a count row by default.
+  const activeTriggers = triggers.filter((t) => t.enabled);
+  const inactiveTriggers = triggers.filter((t) => !t.enabled);
+  const [showInactive, setShowInactive] = useState(false);
+
+  const summary = summarizeTriggers(triggers);
+
+  /*
+   * Remember the open state with a false default: useLocalStorage only hydrates
+   * stored values to true, so storing "collapsed" would lose the preference.
+   */
+  const [storedOpen, setStoredOpen] = useLocalStorage(TRIGGERS_OPEN_KEY, false);
+
+  /*
+   * Auto-open once per mount for running or unconfigured finders, or an empty queue.
+   * Keep this separate from the stored preference so automatic opens do not
+   * overwrite it and refetches do not reopen a panel the user closed.
+   */
+  const [autoOpen, setAutoOpen] = useState(false);
+  const seeded = useRef(false);
+  // `queueEmpty` is null until the queue itself has loaded. Seeding on the
+  // triggers response alone would race it: whichever query lands first decides,
+  // and an empty queue would fail to open the panel about half the time.
+  if (!seeded.current && triggersQuery.data && queueEmpty !== null) {
+    seeded.current = true;
+    if (summary.running > 0 || summary.notReady > 0 || queueEmpty) setAutoOpen(true);
+  }
+
+  const expanded = storedOpen || autoOpen;
+
+  const toggle = (): void => {
+    if (expanded) {
+      // Collapsing hides the JSON editor rather than unmounting it, so without
+      // this a reopened panel restores unsaved text the reader walked away from.
+      setEditing(null);
+      setEditError(null);
+      setShowInactive(false);
+      setAutoOpen(false);
+      setStoredOpen(false);
+      return;
+    }
+    setStoredOpen(true);
+  };
+
+  const renderTriggerRow = (t: TriggerView, i: number) => {
+    const summary = summarizeRun(t.lastRunSummary);
+    // `inProcess` covers the sub-millisecond window before the 202 lands;
+    // `tracked` takes over via localStorage + server `runningSince`.
+    const inProcess = runTrigger.isPending && runTrigger.variables === t.name;
+    const tracked = runningByName.get(t.name);
+    const running = inProcess || tracked != null;
+    const elapsedMs = tracked?.elapsedMs ?? null;
+    const isEditing = editing?.name === t.name;
+    return (
+      <TriggerRowFragment
+        key={t.name}
+        trigger={t}
+        zebra={i % 2 === 1}
+        running={running}
+        elapsedMs={elapsedMs}
+        summary={summary}
+        isEditing={Boolean(isEditing)}
+        editing={isEditing ? editing : null}
+        editError={isEditing ? editError : null}
+        onToggleEnabled={(next) => setEnabled.mutate({ name: t.name, enabled: next })}
+        onRun={() => runTrigger.mutate(t.name)}
+        onSetInterval={(ms) =>
+          setConfig.mutate({
+            name: t.name,
+            config: withIntervalOverride(t.config, ms),
+            source: "inline",
+          })
+        }
+        onStartEdit={() => {
+          setEditing({
+            name: t.name,
+            text: JSON.stringify(t.config ?? {}, null, 2),
+            defaultConfig: t.defaultConfig,
+          });
+          setEditError(null);
+        }}
+        onCancelEdit={() => {
+          setEditing(null);
+          setEditError(null);
+        }}
+        onChangeEditText={(text) => setEditing((prev) => (prev ? { ...prev, text } : prev))}
+        onResetDefaults={() =>
+          setEditing((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  text: JSON.stringify(prev.defaultConfig ?? {}, null, 2),
+                }
+              : prev,
+          )
+        }
+        onSaveEdit={() => {
+          if (!editing) return;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(editing.text);
+          } catch (err) {
+            setEditError(`invalid JSON: ${(err as Error).message}`);
+            return;
+          }
+          if (!parsed || typeof parsed !== "object") {
+            setEditError("config must be a JSON object");
+            return;
+          }
+          setEditError(null);
+          setConfig.mutate({ name: editing.name, config: parsed, source: "editor" });
+        }}
+        setEnabledPending={setEnabled.isPending}
+        setConfigPending={setConfig.isPending}
+      />
+    );
+  };
+
+  // Invalidate queue/home the moment any trigger's `running` flips true → false.
+  const runningKey = triggers
+    .filter((t) => t.running)
+    .map((t) => t.name)
+    .toSorted()
+    .join(",");
+  const prevRunningRef = useRef<string>("");
+  useEffect(() => {
+    const prev = prevRunningRef.current;
+    prevRunningRef.current = runningKey;
+    const prevNames = prev ? prev.split(",") : [];
+    const nowNames = runningKey ? runningKey.split(",") : [];
+    const stillRunning = new Set(nowNames);
+    if (prevNames.some((n) => !stillRunning.has(n))) {
+      void qc.invalidateQueries({ queryKey: ["queue"] });
+    }
+  }, [runningKey, qc]);
+
+  const lastPolledByName = new Map<string, string | null>(
+    triggers.map((t) => [t.name, t.lastPolledAt]),
+  );
+  const serverRunningSinceByName = new Map<string, string | null>(
+    triggers.map((t) => [t.name, t.runningSince]),
+  );
+  const runningByName = useRunningTriggers(
+    triggers.map((t) => t.name),
+    lastPolledByName,
+    serverRunningSinceByName,
+  );
+
+  return (
+    <section className="border-b border-ink-rule">
+      <div className="flex items-center justify-between">
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={expanded}
+          /*
+           * Use the visible summary as the accessible name; aria-label would hide
+           * its counts and timing. aria-expanded already communicates open state.
+           */
+          className="flex min-w-0 flex-1 flex-wrap items-center gap-3 px-6 py-2.5 text-left transition-colors duration-[var(--dur-stamp)] hover:bg-ink-surface/40"
+        >
+          <span className="text-ink-faint">
+            {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          </span>
+          <div className="ln-eyebrow">Triggers</div>
+          {/* The facts you would open the panel to check, so that most of the
+              time you do not have to. Only while shut: expanded, the table
+              below says all of this in more detail. */}
+          <div className="font-mono text-[11px] text-ink-faint">
+            {/* Leading separator so the accessible name reads "· 11 · 5 on"
+                rather than running the two counts together as "115 on". */}
+            · {summary.enabled} on
+            {summary.running > 0 && (
+              <span className="ml-2 text-[color:var(--ink-signal-2)]">
+                · {summary.running} running
+              </span>
+            )}
+            {summary.notReady > 0 && (
+              <span className="ml-2 text-[color:var(--ink-blocked-2)]">
+                · {summary.notReady} need config
+              </span>
+            )}
+            {!expanded && summary.nextDueMs != null && (
+              <span className="ml-2">· next in {humanInterval(summary.nextDueMs)}</span>
+            )}
+          </div>
+        </button>
+      </div>
+      {/* Packs configure the triggers below, so the picker rides inside this
+          panel and inherits its collapse: including the autoOpen rule, which
+          fires on exactly the occasions a pack is the thing you came for. */}
+      {expanded && <PackPicker />}
+      {!expanded ? null : triggersQuery.isLoading ? (
+        Array.from({ length: 3 }, (_, i) => <SkeletonRow key={i} />)
+      ) : triggers.length === 0 ? (
+        <div className="px-6 pb-6">
+          <EmptyNote
+            note="No triggers stored yet. Enable one below and it bootstraps itself on the next watch tick — or run the watch loop once to initialise."
+            cli="oneshot-gtm find watch --once"
+          />
+        </div>
+      ) : (
+        <table className="w-full text-[13px]">
+          <thead>
+            <tr className="border-b border-ink-rule/60 text-[10px] uppercase tracking-[0.14em] text-ink-faint">
+              <th className="px-6 py-2 text-left font-medium">name</th>
+              <th className="py-2 text-left font-medium">enabled</th>
+              <th className="py-2 text-left font-medium">interval</th>
+              <th className="py-2 text-left font-medium">last polled</th>
+              <th className="py-2 text-left font-medium">last run</th>
+              <th className="px-6 py-2 text-right font-medium">actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {activeTriggers.map(renderTriggerRow)}
+            {/* Disabled finders are dormant, not broken: collapsed behind one
+                  quiet row (same-tbody colSpan trick as SchedulerStrip, so the
+                  shared column widths hold). */}
+            {inactiveTriggers.length > 0 && (
+              <tr className="border-b border-ink-rule/60">
+                <td colSpan={6} className="px-6 py-2">
+                  <button
+                    type="button"
+                    aria-expanded={showInactive}
+                    onClick={() => setShowInactive((v) => !v)}
+                    className="flex items-center gap-1.5 font-mono text-[11px] text-ink-faint transition-colors hover:text-ink-cream-2"
+                  >
+                    {showInactive ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                    {inactiveTriggers.length} inactive finder
+                    {inactiveTriggers.length === 1 ? "" : "s"} · {showInactive ? "hide" : "show"}
+                  </button>
+                </td>
+              </tr>
+            )}
+            {showInactive && inactiveTriggers.map(renderTriggerRow)}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+interface TriggerRowProps {
+  trigger: TriggerView;
+  zebra: boolean;
+  running: boolean;
+  /** ms elapsed since the cross-refresh start; null when only in-process. */
+  elapsedMs: number | null;
+  summary: string;
+  isEditing: boolean;
+  editing: EditingState | null;
+  editError: string | null;
+  onToggleEnabled: (next: boolean) => void;
+  onRun: () => void;
+  /** Write an `intervalMs` override into the trigger config; null = revert to default. */
+  onSetInterval: (intervalMs: number | null) => void;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onChangeEditText: (text: string) => void;
+  onResetDefaults: () => void;
+  onSaveEdit: () => void;
+  setEnabledPending: boolean;
+  setConfigPending: boolean;
+}
+
+function TriggerRowFragment(props: TriggerRowProps) {
+  const t = props.trigger;
+  // Click-to-edit state for the interval cell (select swaps in over the text).
+  const [editingInterval, setEditingInterval] = useState(false);
+  // Missing `ready` field = treat as ready (tolerate older servers).
+  const notReady = t.ready === false;
+  const notReadyReason = t.notReadyReason ?? "missing required config";
+  const approvalBlocked = t.deprioritized === true;
+  // Configured angles the founder has had chances to send and never did:
+  // the nudge to open the editor, where the per-angle tally lives.
+  const neverSent = neverSentAngles(t.angleUsage);
+  // Block enabling an unready trigger but still allow disabling.
+  // Both fold in READ_ONLY rather than taking `readOnly` as props: these two
+  // controls compute their own disabled state, and `run now` gates clicks
+  // through pointer-events rather than the `disabled` attribute.
+  const toggleDisabled = props.setEnabledPending || (notReady && !t.enabled) || READ_ONLY;
+  const runDisabled = props.running || notReady || READ_ONLY;
+  return (
+    <>
+      <tr
+        className={cn(
+          "group relative border-b border-ink-rule/60",
+          "transition-colors duration-[var(--dur-stamp)]",
+          props.zebra && "bg-ink-surface/20",
+          !t.enabled && "opacity-65",
+          "hover:bg-ink-surface/50",
+          props.isEditing && "bg-ink-surface/50",
+          props.running && "bg-[color:var(--ink-signal)]/[0.08]",
+        )}
+      >
+        <td className="relative px-6 py-2 font-mono text-[12px]">
+          {props.running ? (
+            <span
+              aria-hidden="true"
+              className="absolute inset-y-0 left-0 w-[2px] bg-[color:var(--ink-signal)] animate-pulse"
+            />
+          ) : (
+            t.enabled && (
+              <span
+                aria-hidden="true"
+                className="absolute inset-y-0 left-0 w-[2px] bg-[color:var(--ink-signal)]/60"
+              />
+            )
+          )}
+          <span className={t.enabled ? "text-ink-cream" : "text-ink-muted"}>{t.name}</span>
+        </td>
+        <td
+          className="py-2"
+          title={notReady && !t.enabled ? `not ready · ${notReadyReason}` : undefined}
+        >
+          <Toggle
+            checked={t.enabled}
+            disabled={toggleDisabled}
+            label={`${t.enabled ? "disable" : "enable"} ${t.name}`}
+            onChange={props.onToggleEnabled}
+          />
+        </td>
+        <td className="py-2 font-mono text-[12px] text-ink-muted">
+          {editingInterval ? (
+            <select
+              autoFocus
+              aria-label={`polling interval for ${t.name}`}
+              className="rounded border border-ink-rule bg-ink-surface px-1 py-0.5 font-mono text-[12px] text-ink-cream"
+              value={String(t.intervalMs)}
+              disabled={props.setConfigPending || READ_ONLY}
+              onBlur={() => setEditingInterval(false)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setEditingInterval(false);
+              }}
+              onChange={(e) => {
+                const v = e.target.value;
+                props.onSetInterval(v === "default" ? null : Number(v));
+                setEditingInterval(false);
+              }}
+            >
+              {/* A custom value set via the JSON editor still displays selected. */}
+              {!INTERVAL_PRESETS_MS.includes(t.intervalMs) && (
+                <option value={String(t.intervalMs)}>{humanInterval(t.intervalMs)}</option>
+              )}
+              {INTERVAL_PRESETS_MS.map((ms) => (
+                <option key={ms} value={String(ms)}>
+                  {humanInterval(ms)}
+                </option>
+              ))}
+              <option value="default">default ({humanInterval(t.defaultIntervalMs)})</option>
+            </select>
+          ) : (
+            <button
+              type="button"
+              title="change polling interval"
+              disabled={props.setConfigPending || READ_ONLY}
+              className="cursor-pointer underline decoration-ink-faint decoration-dotted underline-offset-2 hover:text-ink-cream disabled:cursor-default disabled:opacity-60"
+              onClick={() => setEditingInterval(true)}
+            >
+              {humanInterval(t.intervalMs)}
+              {t.intervalMs !== t.defaultIntervalMs && (
+                <span className="ml-1 text-ink-faint">
+                  · default {humanInterval(t.defaultIntervalMs)}
+                </span>
+              )}
+            </button>
+          )}
+        </td>
+        <td className="py-2 font-mono text-[12px] text-ink-muted">
+          {t.lastPolledAt ? timeAgo(t.lastPolledAt) : "never"}
+        </td>
+        <td
+          className={cn(
+            "py-2 font-mono text-[11.5px]",
+            // Missing config on a DISABLED finder is dormancy, not an error:
+            // only an enabled-but-unready row (or a real run failure) goes red.
+            (notReady && t.enabled) ||
+              props.summary.startsWith("error:") ||
+              props.summary.startsWith("halted")
+              ? "text-[color:var(--ink-blocked-2)]"
+              : notReady
+                ? "text-ink-faint"
+                : "text-ink-muted",
+          )}
+        >
+          {notReady
+            ? `not ready · ${notReadyReason}`
+            : approvalBlocked
+              ? `deprioritized · ${t.deprioritizedReason ?? "low-approval-rate"} · ${((t.approvalRate ?? 0) * 100).toFixed(0)}% (${t.approvalReviewed}/${t.approvalMinSamples} min)`
+              : neverSent.length > 0
+                ? `${props.summary ? `${props.summary} · ` : ""}${neverSent.length} angle${neverSent.length === 1 ? "" : "s"} never sent`
+                : props.summary}
+        </td>
+        <td className="px-6 py-2 text-right">
+          <div className="flex items-center justify-end gap-1">
+            <Button
+              variant={props.running ? "accent" : "ghost"}
+              size="sm"
+              // `aria-disabled` (not `disabled`) so accent colors stay vivid;
+              // clicks are gated by the `onClick` guard + pointer-events-none.
+              aria-disabled={runDisabled || undefined}
+              onClick={runDisabled ? undefined : props.onRun}
+              className={cn(runDisabled && "cursor-not-allowed pointer-events-none")}
+              title={
+                props.running
+                  ? `Running for ${props.elapsedMs != null ? humanDuration(props.elapsedMs) : "a moment"} — click won't re-fire`
+                  : notReady
+                    ? `not ready · ${notReadyReason}`
+                    : "Run this finder now — ignores schedule, spends $"
+              }
+            >
+              {props.running ? (
+                <Loader2 size={12} className="animate-spin" aria-hidden="true" />
+              ) : (
+                <Play size={12} aria-hidden="true" />
+              )}
+              {props.running
+                ? props.elapsedMs != null
+                  ? `running · ${humanDuration(props.elapsedMs)}`
+                  : "running…"
+                : "run now"}
+            </Button>
+            <Button
+              variant={props.isEditing ? "secondary" : "ghost"}
+              size="sm"
+              title={props.isEditing ? "close config" : "edit config"}
+              aria-label={`${props.isEditing ? "close" : "edit"} ${t.name} config`}
+              onClick={props.isEditing ? props.onCancelEdit : props.onStartEdit}
+            >
+              <Pencil size={12} />
+            </Button>
+          </div>
+        </td>
+      </tr>
+      {props.isEditing && props.editing && (
+        <tr className="border-b border-ink-rule/60 bg-ink-bg-deep/60">
+          <td colSpan={6} className="px-6 py-4">
+            <div className="flex flex-col gap-3">
+              <div className="flex items-baseline justify-between gap-3">
+                <div className="ln-eyebrow">
+                  config ·{" "}
+                  <span className="text-ink-cream-2 normal-case font-mono tracking-normal">
+                    {t.name}
+                  </span>
+                </div>
+                <div className="ln-note text-[12px] text-ink-cream-2">
+                  add{" "}
+                  <code className="ln-mono text-[11.5px] text-[color:var(--ink-signal-2)]">
+                    "intervalMs"
+                  </code>{" "}
+                  to override the watch cadence · min 60000 · or just click the interval in the row
+                </div>
+              </div>
+              <Textarea
+                rows={8}
+                value={props.editing.text}
+                onChange={(e) => props.onChangeEditText(e.target.value)}
+                className="font-mono text-[12px]"
+                spellCheck={false}
+              />
+              {/yourEdge|yourClaim/.test(props.editing.text) && (
+                <div className="ln-note text-[12px] text-ink-cream-2">
+                  <code className="ln-mono text-[11.5px] text-[color:var(--ink-signal-2)]">
+                    yourEdge
+                  </code>
+                  : 3–4 angles separated by <code className="ln-mono text-[11.5px]">{"//"}</code>
+                  <Explain concept="edgeShape" />
+                </div>
+              )}
+              {/yourEdge|yourClaim/.test(props.editing.text) && (
+                <AngleUsagePanel
+                  angleUsage={t.angleUsage ?? null}
+                  draftUsage={t.draftUsage ?? null}
+                  voiceUsage={t.voiceUsage ?? null}
+                  formatUsage={t.formatUsage ?? null}
+                  disabled={props.setConfigPending || READ_ONLY}
+                  onRetire={(angleText) => {
+                    const next = removeAngleFromConfigText(props.editing?.text ?? "", angleText);
+                    if (next == null) {
+                      toast.error("couldn't find that angle in the edge text — edit it by hand");
+                      return;
+                    }
+                    props.onChangeEditText(next);
+                    toast.message("angle removed from the editor · save to apply");
+                  }}
+                />
+              )}
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-mono text-[11.5px] text-[color:var(--ink-blocked-2)]">
+                  {props.editError ?? ""}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {props.editing.defaultConfig && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={props.onResetDefaults}
+                      disabled={props.setConfigPending || READ_ONLY}
+                      title="Replace the textarea with the registry default config"
+                    >
+                      reset
+                    </Button>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={props.onCancelEdit}
+                    disabled={props.setConfigPending || READ_ONLY}
+                  >
+                    cancel
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={props.onSaveEdit}
+                    disabled={props.setConfigPending || READ_ONLY}
+                  >
+                    {props.setConfigPending ? "saving…" : "save"}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function IcpBanner() {
+  const setupQuery = useQuery({ queryKey: ["setup"], queryFn: () => api.setupStatus() });
+  const icp = setupQuery.data?.cfg.icpOneLiner ?? null;
+  if (setupQuery.isLoading) return null;
+
+  if (!icp || icp.trim().length === 0) {
+    return (
+      <section className="flex items-start gap-3 border-b border-ink-rule bg-[color:var(--ink-spend)]/6 px-6 py-4">
+        <Target size={14} className="mt-[3px] shrink-0 text-[color:var(--ink-spend-2)]" />
+        <div className="flex-1">
+          <div className="ln-eyebrow" style={{ color: "var(--ink-spend-2)" }}>
+            Set your ICP first
+          </div>
+          <div className="ln-note mt-0.5 text-[13px] text-ink-cream-2">
+            The find layer needs a free-text ICP one-liner to filter candidates. Without it, every
+            result passes through and you'll review more noise than signal.
+          </div>
+        </div>
+        <Link to="/setup">
+          <Button size="sm">Open setup</Button>
+        </Link>
+      </section>
+    );
+  }
+
+  return (
+    <section className="flex items-start gap-3 border-b border-ink-rule px-6 py-2">
+      <details className="group min-w-0 flex-1">
+        <summary className="flex cursor-pointer list-none items-center gap-3 py-1 text-[12px] [&::-webkit-details-marker]:hidden">
+          <ChevronRight
+            size={12}
+            className="shrink-0 text-ink-faint transition-transform group-open:rotate-90"
+          />
+          <span className="shrink-0 text-ink-muted">ICP</span>
+          <span className="truncate text-ink-cream-2 group-open:hidden">{icp}</span>
+        </summary>
+        <p className="mb-2 mt-2 max-w-[90ch] pl-6 text-[13px] leading-5 text-ink-cream-2">{icp}</p>
+      </details>
+      <Link
+        to="/setup"
+        className="rounded px-2 py-1 text-[12px] text-ink-muted hover:text-ink-cream"
+      >
+        Edit ICP
+      </Link>
+    </section>
+  );
+}
+
+/**
+ * Learning-loop v2 (issue #750): the background job (`icp-proposals.ts`)
+ * periodically proposes a tighter ICP one-liner from accumulated approve/
+ * reject decisions, but the active ICP never changes without this explicit
+ * approval — dismiss leaves it untouched. Nothing to show when there is no
+ * pending proposal (the common case).
+ */
+export function IcpProposalsCard() {
+  const qc = useQueryClient();
+  const query = useQuery({
+    queryKey: ["icp-proposals"],
+    queryFn: () => api.icpProposals(),
+    refetchInterval: 60_000,
+  });
+  const invalidate = (): void => {
+    void qc.invalidateQueries({ queryKey: ["icp-proposals"] });
+    void qc.invalidateQueries({ queryKey: ["setup"] });
+  };
+  const approve = useMutation({
+    mutationFn: (id: string) => api.approveIcpProposal(id),
+    onSuccess: () => {
+      toast.success("ICP updated");
+      invalidate();
+    },
+    onError: (err: Error) => toast.error(`couldn't approve · ${err.message}`),
+  });
+  const dismiss = useMutation({
+    mutationFn: (id: string) => api.dismissIcpProposal(id),
+    onSuccess: invalidate,
+    onError: (err: Error) => toast.error(`couldn't dismiss · ${err.message}`),
+  });
+  const proposals = query.data?.proposals ?? [];
+  if (proposals.length === 0) return null;
+  return (
+    <section className="space-y-3 border-b border-ink-rule px-6 py-4">
+      {proposals.map((p) => (
+        <div
+          key={p.id}
+          className="rounded-sm border border-[color:var(--ink-receipt)]/50 bg-[color:var(--ink-receipt)]/6 p-3"
+        >
+          <div className="ln-eyebrow" style={{ color: "var(--ink-receipt-2)" }}>
+            Proposed ICP rewrite
+          </div>
+          <div className="mt-1 grid gap-1 text-[13px] leading-5">
+            <div className="text-ink-muted">
+              Current: <span className="text-ink-cream-2">{p.currentIcp}</span>
+            </div>
+            <div className="text-ink-cream">
+              Proposed: <span className="font-medium">{p.proposedIcp}</span>
+            </div>
+          </div>
+          <p className="mt-1.5 text-[12px] leading-5 text-ink-muted">{p.evidenceSummary}</p>
+          <div className="mt-2 flex items-center gap-2">
+            <Button
+              size="sm"
+              disabled={approve.isPending || dismiss.isPending || READ_ONLY}
+              onClick={() => approve.mutate(p.id)}
+              {...readOnly}
+            >
+              Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={approve.isPending || dismiss.isPending || READ_ONLY}
+              onClick={() => dismiss.mutate(p.id)}
+              {...readOnly}
+            >
+              Dismiss
+            </Button>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function EmptyQueueHelp({ filterActive }: { filterActive: boolean }) {
+  if (filterActive) {
+    return (
+      <div className="p-5">
+        <EmptyNote note="No queue rows match this filter. Try a different status or play above to see other rows." />
+      </div>
+    );
+  }
+  return (
+    <div className="p-5">
+      <EmptyNote
+        note="No targets yet. Run a finder from the Triggers panel above, or add one prospect by hand — either way candidates land here for review before any send."
+        cli="oneshot-gtm find watch"
+      />
+    </div>
+  );
+}
+
+// Event metadata: present only on luma-events payloads (the persisted
+// LumaEventsTarget). All return null for other plays so the chip + EVENT strip
+// render nothing on non-luma rows.
+function eventTitleFor(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const v = (payload as Record<string, unknown>)["eventTitle"];
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function eventDateFor(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const v = (payload as Record<string, unknown>)["eventDate"];
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function eventCityFor(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const v = (payload as Record<string, unknown>)["eventCity"];
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function eventUrlFor(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const v = (payload as Record<string, unknown>)["eventUrl"];
+  if (typeof v !== "string" || v.length === 0) return null;
+  // Defense in depth: payload comes from sqlite; only render a real Luma link,
+  // never a javascript:// or data:// URL. Mirrors linkedinUrlFor. The finder
+  // stores luma.com/<slug> (see packages/find/src/luma.ts); lu.ma is the short host.
+  return /^https?:\/\/(?:[a-z0-9-]+\.)*(?:luma\.com|lu\.ma)\//i.test(v) ? v : null;
+}
+
+// Relationship to the event ("Host" vs "Guest"): fed to the prompt and worth
+// surfacing for review so a host isn't read as a mere attendee.
+function eventRoleFor(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const v = (payload as Record<string, unknown>)["role"];
+  return typeof v === "string" && v.length > 0 ? v : null;
+}

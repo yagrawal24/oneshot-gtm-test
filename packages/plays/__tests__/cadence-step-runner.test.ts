@@ -1,0 +1,819 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const calls = {
+  sendEmail: 0,
+  llm: 0,
+  lastSendEmailArgs: null as { to: string; subject: string; body: string } | null,
+  lastSendEmailCtx: null as {
+    playName: string;
+    memo?: string;
+    decisionContext?: Record<string, unknown>;
+  } | null,
+};
+
+let cadenceRows: Array<{
+  prospect_id: number;
+  play_name: string;
+  current_step: number;
+  status: string;
+  enrolled_at: string;
+  next_due_at: string | null;
+  last_polled_at: string | null;
+  next_step_draft_json: string | null;
+  next_step_drafted_at: string | null;
+  prospect_email: string | null;
+  prospect_name: string | null;
+  prospect_company: string | null;
+}> = [];
+let lastDraftDiscardReason: string | null = null;
+let persistedDraft: {
+  subject: string;
+  body: string;
+  flags: string[];
+  payload: unknown;
+  draftedAt: string;
+} | null = null;
+const advanceCalls: Array<{
+  prospectId: number;
+  playName: string;
+  newStep: number;
+  nextDueAt: string | null;
+}> = [];
+const sendErrorCalls: Array<{ prospectId: number; playName: string; error: string }> = [];
+const statusCalls: Array<{ prospectId: number; playName: string; status: string }> = [];
+let mailDraft: any = null;
+let mailSends = 0;
+let throwOnSend = false;
+let deferOnSend = false;
+// Simulates a sequence_events row already existing at the step about to be sent
+// (nextIndex). The crash-mid-send state the re-send guard must catch.
+let alreadySentNextStep = false;
+// Simulates a prior hard bounce for this cadence's prospect.
+let suppression: { status_code: string | null; bounced_at: string } | null = null;
+let contactSuppression: { kind: string; received_at: string } | null = null;
+let icpVerdict: { verdict: string; reason: string | null } | null = null;
+let meetingOutcome: { outcome: string; note: string | null; summary: string | null } | null = null;
+const stopCalls: Array<{ prospectId: number; playName: string; reason: string; note?: string }> =
+  [];
+
+vi.mock("@oneshot-gtm/core", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/core")>("@oneshot-gtm/core");
+  return {
+    ...actual,
+    loadConfig: () => ({
+      walletMode: "cdp",
+      llmProvider: "anthropic",
+      llmModel: "test",
+      telemetryEnabled: false,
+      founderName: "J",
+      founderEmail: "j@x.dev",
+      productOneLiner: "TestProduct",
+      productDomain: null,
+      sendingDomain: null,
+      icpOneLiner: null,
+      cadenceOverrides: null,
+      founderCredentials: null,
+      productPortfolio: null,
+      partners: null,
+      mobileSignature: false,
+      clientId: null,
+    }),
+    sendEmail: async (
+      input: { to: string; subject: string; body: string },
+      ctx: {
+        playName: string;
+        memo?: string;
+        decisionContext?: Record<string, unknown>;
+      },
+    ) => {
+      if (deferOnSend) {
+        const e = new Error("deferred: daily send caps reached");
+        e.name = "SendDeferredError";
+        throw e;
+      }
+      if (throwOnSend) throw new Error("Job failed: Tool execution failed. (ref: test123)");
+      calls.sendEmail++;
+      calls.lastSendEmailArgs = input;
+      calls.lastSendEmailCtx = ctx;
+      return { receiptId: 7 };
+    },
+    listInbox: async () => ({ emails: [], has_more: false }),
+    sendDirectMail: async () => {
+      mailSends++;
+      return mailDraft;
+    },
+    getLedger: () => ({
+      getCadencePlan: () => null,
+      getDirectMail: () => mailDraft,
+      findDirectMail: () => null,
+      // Opener-frequency cap: no send history in these fakes, so nothing is worn out.
+      recentSentEmailBodies: () => [],
+      // Reply-poll plumbing: no watermark, nothing to record (inbox is stubbed empty).
+      getPollWatermark: () => null,
+      setPollWatermark: () => {},
+      recordProspectReply: () => [],
+      // Null by default: most tests exercise the normal send path.
+      suppressionFor: () => suppression,
+      contactSuppressionFor: () => contactSuppression,
+      latestMeetingOutcomeFor: () => meetingOutcome,
+      stopCadence: (input: {
+        prospectId: number;
+        playName: string;
+        reason: string;
+        note?: string;
+      }) => {
+        stopCalls.push(input);
+        const row = cadenceRows.find(
+          (c) => c.prospect_id === input.prospectId && c.play_name === input.playName,
+        );
+        if (row) row.status = "stopped";
+        return true;
+      },
+      listAllCadences: () => cadenceRows,
+      listActiveCadences: () => cadenceRows.filter((c) => c.status === "active"),
+      listCadencesForProspect: (prospectId: number) =>
+        cadenceRows.filter((c) => c.prospect_id === prospectId),
+      getCadence: (prospectId: number, playName: string) =>
+        cadenceRows.find((c) => c.prospect_id === prospectId && c.play_name === playName) ?? null,
+      getProspectById: (id: number) => {
+        const row = cadenceRows.find((c) => c.prospect_id === id);
+        return row
+          ? {
+              id: row.prospect_id,
+              name: row.prospect_name,
+              email: row.prospect_email,
+              company: row.prospect_company,
+              linkedin_url: null,
+              dossier_json: null,
+              source: "test",
+              phone: null,
+              icp_verdict: icpVerdict?.verdict ?? null,
+              icp_verdict_reason: icpVerdict?.reason ?? null,
+              created_at: "now",
+            }
+          : null;
+      },
+      findProspectByEmail: () => null,
+      listSequenceEventsForProspectPlay: () => [],
+      hasSentSequenceEvent: () => alreadySentNextStep,
+      recordSequenceEvent: () => 0,
+      setCadenceStatus: (input: { prospectId: number; playName: string; status: string }) => {
+        statusCalls.push(input);
+      },
+      recordCadenceSendError: (input: { prospectId: number; playName: string; error: string }) => {
+        sendErrorCalls.push(input);
+      },
+      advanceCadence: (input: {
+        prospectId: number;
+        playName: string;
+        newStep: number;
+        nextDueAt: string | null;
+      }) => {
+        advanceCalls.push(input);
+        const row = cadenceRows.find(
+          (c) => c.prospect_id === input.prospectId && c.play_name === input.playName,
+        );
+        if (row) {
+          row.current_step = input.newStep;
+          row.next_due_at = input.nextDueAt;
+          row.next_step_draft_json = null;
+          row.next_step_drafted_at = null;
+        }
+        persistedDraft = null;
+      },
+      setCadenceDraft: (input: {
+        prospectId: number;
+        playName: string;
+        draft: { subject: string; body: string; flags: string[]; payload: unknown };
+        discardReason?: string;
+      }) => {
+        lastDraftDiscardReason = input.discardReason ?? null;
+        persistedDraft = { ...input.draft, draftedAt: new Date().toISOString() };
+        const row = cadenceRows.find(
+          (c) => c.prospect_id === input.prospectId && c.play_name === input.playName,
+        );
+        if (row) row.next_step_draft_json = JSON.stringify(persistedDraft);
+      },
+      getCadenceDraft: () => persistedDraft,
+      clearCadenceDraft: () => {
+        persistedDraft = null;
+      },
+      // The loadProspect helper in _cadence.ts pokes db.query directly; surface
+      // a minimal stub that returns a fake ProspectRecord by id.
+      db: {
+        query: (_sql: string) => ({
+          get: (id: number) => {
+            const row = cadenceRows.find((c) => c.prospect_id === id);
+            return row
+              ? {
+                  id: row.prospect_id,
+                  name: row.prospect_name,
+                  email: row.prospect_email,
+                  company: row.prospect_company,
+                  linkedin_url: null,
+                  dossier_json: null,
+                  source: "test",
+                  created_at: new Date().toISOString(),
+                }
+              : null;
+          },
+        }),
+      },
+    }),
+  };
+});
+
+vi.mock("@oneshot-gtm/intel", async () => {
+  const actual = await vi.importActual<typeof import("@oneshot-gtm/intel")>("@oneshot-gtm/intel");
+  return {
+    ...actual,
+    loadPrompt: () => "system",
+    complete: async () => {
+      calls.llm++;
+      return {
+        content: JSON.stringify({ subject: "fresh subject", body: "fresh body" }),
+        provider: "test",
+        model: "test",
+      };
+    },
+  };
+});
+
+const {
+  previewCadenceStep,
+  sendCadenceStep,
+  sendDirectMailCadenceStep,
+  runCadenceStepForProspect,
+} = await import("../src/_cadence.ts");
+// Ensure stack-consolidation's sequence is registered.
+await import("../src/stack-consolidation.ts");
+
+function seedActiveCadence(): void {
+  cadenceRows = [
+    {
+      prospect_id: 1,
+      play_name: "stack-consolidation",
+      current_step: 0,
+      status: "active",
+      enrolled_at: new Date().toISOString(),
+      next_due_at: new Date(Date.now() - 1000).toISOString(), // overdue
+      last_polled_at: null,
+      next_step_draft_json: null,
+      next_step_drafted_at: null,
+      prospect_email: "p@x.dev",
+      prospect_name: "Pat",
+      prospect_company: "Acme",
+    },
+  ];
+}
+
+beforeEach(() => {
+  mailDraft = null;
+  mailSends = 0;
+  calls.sendEmail = 0;
+  calls.llm = 0;
+  calls.lastSendEmailArgs = null;
+  calls.lastSendEmailCtx = null;
+  persistedDraft = null;
+  advanceCalls.length = 0;
+  sendErrorCalls.length = 0;
+  statusCalls.length = 0;
+  throwOnSend = false;
+  deferOnSend = false;
+  alreadySentNextStep = false;
+  suppression = null;
+  contactSuppression = null;
+  icpVerdict = null;
+  meetingOutcome = null;
+  stopCalls.length = 0;
+  seedActiveCadence();
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
+
+describe("previewCadenceStep", () => {
+  it("builds + persists a draft, never calls sendEmail", async () => {
+    const out = await previewCadenceStep({
+      prospectId: 1,
+      playName: "stack-consolidation",
+    });
+    expect(calls.llm).toBe(1);
+    expect(calls.sendEmail).toBe(0);
+    expect(out.subject).toBe("fresh subject");
+    expect(out.body).toBe("fresh body");
+    expect(out.flags).toEqual([]); // clean draft
+    expect(persistedDraft).toMatchObject({ subject: "fresh subject", body: "fresh body" });
+    // A preview is the founder asking for a draft: the one it replaces was
+    // rejected on its text (the follow-up keeps the classifier's angle).
+    expect(lastDraftDiscardReason).toBe("regenerate");
+  });
+
+  it("refuses on a non-active cadence", async () => {
+    cadenceRows[0]!.status = "replied";
+    await expect(
+      previewCadenceStep({ prospectId: 1, playName: "stack-consolidation" }),
+    ).rejects.toThrow(/replied/);
+  });
+
+  it("refuses when no cadence exists for that pair", async () => {
+    cadenceRows = [];
+    await expect(
+      previewCadenceStep({ prospectId: 1, playName: "stack-consolidation" }),
+    ).rejects.toThrow(/no cadence/);
+  });
+});
+
+describe("sendCadenceStep", () => {
+  it("sends the previewed draft verbatim and advances current_step", async () => {
+    await previewCadenceStep({ prospectId: 1, playName: "stack-consolidation" });
+    const result = await sendCadenceStep({
+      prospectId: 1,
+      playName: "stack-consolidation",
+    });
+    expect(calls.sendEmail).toBe(1);
+    expect(calls.lastSendEmailArgs).toMatchObject({
+      to: "p@x.dev",
+      subject: "fresh subject",
+      body: "fresh body",
+      // Keyed on (play, prospect, step), never the draft text: a re-draft keeps it.
+      idempotencyKey: expect.stringMatching(/^gtm:[^:]+:email:stack-consolidation:prospect:1:\d+$/),
+    });
+    expect(result.action).toBe("step-sent");
+    expect(advanceCalls).toHaveLength(1);
+    expect(advanceCalls[0]).toMatchObject({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      newStep: 1,
+    });
+    // Advance clears the persisted draft (mocked side effect of advanceCadence).
+    expect(persistedDraft).toBeNull();
+  });
+
+  it("refuses to send without a persisted preview", async () => {
+    await expect(
+      sendCadenceStep({ prospectId: 1, playName: "stack-consolidation" }),
+    ).rejects.toThrow(/no persisted preview/);
+  });
+
+  it("refuses to send a draft the lint held, so the API matches the disabled button", async () => {
+    await previewCadenceStep({ prospectId: 1, playName: "stack-consolidation" });
+    persistedDraft = { ...persistedDraft!, flags: ["opener-overused"] };
+    await expect(
+      sendCadenceStep({ prospectId: 1, playName: "stack-consolidation" }),
+    ).rejects.toThrow(/held by lint \(opener-overused\)/);
+    expect(calls.sendEmail).toBe(0);
+  });
+
+  it("attaches audit context (memo + decisionContext.source='cadence') to the SDK call", async () => {
+    await previewCadenceStep({ prospectId: 1, playName: "stack-consolidation" });
+    await sendCadenceStep({ prospectId: 1, playName: "stack-consolidation" });
+    expect(calls.lastSendEmailCtx).toMatchObject({
+      playName: "stack-consolidation",
+      memo: expect.stringMatching(/^stack-consolidation step 1.*→ p@x\.dev$/),
+      decisionContext: expect.objectContaining({
+        source: "cadence",
+        prospectId: 1,
+        prospectEmail: "p@x.dev",
+        stepIndex: 1,
+      }),
+    });
+  });
+});
+
+describe("runCadenceStepForProspect — reply-stream do-not-send gate", () => {
+  it("an unsubscribe skips before drafting and stops the cadence as unsubscribed", async () => {
+    contactSuppression = { kind: "unsubscribe", received_at: "2026-08-27T16:00:00.000Z" };
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/asked not to be contacted/);
+    expect(calls.llm).toBe(0);
+    expect(calls.sendEmail).toBe(0);
+    expect(statusCalls).toEqual([
+      { prospectId: 1, playName: "stack-consolidation", status: "unsubscribed" },
+    ]);
+  });
+
+  it("a dead-mailbox verdict stops the cadence as bounced", async () => {
+    contactSuppression = { kind: "auto_permanent", received_at: "2026-08-27T16:00:00.000Z" };
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/mailbox reported dead/);
+    expect(calls.sendEmail).toBe(0);
+    expect(statusCalls).toEqual([
+      { prospectId: 1, playName: "stack-consolidation", status: "bounced" },
+    ]);
+  });
+});
+
+describe("runCadenceStepForProspect — off-ICP gate", () => {
+  it("refuses to draft or send for a rejected prospect and stops the cadence", async () => {
+    // Code-level gate: the intro was the mistake, follow-ups compound it.
+    // Must fire BEFORE the LLM draft (no spend on a prospect we won't email)
+    // and set a distinct terminal status so reporting stays honest.
+    icpVerdict = { verdict: "reject", reason: "Account Executive is a sales role" };
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/off-ICP: Account Executive/);
+    expect(calls.llm).toBe(0);
+    expect(calls.sendEmail).toBe(0);
+    expect(statusCalls).toEqual([
+      { prospectId: 1, playName: "stack-consolidation", status: "off-icp" },
+    ]);
+  });
+
+  it("a pass verdict sends normally", async () => {
+    icpVerdict = { verdict: "pass", reason: "CTO" };
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("step-sent");
+    expect(calls.sendEmail).toBe(1);
+  });
+
+  it("an unjudged prospect (NULL verdict) sends normally — the gate is opt-in by audit", async () => {
+    icpVerdict = null;
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("step-sent");
+    expect(calls.sendEmail).toBe(1);
+  });
+});
+
+describe("runCadenceStepForProspect — meeting-outcome gate (issue #578)", () => {
+  it("a held meeting stops the cadence before drafting, with an honest stop_reason", async () => {
+    meetingOutcome = { outcome: "held", note: null, summary: "Intro call" };
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/meeting held/);
+    expect(calls.llm).toBe(0);
+    expect(calls.sendEmail).toBe(0);
+    expect(stopCalls).toEqual([
+      {
+        prospectId: 1,
+        playName: "stack-consolidation",
+        reason: "other",
+        note: "meeting held — cadence superseded by a real conversation",
+      },
+    ]);
+  });
+
+  it("a no-show is NOT terminal — the cadence still drafts and sends", async () => {
+    meetingOutcome = { outcome: "no_show", note: null, summary: null };
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("step-sent");
+    expect(calls.sendEmail).toBe(1);
+    expect(stopCalls).toHaveLength(0);
+  });
+
+  it("cancelled/rescheduled outcomes do not stop the cadence — neither meeting ever happened", async () => {
+    meetingOutcome = { outcome: "cancelled", note: null, summary: null };
+    let result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("step-sent");
+    // advanceCadence clears the persisted draft between runs; re-seed for the
+    // second call in this same test.
+    seedActiveCadence();
+    meetingOutcome = { outcome: "rescheduled", note: null, summary: null };
+    result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("step-sent");
+    expect(stopCalls).toHaveLength(0);
+  });
+
+  it("no meeting on the prospect at all sends normally — unchanged from before #578", async () => {
+    meetingOutcome = null;
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("step-sent");
+    expect(calls.sendEmail).toBe(1);
+    expect(stopCalls).toHaveLength(0);
+  });
+
+  it("dryRun: a held meeting reports skipped but must NOT stop the live cadence (finding PRRT_kwDOSKzrBs6gwORi)", async () => {
+    meetingOutcome = { outcome: "held", note: null, summary: "Intro call" };
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: true,
+    });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/meeting held/);
+    expect(calls.llm).toBe(0);
+    expect(calls.sendEmail).toBe(0);
+    // The critical assertion: a preview must never write the stop. That
+    // would cancel a real cadence (clear its schedule + pending draft) from
+    // what the caller believed was a read-only dry run.
+    expect(stopCalls).toHaveLength(0);
+  });
+});
+
+describe("runCadenceStepForProspect", () => {
+  it("dryRun: builds but does not send + does not advance", async () => {
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: true,
+    });
+    expect(calls.llm).toBe(1);
+    expect(calls.sendEmail).toBe(0);
+    expect(result.action).toBe("step-sent");
+    expect(advanceCalls).toHaveLength(1); // advance still happens in dryRun (cadence state moves; just no SDK send)
+  });
+
+  it("records the send error and rethrows on a hard send failure, without advancing", async () => {
+    throwOnSend = true;
+    await expect(
+      runCadenceStepForProspect({ prospectId: 1, playName: "stack-consolidation", dryRun: false }),
+    ).rejects.toThrow(/Tool execution failed/);
+    expect(sendErrorCalls).toHaveLength(1);
+    expect(sendErrorCalls[0]).toMatchObject({ prospectId: 1, playName: "stack-consolidation" });
+    expect(sendErrorCalls[0]!.error).toContain("Tool execution failed");
+    // A failed send must NOT advance the cadence (it stays due for retry).
+    expect(advanceCalls).toHaveLength(0);
+  });
+
+  it("does NOT record a send error on a daily-cap deferral (it just stays due)", async () => {
+    deferOnSend = true;
+    await expect(
+      runCadenceStepForProspect({ prospectId: 1, playName: "stack-consolidation", dryRun: false }),
+    ).rejects.toThrow(/deferred/);
+    expect(sendErrorCalls).toHaveLength(0);
+    expect(advanceCalls).toHaveLength(0);
+  });
+
+  it("does not record a send error on a successful send", async () => {
+    await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(sendErrorCalls).toHaveLength(0);
+    expect(advanceCalls).toHaveLength(1);
+  });
+
+  it("skips a now-replied cadence (founder previewed then prospect replied)", async () => {
+    cadenceRows[0]!.status = "replied";
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(calls.sendEmail).toBe(0);
+    expect(result.action).toBe("skipped");
+    expect(result.note).toContain("replied");
+  });
+
+  it("returns 'completed' action when current_step is past the last registered step", async () => {
+    // stack-consolidation has 2 follow-up steps (value follow-up + breakup).
+    // current_step = 2 means both have already fired; nextIndex = 3 is past
+    // the end → terminal completion path.
+    cadenceRows[0]!.current_step = 2;
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("completed");
+    expect(calls.sendEmail).toBe(0);
+    expect(calls.llm).toBe(0);
+  });
+
+  it("returns 'skipped' with 'no cadence' note when no cadence row exists", async () => {
+    cadenceRows = [];
+    const result = await runCadenceStepForProspect({
+      prospectId: 999,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/no cadence/i);
+  });
+
+  it("re-send guard: reconciles (advances without sending) when nextIndex already has a sent event", async () => {
+    // The crash-mid-send state: the step was dispatched + recorded but the
+    // process died before advanceCadence, leaving current_step lagging. The
+    // guard must advance past it WITHOUT re-sending, and without even drafting.
+    alreadySentNextStep = true;
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(calls.sendEmail).toBe(0);
+    expect(calls.llm).toBe(0); // guard short-circuits before the builder
+    expect(advanceCalls).toHaveLength(1);
+    expect(advanceCalls[0]).toMatchObject({ prospectId: 1, newStep: 1 });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/already sent/i);
+  });
+
+  it("re-send guard: does NOT skip when nextIndex has no event (181-186 style — only enrollment sent)", async () => {
+    // current_step 0 with only the enrollment (step_index 0) sent, no step_index
+    // 1 event → the guard keys on nextIndex (1), finds nothing, and the overdue
+    // step-1 follow-up dispatches normally exactly once.
+    alreadySentNextStep = false;
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(calls.sendEmail).toBe(1);
+    expect(result.action).toBe("step-sent");
+    expect(advanceCalls).toHaveLength(1);
+  });
+
+  it("re-send guard: a reconciled breakup step lands in 'breakup', not advanced/completed", async () => {
+    // stack-consolidation's last step (index 1) is the breakup. current_step 1 →
+    // nextIndex 2 = the breakup step. If it already went out, reconcile must set
+    // 'breakup' (same terminal transition a real send would), not advance.
+    alreadySentNextStep = true;
+    cadenceRows[0]!.current_step = 1;
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: false,
+    });
+    expect(calls.sendEmail).toBe(0);
+    expect(advanceCalls).toHaveLength(0); // breakup sets status, never advances
+    expect(statusCalls).toContainEqual({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      status: "breakup",
+    });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/breakup/i);
+  });
+
+  it("re-send guard: does not fire on dryRun (previews never advance a real cadence)", async () => {
+    alreadySentNextStep = true;
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "stack-consolidation",
+      dryRun: true,
+    });
+    // dryRun bypasses the guard, builds the preview, and takes the normal
+    // dryRun advance path (no send).
+    expect(calls.sendEmail).toBe(0);
+    expect(result.action).toBe("step-sent");
+  });
+
+  it("returns 'skipped' with 'no registered sequence' note for unknown play", async () => {
+    cadenceRows[0]!.play_name = "unknown-play";
+    const result = await runCadenceStepForProspect({
+      prospectId: 1,
+      playName: "unknown-play",
+      dryRun: false,
+    });
+    expect(result.action).toBe("skipped");
+    expect(result.note).toMatch(/no registered sequence/i);
+  });
+
+  describe("hard-bounce suppression", () => {
+    it("skips a suppressed prospect without drafting or sending", async () => {
+      // sendEmail would refuse this anyway, but only after an LLM draft has
+      // been paid for. The whole point of checking here is to not spend.
+      suppression = { status_code: "5.1.1", bounced_at: "2026-08-01T10:00:00.000Z" };
+      const result = await runCadenceStepForProspect({
+        prospectId: 1,
+        playName: "stack-consolidation",
+        dryRun: false,
+      });
+
+      expect(result.action).toBe("skipped");
+      expect(result.note).toMatch(/suppressed/i);
+      expect(calls.llm).toBe(0);
+      expect(calls.sendEmail).toBe(0);
+    });
+
+    it("marks the cadence bounced rather than leaving it due forever", async () => {
+      suppression = { status_code: "5.1.1", bounced_at: "2026-08-01T10:00:00.000Z" };
+      await runCadenceStepForProspect({
+        prospectId: 1,
+        playName: "stack-consolidation",
+        dryRun: false,
+      });
+
+      expect(statusCalls).toEqual([
+        { prospectId: 1, playName: "stack-consolidation", status: "bounced" },
+      ]);
+      // NOT recorded as a send failure: that renders as "retrying", and a dead
+      // address will never accept a retry.
+      expect(sendErrorCalls).toEqual([]);
+      expect(advanceCalls).toEqual([]);
+    });
+
+    it("leaves an unsuppressed prospect on the normal path", async () => {
+      suppression = null;
+      const result = await runCadenceStepForProspect({
+        prospectId: 1,
+        playName: "stack-consolidation",
+        dryRun: false,
+      });
+      expect(result.action).not.toBe("skipped");
+      expect(calls.sendEmail).toBe(1);
+    });
+  });
+});
+
+describe("cross-workspace hold (draft-time advisory)", () => {
+  it("skips the step with a 'held' note when another workspace emailed the prospect this week", async () => {
+    const { getSharedDb } = await import("@oneshot-gtm/core");
+    process.env["ONESHOT_GTM_WORKSPACE"] = "gtm";
+    try {
+      getSharedDb().recordTouch({ email: "p@x.dev", workspace: "sdk", playName: "post-funding" });
+      const out = await runCadenceStepForProspect({
+        prospectId: 1,
+        playName: "stack-consolidation",
+        mode: "preview",
+      } as never);
+      expect(out.action).toBe("skipped");
+      expect(out.note).toMatch(/held: emailed by workspace 'sdk'/);
+      // Decided BEFORE paying for a draft, and without touching the cadence status.
+      expect(calls.llm).toBe(0);
+      expect(statusCalls).toEqual([]);
+    } finally {
+      delete process.env["ONESHOT_GTM_WORKSPACE"];
+    }
+  });
+});
+
+describe("mailpiece cadence recovery", () => {
+  beforeEach(() => {
+    cadenceRows[0]!.prospect_email = "mail-recovery@example.test";
+    mailDraft = {
+      id: "mail-1",
+      prospectId: 1,
+      playName: "stack-consolidation",
+      enrollment: cadenceRows[0]!.enrolled_at,
+      stepIndex: 1,
+      order: { order_id: "order-1", order_status: "accepted" },
+    };
+    persistedDraft = {
+      subject: "Direct mail",
+      body: "Reviewed",
+      flags: [],
+      payload: { kind: "direct_mail", draftId: "mail-1" },
+      draftedAt: new Date().toISOString(),
+    };
+  });
+  it("advances an accepted mailpiece and makes repeated recovery harmless", async () => {
+    const recovered = await sendDirectMailCadenceStep("mail-1");
+    expect(recovered.action, JSON.stringify(recovered)).toBe("step-sent");
+    expect(advanceCalls).toHaveLength(1);
+    expect((await sendDirectMailCadenceStep("mail-1")).action).toBe("skipped");
+    expect(mailSends).toBe(1);
+    expect(calls.sendEmail).toBe(0);
+  });
+  it("does not dispatch a later step from an old mailpiece action", async () => {
+    cadenceRows[0]!.current_step = 1;
+    persistedDraft!.payload = { kind: "email", subject: "next", body: "next" };
+    expect((await sendDirectMailCadenceStep("mail-1")).action).toBe("skipped");
+    expect(calls.sendEmail).toBe(0);
+    expect(mailSends).toBe(0);
+  });
+  it("does not dispatch a new enrollment or a mismatched preview", async () => {
+    mailDraft.enrollment = "previous-enrollment";
+    expect((await sendDirectMailCadenceStep("mail-1")).action).toBe("skipped");
+    mailDraft.enrollment = cadenceRows[0]!.enrolled_at;
+    persistedDraft!.payload = { kind: "email", subject: "next", body: "next" };
+    await expect(sendDirectMailCadenceStep("mail-1")).rejects.toThrow("does not match");
+    expect(calls.sendEmail).toBe(0);
+    expect(mailSends).toBe(0);
+  });
+});

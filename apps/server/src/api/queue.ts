@@ -1,0 +1,1665 @@
+import { draftAngleFor, parseDraftAngle } from "./_draft-angle.ts";
+import { toDraftVersionView } from "./_draft-versions.ts";
+import {
+  companyRecordFromResearch,
+  extractBusinessAddress,
+  isPersonResearchDossier,
+  personRecordFromResearch,
+  channelOf,
+  isWithdrawnStatus,
+  xHandleFrom,
+  firstTouchSender,
+  linkedInOutreachAccount,
+  isOutreachChannel,
+  channelAddresses,
+} from "@oneshot-gtm/core";
+import {
+  currentWorkspaceName,
+  getLedger,
+  isDraining,
+  loadConfig,
+  isRecentlyContacted,
+  isSendDeferred,
+  parseProspectPriority,
+  sqliteToIso,
+  type QueueRow,
+  type QueueSearchOpts,
+  type QueueSearchRow,
+  type QueueStatus,
+  type TelemetryOutcome,
+} from "@oneshot-gtm/core";
+import {
+  drainQueue,
+  isDudDomain,
+  portableQueuePayload,
+  rankPendingRows,
+  resolveQueueTarget,
+  safeEnrichCompany,
+  scheduleNewsfeedOnApproval,
+  type MovedFrom,
+} from "@oneshot-gtm/find";
+import { ensureWorkspaceRunning, resolveOtherWorkspace } from "./workspace.ts";
+import {
+  MANUAL_PLAYS,
+  PLAYS,
+  enrollInCadence,
+  generateRejectReason,
+  logTargetError,
+  playMetadata,
+  sendDraftedEmail,
+  draftLinkedInNote,
+  draftXDm,
+  sendLinkedInInvite,
+} from "@oneshot-gtm/plays";
+import { reportServerExecution } from "../telemetry.ts";
+import {
+  blockingFlags,
+  isQueueImportInProgress,
+  type ImportQueueRowRequest,
+  type ImportQueueRowResult,
+  type MoveQueueRowResult,
+  type DrainRequest,
+  type DrainResult,
+  type LastDraft,
+  parseQueueIds,
+  type DecidedByFilter,
+  type ProspectBrowseRow,
+  type ProspectPriorityView,
+  type ProspectSearchResponse,
+  type ProspectSortKey,
+  type QueueCounts,
+  type QueueListResponse,
+  type QueueRowDetail,
+  type QueueRowView,
+  type RunPlayRequest,
+  type SendDeliveryView,
+} from "@oneshot-gtm/shared-types";
+import { jsonResponse } from "../server.ts";
+import { callLinkedIn } from "../linkedin-client.ts";
+import { sendsToday } from "./_capacity.ts";
+import { dispatchPlay } from "./_play-dispatch.ts";
+import { buildProspectTimeline } from "./_prospect-timeline.ts";
+import { viewsForRows } from "./cadences.ts";
+
+/**
+ * Shape-check a stored priority artifact via the shared core validator:
+ * strict integers 0..100 on every score, so corruption like `total: -1` or
+ * `personFit: 999` reads as null instead of rendering. The backfill's
+ * resume-skip uses the same validator, so anything hidden here is seen as
+ * unscored and repaired on the next `find score-prospects` run.
+ */
+function parsePriority(raw: string | null): ProspectPriorityView | null {
+  return parseProspectPriority(raw);
+}
+
+/** Resolve the same fresh-verdict precedence used by the email send gate. */
+function emailFitHold(payload: unknown): QueueRowView["sendHold"] {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const p = payload as Record<string, unknown>;
+  let verdict = p.icpVerdict;
+  let reason = p.icpVerdictReason;
+  if (verdict !== "pass" && verdict !== "reject" && verdict !== "unclear") {
+    const email = typeof p.email === "string" && p.email.trim() ? p.email.trim() : p.founderEmail;
+    if (typeof email !== "string" || !email) return null;
+    const ledger = getLedger();
+    const existing = ledger.findProspectByEmail(email);
+    const stored = existing ? ledger.getProspectById(existing.id) : null;
+    verdict = stored?.icp_verdict;
+    reason = stored?.icp_verdict_reason;
+  }
+  return verdict === "reject"
+    ? {
+        code: "off-icp",
+        reason:
+          typeof reason === "string" && reason.trim()
+            ? reason
+            : "Saved assessment says this person does not fit the target customer profile.",
+      }
+    : null;
+}
+
+export function toView(row: QueueRow): QueueRowView {
+  let payload: unknown = null;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    payload = row.payload_json;
+  }
+  let lastDraft: LastDraft | null = null;
+  if (row.last_draft_json) {
+    try {
+      const parsed = JSON.parse(row.last_draft_json) as Partial<LastDraft>;
+      // Shape check: schema drift must not crash the queue listing.
+      if (parsed && typeof parsed.subject === "string" && typeof parsed.body === "string") {
+        lastDraft = {
+          subject: parsed.subject,
+          body: parsed.body,
+          flags: Array.isArray(parsed.flags) ? parsed.flags : [],
+          sent: parsed.sent === true,
+          receiptIds: Array.isArray(parsed.receiptIds) ? parsed.receiptIds : [],
+          dryRun: parsed.dryRun === true,
+          draftedAt: typeof parsed.draftedAt === "string" ? parsed.draftedAt : "",
+          ...(parseDraftAngle(parsed.angle) ? { angle: parseDraftAngle(parsed.angle)! } : {}),
+          ...(typeof parsed.voiceKey === "string" && parsed.voiceKey
+            ? { voiceKey: parsed.voiceKey }
+            : {}),
+          ...(typeof parsed.formatKey === "string" && parsed.formatKey
+            ? { formatKey: parsed.formatKey }
+            : {}),
+          ...(parsed.enrichmentFailed === true ? { enrichmentFailed: true } : {}),
+        };
+      }
+    } catch {
+      lastDraft = null;
+    }
+  }
+  return {
+    id: row.id,
+    playName: row.play_name,
+    channel: channelOf(row.channel),
+    sender: firstTouchSender(channelOf(row.channel)),
+    payload,
+    sendHold:
+      channelOf(row.channel) === "email" && row.status !== "sent" && !lastDraft?.sent
+        ? emailFitHold(payload)
+        : null,
+    dedupeKey: row.dedupe_key,
+    source: row.source,
+    status: row.status,
+    foundAt: sqliteToIso(row.found_at),
+    reviewedAt: row.reviewed_at,
+    sentAt: row.sent_at,
+    notes: row.notes,
+    prospectId: row.prospect_id,
+    lastDraft,
+    lastDraftedAt: row.last_drafted_at,
+    isSending: row.send_started_at != null,
+    priority: parsePriority(row.priority_json),
+    // `?? null`: pre-v26 rows and test fakes may not carry the columns.
+    decision: row.decision ?? null,
+    decidedBy: row.decided_by ?? null,
+    decidedAt: row.decided_at ?? null,
+    delivery: deliveryFor(row.status, lastDraft),
+  };
+}
+
+/**
+ * The Sent-folder delivery check of a sent row's first touch, when one ran.
+ * Best-effort: a ledger without the table (or a test fake) reads as none.
+ */
+function deliveryFor(status: string, lastDraft: LastDraft | null): SendDeliveryView | null {
+  if (status !== "sent" || !lastDraft?.receiptIds?.length) return null;
+  try {
+    return getLedger().sendDelivery.forReceipts(
+      lastDraft.receiptIds.filter((n): n is number => typeof n === "number"),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function toBrowseRow(row: QueueSearchRow): ProspectBrowseRow {
+  return {
+    ...toView(row),
+    prospect:
+      row.p_id == null
+        ? null
+        : {
+            id: row.p_id,
+            name: row.p_name,
+            email: row.p_email,
+            company: row.p_company,
+            title: row.p_title,
+            icpVerdict: row.p_icp_verdict,
+            icpVerdictReason: row.p_icp_verdict_reason,
+            hasDossier: row.p_has_dossier === 1,
+            linkedBy: row.p_linked_by_email === 1 ? "email" : "prospect_id",
+          },
+  };
+}
+
+const QUEUE_STATUS_VALUES = new Set<QueueStatus>([
+  "pending",
+  "approved",
+  "rejected",
+  "sent",
+  "expired",
+]);
+const SORT_KEYS: Record<ProspectSortKey, QueueSearchOpts["sort"]> = {
+  found: "found_at",
+  decided: "decided_at",
+  name: "name",
+};
+const DECIDED_FILTERS = new Set<DecidedByFilter>(["human", "machine", "none"]);
+/** Longest search string accepted: anything longer is a paste, not a search. */
+const MAX_QUERY_CHARS = 200;
+
+/**
+ * GET /api/queue/search. The /prospects browse view. Every queue row, any
+ * status, with free-text search, sort and offset paging. `status` is a comma
+ * list; absent means all. Junk values fall back rather than 400: a stale
+ * bookmark should still open the page.
+ */
+export function searchQueueRoute(req: Request): Response {
+  const url = new URL(req.url);
+  const q = (url.searchParams.get("q") ?? "").trim().slice(0, MAX_QUERY_CHARS);
+  const statuses = (url.searchParams.get("status") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s): s is QueueStatus => QUEUE_STATUS_VALUES.has(s as QueueStatus));
+  const playName = url.searchParams.get("play") ?? undefined;
+  const decidedRaw = url.searchParams.get("decided");
+  const decidedBy = DECIDED_FILTERS.has(decidedRaw as DecidedByFilter)
+    ? (decidedRaw as DecidedByFilter)
+    : undefined;
+  const sortRaw = url.searchParams.get("sort");
+  // Own-property check: `"toString" in SORT_KEYS` is true via the prototype.
+  const sort =
+    sortRaw && Object.hasOwn(SORT_KEYS, sortRaw)
+      ? SORT_KEYS[sortRaw as ProspectSortKey]
+      : "found_at";
+  const dir = url.searchParams.get("dir") === "asc" ? "asc" : "desc";
+  const limit = Math.min(
+    200,
+    Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50),
+  );
+  const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0);
+
+  const ledger = getLedger();
+  const opts: QueueSearchOpts = { limit, offset, sort, dir, withTotal: false };
+  if (q) opts.q = q;
+  if (statuses.length > 0) opts.statuses = statuses;
+  if (playName) opts.playName = playName;
+  if (decidedBy) opts.decidedBy = decidedBy;
+  const { rows } = ledger.searchQueue(opts);
+  const countOpts: Pick<QueueSearchOpts, "q" | "playName" | "decidedBy"> = {};
+  if (q) countOpts.q = q;
+  if (playName) countOpts.playName = playName;
+  if (decidedBy) countOpts.decidedBy = decidedBy;
+  // The facets are computed under every filter but status, so the total of
+  // the selected statuses IS the page total: no separate COUNT(*) scan.
+  const counts = ledger.searchQueueStatusCounts(countOpts);
+  const selected = statuses.length > 0 ? statuses : ([...QUEUE_STATUS_VALUES] as QueueStatus[]);
+  const total = [...new Set(selected)].reduce((n, st) => n + counts[st], 0);
+  const body: ProspectSearchResponse = {
+    rows: rows.map(toBrowseRow),
+    total,
+    limit,
+    offset,
+    counts,
+    plays: ledger.listQueuePlayNames(),
+  };
+  return jsonResponse(body, 200, req);
+}
+
+function payloadString(row: QueueRow, ...keys: string[]): string | null {
+  try {
+    const p = JSON.parse(row.payload_json) as Record<string, unknown> | null;
+    if (!p || typeof p !== "object") return null;
+    for (const key of keys) {
+      const v = p[key];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function payloadEmail(row: QueueRow): string | null {
+  return payloadString(row, "email", "founderEmail");
+}
+
+/** The prospect a queue row resolves to: its FK, else the payload's email. */
+function resolveProspectId(ledger: ReturnType<typeof getLedger>, row: QueueRow): number | null {
+  if (row.prospect_id != null) return row.prospect_id;
+  const email = payloadEmail(row);
+  return email ? (ledger.findProspectByEmail(email)?.id ?? null) : null;
+}
+
+/**
+ * Has this person answered, on any channel? Human email replies, LinkedIn
+ * replies, or a step whose status flipped to `replied` (legacy rows that
+ * predate `inbox_replies`). Overrides must not email past this.
+ */
+function prospectHasReplied(ledger: ReturnType<typeof getLedger>, prospectId: number): boolean {
+  return (
+    ledger.listInboxRepliesForProspect(prospectId).some((r) => (r.kind ?? "human") === "human") ||
+    ledger.listChannelEventsForProspect(prospectId).some((e) => e.event_type === "reply") ||
+    ledger.listSequenceEventsForProspect(prospectId).some((e) => e.status === "replied")
+  );
+}
+
+/**
+ * GET /api/queue/:id. The /prospects detail drawer. The queue row, the
+ * prospect it resolved to, and everything recorded against that prospect.
+ * Reads only; nothing here spends (no `gatherReplyContext`).
+ */
+export function queueRowDetailRoute(req: Request, params: Record<string, string>): Response {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+
+  const email = payloadEmail(row);
+  const prospectId = resolveProspectId(ledger, row);
+  const prospect = prospectId != null ? ledger.getProspectById(prospectId) : null;
+  const linkedBy = row.prospect_id != null ? "prospect_id" : "email";
+
+  const browseRow = toBrowseRow({
+    ...row,
+    p_id: prospect?.id ?? null,
+    p_name: prospect?.name ?? null,
+    p_email: prospect?.email ?? null,
+    p_company: prospect?.company ?? null,
+    p_title: prospect?.title ?? null,
+    p_icp_verdict: prospect?.icp_verdict ?? null,
+    p_icp_verdict_reason: prospect?.icp_verdict_reason ?? null,
+    p_has_dossier: prospect?.dossier_json && prospect.dossier_json.trim() ? 1 : 0,
+    p_linked_by_email: prospect && linkedBy === "email" ? 1 : 0,
+  });
+
+  const cadences = prospect ? viewsForRows(ledger.listCadencesForProspect(prospect.id)) : [];
+  const sequenceEvents = prospect ? ledger.listAllSequenceEventsForProspect(prospect.id) : [];
+  const deliveries = new Map<number, SendDeliveryView>();
+  for (const ev of sequenceEvents) {
+    try {
+      const d = ledger.sendDelivery.forSequenceEvent(ev.id);
+      if (d) deliveries.set(ev.id, d);
+    } catch {
+      // A ledger without the delivery table reads as no checks.
+    }
+  }
+  const timeline = buildProspectTimeline({
+    row,
+    sequenceEvents,
+    replies: prospect ? ledger.listInboxRepliesForProspect(prospect.id) : [],
+    channelEvents: prospect ? ledger.listChannelEventsForProspect(prospect.id) : [],
+    outcomes: prospect ? ledger.listDealOutcomesForProspect(prospect.id) : [],
+    deliveries,
+  });
+  const flagEmail = prospect?.email ?? email;
+  const contactSuppressed = flagEmail ? ledger.contactSuppressionFor(flagEmail) : null;
+  const body: QueueRowDetail = {
+    row: browseRow,
+    prospect:
+      prospect && browseRow.prospect
+        ? {
+            ...browseRow.prospect,
+            linkedinUrl: prospect.linkedin_url,
+            createdAt: prospect.created_at,
+          }
+        : null,
+    cadences,
+    timeline,
+    flags: {
+      replied: prospect ? prospectHasReplied(ledger, prospect.id) : false,
+      bounced: flagEmail ? ledger.suppressionFor(flagEmail) != null : false,
+      contactSuppressed: contactSuppressed?.kind ?? null,
+      breakupHold: flagEmail ? ledger.breakupReviveHoldFor(flagEmail) != null : false,
+      // The prospect record wins; a row that was never emailed only carries
+      // the gate's verdict on its payload.
+      icpReject:
+        prospect != null
+          ? prospect.icp_verdict === "reject"
+          : payloadString(row, "icpVerdict") === "reject",
+    },
+  };
+  return jsonResponse(body, 200, req);
+}
+
+/**
+ * Rank a wider pending window in memory, then slice the page. Ranking uses
+ * interleaving, scores within each finder, and exploration (find/_rank.ts).
+ * Rows beyond the window are excluded.
+ */
+const RANK_WINDOW = 1000;
+
+export function listQueueRoute(req: Request): Response {
+  const url = new URL(req.url);
+  const playName = url.searchParams.get("play") ?? undefined;
+  const status = (url.searchParams.get("status") ?? undefined) as QueueStatus | undefined;
+  // `?ids=1,2,3`: explicit row pick. A present-but-unusable value yields
+  // `[]`, NOT `undefined`: falling back to the unscoped batch would hand the
+  // caller rows it never picked.
+  const ids = parseQueueIds(url.searchParams.get("ids"));
+  const limit = Math.min(500, Number.parseInt(url.searchParams.get("limit") ?? "200", 10) || 200);
+  const ledger = getLedger();
+  const orderParam = url.searchParams.get("order");
+  const requestedOrder =
+    orderParam === "ranked" || orderParam === "newest"
+      ? orderParam
+      : (loadConfig().queueReviewOrder ?? "newest");
+  // Ranked order exists for ONE surface: the pending review list. Explicit id
+  // picks and every other status keep chronological order.
+  const ranked = requestedOrder === "ranked" && status === "pending" && !ids;
+  const filterArgs: {
+    playName?: string;
+    status?: QueueStatus;
+    limit?: number;
+    ids?: number[];
+  } = { limit: ranked ? RANK_WINDOW : ids ? Math.max(limit, ids.length) : limit };
+  if (playName) filterArgs.playName = playName;
+  if (status) filterArgs.status = status;
+  if (ids) filterArgs.ids = ids;
+  const rows = ledger.listQueue(filterArgs);
+  const ordered = ranked ? rankPendingRows(rows).slice(0, limit) : rows;
+  const counts: QueueCounts = ledger.queueCounts();
+  // Unfiltered on purpose. The drain button needs per-play approved counts
+  // regardless of the page's current filter.
+  let views: QueueRowView[];
+  try {
+    views = ordered.map((row) =>
+      url.searchParams.get("forRun") === "1"
+        ? Object.assign(toView(row), { payload: resolveQueueTarget(row) })
+        : toView(row),
+    );
+  } catch (error) {
+    return jsonResponse({ error: (error as Error).message }, 400, req);
+  }
+  const body: QueueListResponse = {
+    rows: views,
+    counts,
+    approvedByPlay: ledger.approvedCountsByPlay(),
+    order: ranked ? "ranked" : "newest",
+  };
+  const capacity = sendsToday();
+  if (capacity) body.sendsToday = capacity;
+  return jsonResponse(body, 200, req);
+}
+
+export async function approveQueueRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  if (isQueueImportInProgress(row)) {
+    return jsonResponse(
+      { error: "CSV import is still being classified; try again when it finishes" },
+      409,
+      req,
+    );
+  }
+  // Drain picks up every `approved` row, so re-approving a sent one would
+  // email the same person again. /prospects can reach sent rows; /queue
+  // never offered the button on them.
+  if (row.status === "sent") {
+    return jsonResponse({ error: "row already sent; re-approving would re-send" }, 409, req);
+  }
+  // An override (a row that already left `pending`) must not re-open a
+  // conversation the prospect has answered: a breakup-revive row expires with
+  // "prospect replied", and nothing downstream of `approved` checks that.
+  if (row.status !== "pending") {
+    const prospectId = resolveProspectId(ledger, row);
+    if (prospectId != null && prospectHasReplied(ledger, prospectId)) {
+      return jsonResponse(
+        { error: "prospect has replied; approving would email them mid-conversation" },
+        409,
+        req,
+      );
+    }
+  }
+  ledger.setQueueStatus({ id, status: "approved", decidedBy: "human" });
+  // Recent posts are bought on approval, in the background: the response
+  // never waits on them, and a failed capture never fails the approval.
+  scheduleNewsfeedOnApproval([id]);
+  return jsonResponse({ ok: true }, 200, req);
+}
+
+/** `dequeueApproved`'s default lease: a row claimed more recently than this is mid-drain. */
+const DRAIN_LEASE_MS = 15 * 60 * 1000;
+
+/**
+ * The source row's note once it has been handed over: a human reason is
+ * kept and the destination appended; otherwise the destination alone. Never
+ * `auto:`. The founder clicked.
+ */
+export function moveNote(existing: string | null | undefined, workspace: string): string {
+  const moved = `moved to ${workspace}`;
+  const prior = existing?.trim() ?? "";
+  if (!prior || MACHINE_PREFIX.test(prior)) return moved;
+  if (prior.includes(moved)) return prior;
+  return `${prior} · ${moved}`.slice(0, REJECT_REASON_MAX_CHARS);
+}
+
+function isImportRequest(body: unknown): body is ImportQueueRowRequest {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  const b = body as Record<string, unknown>;
+  const from = b["movedFrom"];
+  return (
+    typeof b["playName"] === "string" &&
+    b["playName"].trim() !== "" &&
+    typeof b["dedupeKey"] === "string" &&
+    b["dedupeKey"].trim() !== "" &&
+    typeof b["source"] === "string" &&
+    !!b["payload"] &&
+    typeof b["payload"] === "object" &&
+    !Array.isArray(b["payload"]) &&
+    !!from &&
+    typeof from === "object" &&
+    typeof (from as { workspace?: unknown }).workspace === "string" &&
+    typeof (from as { queueId?: unknown }).queueId === "number"
+  );
+}
+
+/**
+ * POST /api/queue/import. The destination side of a move. Another workspace's
+ * server on this machine hands over a row; only loopback callers get here
+ * (the Host and Origin gates in server.ts). The row lands `pending` for
+ * review, with the person's research intact and the sender's positioning
+ * and verdicts stripped (queue-portable.ts). A rejected/expired row this
+ * workspace already holds for the same play + dedupe key is re-opened rather
+ * than refused. That is how a prospect comes back after a move away.
+ */
+export async function importQueueRowRoute(req: Request): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return jsonResponse({ error: "JSON body required" }, 400, req);
+  }
+  if (!isImportRequest(body)) {
+    return jsonResponse(
+      {
+        error:
+          "body must be {playName, dedupeKey, source, payload, movedFrom:{workspace, queueId}}",
+      },
+      400,
+      req,
+    );
+  }
+  const playName = body.playName.trim();
+  if (!(playName in PLAYS) && !(playName in MANUAL_PLAYS)) {
+    return jsonResponse({ error: `unknown play '${playName}'` }, 400, req);
+  }
+  const portable = portableQueuePayload(body.payload);
+  if (!portable) return jsonResponse({ error: "payload must be an object" }, 400, req);
+  const movedFrom: MovedFrom = {
+    workspace: body.movedFrom.workspace,
+    queueId: body.movedFrom.queueId,
+    at: new Date().toISOString(),
+  };
+  const payload = { ...portable, movedFrom };
+  const notes = `moved from ${movedFrom.workspace}`;
+  const ledger = getLedger();
+  const dedupeKey = body.dedupeKey.trim();
+  const inserted = ledger.enqueueTarget({
+    playName,
+    payload,
+    dedupeKey,
+    source: body.source,
+    notes,
+  });
+  if (inserted != null) {
+    const out: ImportQueueRowResult = { queueId: inserted, reused: false };
+    return jsonResponse(out, 201, req);
+  }
+  // Unique (play_name, dedupe_key): this workspace already has the person on
+  // this play. Re-open it unless it actually went out from here.
+  const existing = ledger.getQueueRowByDedupe(playName, dedupeKey);
+  if (!existing) return jsonResponse({ error: "could not enqueue the row" }, 500, req);
+  if (existing.status === "sent" || existing.sent_at != null || existing.send_started_at != null) {
+    return jsonResponse(
+      { error: `already sent to this person from this workspace (row #${existing.id})` },
+      409,
+      req,
+    );
+  }
+  // Draft first, status last: a draft written here against an older
+  // payload/edge must not be sendable verbatim, and if the process dies
+  // between these writes the row is left rejected with no draft (harmless)
+  // rather than pending with a stale one that a later approval could send.
+  ledger.clearQueueDraft(existing.id);
+  ledger.updateQueuePayload({ id: existing.id, payload });
+  ledger.setQueueStatus({ id: existing.id, status: "pending", notes });
+  const out: ImportQueueRowResult = { queueId: existing.id, reused: true };
+  return jsonResponse(out, 200, req);
+}
+
+/**
+ * POST /api/queue/:id/move {workspace}: hand this row to another workspace.
+ * The destination is started if it is not running, the row is imported
+ * through its own API, and only then is the row here rejected with a
+ * `moved to <workspace>` note so it never drafts from this workspace again.
+ * A sent or in-flight row cannot move (it is already a conversation here).
+ */
+export async function moveQueueRowRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  let workspace = "";
+  try {
+    const body = (await req.json()) as { workspace?: unknown };
+    if (typeof body.workspace === "string") workspace = body.workspace.trim();
+  } catch {
+    // fall through to the empty guard
+  }
+  if (!workspace) return jsonResponse({ error: "body must be {workspace: string}" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  if (row.status === "sent" || row.sent_at != null || row.send_started_at != null) {
+    return jsonResponse({ error: "row already sent from here; it cannot move" }, 409, req);
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    return jsonResponse({ error: "row payload is not valid JSON" }, 400, req);
+  }
+  const portable = portableQueuePayload(payload);
+  if (!portable) return jsonResponse({ error: "row payload is not an object" }, 400, req);
+  // A drain that has leased this row is mid-send: its play.run is awaiting
+  // and will stamp `sent` when it lands. Moving underneath it would hand the
+  // destination a person this workspace is emailing right now.
+  if (row.drain_claimed_at && Date.now() - Date.parse(row.drain_claimed_at) < DRAIN_LEASE_MS) {
+    return jsonResponse(
+      { error: "row is being drained right now; try again in a few minutes" },
+      409,
+      req,
+    );
+  }
+
+  // The destination must exist and not be us before anything is written.
+  const target = resolveOtherWorkspace(workspace);
+  if (!target.ok) return jsonResponse({ error: target.error }, target.status, req);
+
+  // Reserve the row before anything is awaited: `rejected` is the one status
+  // neither the drain (`dequeueApproved` takes `approved` only) nor send-draft
+  // will touch, so nothing can send it while the destination starts up and
+  // imports. Restored verbatim if the hand-over fails.
+  const previous = { status: row.status, notes: row.notes };
+  const note = moveNote(row.notes, workspace);
+  ledger.setQueueStatus({ id, status: "rejected", decidedBy: "human", notes: note });
+  const restore = (): void => {
+    ledger.setQueueStatus({
+      id,
+      status: previous.status,
+      ...(previous.status === "rejected" ? { decidedBy: "human" as const } : {}),
+    });
+    ledger.setQueueNotes({ id, notes: previous.notes ?? "" });
+  };
+
+  const dest = await ensureWorkspaceRunning(workspace);
+  if (!dest.ok) {
+    restore();
+    return jsonResponse({ error: dest.error }, dest.status, req);
+  }
+
+  const request: ImportQueueRowRequest = {
+    playName: row.play_name,
+    dedupeKey: row.dedupe_key,
+    source: row.source ?? "manual",
+    payload: portable,
+    movedFrom: { workspace: currentWorkspaceName(), queueId: row.id },
+  };
+  let imported: ImportQueueRowResult;
+  try {
+    const res = await fetch(`http://127.0.0.1:${dest.port}/api/queue/import`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const out = (await res.json().catch(() => ({}))) as Partial<ImportQueueRowResult> & {
+      error?: string;
+    };
+    if (!res.ok || typeof out.queueId !== "number") {
+      restore();
+      return jsonResponse(
+        { error: `${workspace}: ${out.error ?? `import failed (${res.status})`}` },
+        res.status >= 400 && res.status < 600 ? res.status : 502,
+        req,
+      );
+    }
+    imported = { queueId: out.queueId, reused: out.reused === true };
+  } catch (err) {
+    restore();
+    return jsonResponse(
+      { error: `${workspace}: could not reach its server — ${(err as Error).message}` },
+      502,
+      req,
+    );
+  }
+
+  // The destination holds the row. If a send that was already in flight
+  // landed meanwhile (the `sent` write ignores status), say so rather than
+  // pretend: the person was emailed from here AND is now queued there.
+  const after = ledger.getQueueRow(id);
+  if (after && (after.status === "sent" || after.sent_at != null)) {
+    return jsonResponse(
+      {
+        error: `sent from here while moving; ${workspace} now holds them as pending (row #${imported.queueId}) — reject it there`,
+      },
+      409,
+      req,
+    );
+  }
+  const result: MoveQueueRowResult = {
+    ok: true,
+    destination: { name: workspace, port: dest.port, ...imported },
+  };
+  return jsonResponse(result, 200, req);
+}
+
+/**
+ * The same cap the auto-reject gates apply to their notes
+ * (`packages/find/src/_qualify.ts`): the column is one freeform slot and the
+ * timeline renders it whole.
+ */
+export const REJECT_REASON_MAX_CHARS = 300;
+
+/**
+ * The `auto:` prefix is how `isAutoRejected` (score-prospects) and the
+ * pre-v26 `isHumanDecision` arm tell a machine negative from a human one, and
+ * both read `notes` unconditionally. A human-submitted reason must never carry
+ * it, or the founder's own decision gets counted as the machine's.
+ */
+const MACHINE_PREFIX = /^auto:/i;
+
+/**
+ * Body → the note to write, or an error. `undefined` means the key was absent
+ * (leave the note alone); `""` means the founder emptied the box (clear it).
+ */
+export function parseRejectReason(body: unknown): { reason?: string } | { error: string } {
+  if (!body || typeof body !== "object" || !("reason" in body)) return {};
+  const raw = (body as { reason: unknown }).reason;
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== "string") return { error: "reason must be a string" };
+  const reason = raw.replace(/\s+/g, " ").trim().slice(0, REJECT_REASON_MAX_CHARS);
+  if (MACHINE_PREFIX.test(reason)) {
+    return { error: "reason can't start with 'auto:' — that prefix marks machine decisions" };
+  }
+  return { reason };
+}
+
+export async function rejectQueueRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  let body: unknown = {};
+  try {
+    body = await req.json();
+  } catch {
+    // empty body is fine
+  }
+  const parsed = parseRejectReason(body);
+  if ("error" in parsed) return jsonResponse({ error: parsed.error }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  ledger.setQueueStatus({
+    id,
+    status: "rejected",
+    decidedBy: "human",
+    ...(parsed.reason !== undefined ? { notes: parsed.reason } : {}),
+  });
+  return jsonResponse({ ok: true }, 200, req);
+}
+
+/** How long the reject box waits on a company lookup before judging without it. */
+const REJECT_ENRICH_DEADLINE_MS = 12_000;
+
+/** The domain a company lookup can key on: the address's, else the payload's own. */
+export function rejectLookupDomain(payload: unknown): string | null {
+  const p = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const email = typeof p.email === "string" ? p.email.trim().toLowerCase() : "";
+  const fromEmail = email.includes("@") ? email.split("@")[1]! : "";
+  const own =
+    typeof p.companyDomain === "string"
+      ? p.companyDomain
+      : typeof p.domain === "string"
+        ? p.domain
+        : "";
+  // Normalize first, then peel: scheme, www., and anything from the first
+  // path, query or fragment separator on. " HTTPS://WWW.Acme.dev?ref=x " is
+  // acme.dev, not "https:".
+  const domain = (fromEmail || own)
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split(/[/?#]/)[0]!
+    .trim();
+  return domain || null;
+}
+
+/**
+ * Preview a one-sentence rejection reason when no stored gate reason or machine
+ * negative exists. Write nothing; return { reason: null } on provider failure
+ * or no mismatch.
+ * Prefer a stored dossier. Otherwise try one bounded enrichCompany lookup by
+ * domain ($0.005) for founding year, headcount, and funding stage. Skip personal
+ * provider addresses and omit failed or slow lookups.
+ */
+export async function suggestRejectReasonRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  let payload: unknown;
+  try {
+    payload = resolveQueueTarget(row);
+  } catch (err) {
+    const error =
+      err instanceof SyntaxError ? "row payload is not valid JSON" : (err as Error).message;
+    return jsonResponse({ error }, 400, req);
+  }
+  // Research the row already carries (pre-send: `payload.personResearch`;
+  // post-send: the prospect's dossier) beats a paid lookup.
+  const research = (payload as { personResearch?: unknown } | null)?.personResearch;
+  const researched =
+    isPersonResearchDossier(research) && research.status !== "unavailable" ? research : null;
+  const dossier =
+    row.prospect_id != null
+      ? (ledger.getProspectById(row.prospect_id)?.dossier_json ?? null)
+      : researched
+        ? JSON.stringify({ person: personRecordFromResearch(researched) })
+        : null;
+  let company: Record<string, unknown> | null = researched
+    ? companyRecordFromResearch(researched)
+    : null;
+  const domain = dossier?.trim() || company ? null : rejectLookupDomain(payload);
+  if (domain && !isDudDomain(domain)) {
+    // The SDK gets the deadline too (totalTimeoutMs), so a slow lookup is
+    // cancelled end to end rather than merely released here.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const enriched = await Promise.race([
+      safeEnrichCompany(
+        { domain, timeoutMs: REJECT_ENRICH_DEADLINE_MS },
+        {
+          playName: row.play_name,
+          memo: "company facts before prefilling a reject reason",
+          decisionContext: { reason: "queue row has no dossier; reject box prefill", queueId: id },
+        },
+      ),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), REJECT_ENRICH_DEADLINE_MS + 500);
+      }),
+    ]).finally(() => clearTimeout(timer));
+    const record = enriched && enriched.result.status !== "error" ? enriched.result.company : null;
+    if (record && Object.keys(record).length > 0) company = record as Record<string, unknown>;
+  }
+  const reason = await generateRejectReason({ playName: row.play_name, payload, dossier, company });
+  return jsonResponse(
+    reason
+      ? { reason, source: "llm", researched: company !== null }
+      : { reason: null, source: null, researched: company !== null },
+    200,
+    req,
+  );
+}
+
+export async function approveAllRoute(req: Request): Promise<Response> {
+  let body: { play?: string } = {};
+  try {
+    body = (await req.json()) as { play?: string };
+  } catch {
+    // empty body is fine
+  }
+  const ledger = getLedger();
+  // The bulk UPDATE returns a count, not ids: take the pending ids first so
+  // the rows it approves get their posts captured (in the background; the
+  // capture re-checks each row is still approved).
+  const pendingIds = ledger
+    .listQueue({ status: "pending", limit: 100_000, ...(body.play ? { playName: body.play } : {}) })
+    .map((row) => row.id);
+  const n = ledger.approveAllPending(body.play ? { playName: body.play } : {});
+  if (n > 0) scheduleNewsfeedOnApproval(pendingIds);
+  return jsonResponse({ approved: n }, 200, req);
+}
+
+export async function drainQueueRoute(req: Request): Promise<Response> {
+  let body: DrainRequest;
+  try {
+    body = (await req.json()) as DrainRequest;
+  } catch {
+    return jsonResponse({ error: "invalid JSON body" }, 400, req);
+  }
+  if (!body.playName) return jsonResponse({ error: "playName required" }, 400, req);
+  const t0 = performance.now();
+  let outcome: TelemetryOutcome = "ok";
+  try {
+    const account = linkedInOutreachAccount();
+    const result = await drainQueue({
+      playName: body.playName,
+      limit: body.limit ?? 10,
+      dryRun: !!body.dryRun,
+      linkedIn: account
+        ? {
+            accountId: account.accountId,
+            workspace: account.workspace,
+            call: (operation) => callLinkedIn(account.workspace, operation),
+          }
+        : null,
+    });
+    const view: DrainResult = {
+      drained: result.drained,
+      sent: result.sent,
+      errors: result.errors,
+      ...(result.haltedReason ? { haltedReason: result.haltedReason } : {}),
+    };
+    return jsonResponse(view, 200, req);
+  } catch (err) {
+    outcome = "error";
+    throw err;
+  } finally {
+    void reportServerExecution("server.queue.drain", {
+      outcome,
+      durationMs: performance.now() - t0,
+      flags: body.dryRun ? ["dry-run"] : [],
+    });
+  }
+}
+
+/**
+ * Re-draft a single queue row in PREVIEW mode and overwrite its persisted
+ * draft. Always dry-run: enrichment is skipped and nothing is sent, even
+ * when the fresh draft is lint-clean.
+ */
+const generatingDrafts = new Set<number>();
+
+export async function regenerateDraftRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (generatingDrafts.has(id))
+    return jsonResponse(
+      { error: "Already generating this draft; wait for it to finish." },
+      409,
+      req,
+    );
+  generatingDrafts.add(id);
+  try {
+    return await regenerateDraftInner(req, params);
+  } finally {
+    generatingDrafts.delete(id);
+  }
+}
+
+async function regenerateDraftInner(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  // Once sent, last_draft_json IS the frozen sent content. Never overwrite it.
+  if (row.status === "sent") return jsonResponse({ error: "row already sent" }, 400, req);
+  // A send claimed the row but hasn't flipped status yet: refuse to start a
+  // regenerate that would race it.
+  if (row.send_started_at != null) {
+    return jsonResponse({ error: "send in flight, can't regenerate" }, 409, req);
+  }
+
+  let target: unknown;
+  try {
+    target = resolveQueueTarget(row);
+  } catch (err) {
+    const error =
+      err instanceof SyntaxError ? "row payload is not valid JSON" : (err as Error).message;
+    return jsonResponse({ error }, 400, req);
+  }
+
+  let rotate = false;
+  try {
+    const raw = await req.text();
+    const options: unknown = raw.trim() ? JSON.parse(raw) : {};
+    if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error();
+    const value = (options as { rotateAngle?: unknown }).rotateAngle;
+    if (value !== undefined && typeof value !== "boolean") throw new Error();
+    rotate = value === true;
+  } catch {
+    return jsonResponse({ error: "rotateAngle must be a boolean" }, 400, req);
+  }
+  let previous: Partial<LastDraft> = {};
+  try {
+    previous = JSON.parse(row.last_draft_json ?? "{}");
+  } catch {
+    /* legacy draft */
+  }
+  if (previous?.sent === true) return jsonResponse({ error: "draft already sent" }, 400, req);
+  let angle: LastDraft["angle"];
+  try {
+    const research =
+      row.prospect_id != null ? ledger.getProspectById(row.prospect_id)?.dossier_json : null;
+    angle = await draftAngleFor({
+      ...(research ? { research } : {}),
+      target,
+      playName: row.play_name,
+      ...(parseDraftAngle(previous?.angle) ? { previous: parseDraftAngle(previous.angle)! } : {}),
+      ...(typeof previous?.body === "string" ? { previousBody: previous.body } : {}),
+      rotate,
+    });
+  } catch (err) {
+    return jsonResponse({ error: (err as Error).message }, 400, req);
+  }
+
+  // The target retains queued prospect facts with current trigger edges.
+  const body: RunPlayRequest = {
+    dryRun: true,
+    targets: [target],
+  };
+
+  let drafted: Awaited<ReturnType<typeof dispatchPlay>>;
+  try {
+    // A LinkedIn row is drafted as a connection-request note with the play's
+    // signal, not as the play's email (channels.ts).
+    const draftRow = {
+      id: row.id,
+      playName: row.play_name,
+      payload: target && typeof target === "object" ? (target as Record<string, unknown>) : {},
+      notes: row.notes,
+    };
+    drafted =
+      channelOf(row.channel) === "x" && row.play_name !== "x-amplify-dm"
+        ? [
+            {
+              ...(await draftXDm(draftRow, { draftAngle: angle?.text ?? null })),
+              sent: false,
+              receiptIds: [],
+            },
+          ]
+        : channelOf(row.channel) === "linkedin"
+          ? [
+              {
+                ...(await draftLinkedInNote(
+                  {
+                    id: row.id,
+                    playName: row.play_name,
+                    payload:
+                      target && typeof target === "object"
+                        ? (target as Record<string, unknown>)
+                        : {},
+                    notes: row.notes,
+                  },
+                  { draftAngle: angle?.text ?? null },
+                )),
+                sent: false,
+                receiptIds: [],
+              },
+            ]
+          : await dispatchPlay(row.play_name, body, undefined, undefined, angle?.text);
+  } catch (err) {
+    return jsonResponse({ error: (err as Error).message }, 400, req);
+  }
+  const draft = drafted[0];
+  if (!draft || !draft.body.trim() || draft.flags.some((f) => f.startsWith("error:"))) {
+    return jsonResponse(
+      { error: "Draft generation failed. Your existing draft is unchanged; try again." },
+      500,
+      req,
+    );
+  }
+
+  // TOCTOU close: re-read after the multi-second dispatchPlay await. A
+  // concurrent send completing mid-LLM-call must not get its canonical sent
+  // body/receiptIds overwritten below.
+  const fresh = ledger.getQueueRow(id);
+  if (!fresh || fresh.status === "sent" || fresh.send_started_at != null) {
+    return jsonResponse({ error: "send completed (or started) during regenerate" }, 409, req);
+  }
+
+  const out: LastDraft = {
+    subject: draft.subject,
+    body: draft.body,
+    flags: draft.flags,
+    sent: false,
+    receiptIds: [],
+    dryRun: true,
+    draftedAt: new Date().toISOString(),
+    ...(angle ? { angle } : {}),
+    ...(draft.enrichmentFailed ? { enrichmentFailed: true } : {}),
+    // The voice card the draft was written with, so its version splits by voice.
+    ...(draft.voiceKey ? { voiceKey: draft.voiceKey } : {}),
+    // The first-touch format arm, so outcomes split by format.
+    ...(draft.formatKey ? { formatKey: draft.formatKey } : {}),
+  };
+  const saved = ledger.setQueueDraftIfCurrent({
+    id,
+    previousDraft: row.last_draft_json ?? null,
+    previousPayload: row.payload_json,
+    previousChannel: row.channel,
+    draft: out,
+    // What the founder said about the draft this replaces: rotate = the
+    // angle was wrong, plain regenerate = the text was (angle kept).
+    discardReason: rotate ? "rotate" : "regenerate",
+  });
+  if (!saved)
+    return jsonResponse(
+      { error: "Draft changed during generation; refresh and try again." },
+      409,
+      req,
+    );
+  return jsonResponse(out, 200, req);
+}
+
+/**
+ * Record that a MANUAL play's draft was sent by hand (e.g. x-amplify-dm: the
+ * founder copied the DM text and sent it from the X app). No transport, no
+ * receipt: writes the prospect + a step-0 sequence event on the play's manual
+ * channel and flips the row to `sent`. Only plays in MANUAL_PLAYS qualify;
+ * everything else must go through the real send route.
+ */
+export async function markSentRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  // Hand-sent channels only (X DMs today: channels.ts); every other channel
+  // goes through its real sender.
+  const channel = channelOf(row.channel);
+  if (firstTouchSender(channel) !== "manual") {
+    return jsonResponse(
+      { error: `${row.play_name} rows are sent on ${channel}, not by hand — use send-draft` },
+      400,
+      req,
+    );
+  }
+  if (row.status === "sent") return jsonResponse({ error: "row already marked sent" }, 400, req);
+  // Same review gate as the send path: only an approved row may be recorded
+  // as sent: marking a rejected (or never-reviewed) row would silently
+  // un-reject it and log outreach to a person the founder killed.
+  if (row.status !== "approved") {
+    return jsonResponse(
+      { error: `row is ${row.status} — approve it before marking sent` },
+      400,
+      req,
+    );
+  }
+  if (!row.last_draft_json) {
+    return jsonResponse({ error: "no draft on this row — drain or regenerate first" }, 400, req);
+  }
+  let draft: Partial<LastDraft>;
+  try {
+    draft = JSON.parse(row.last_draft_json) as Partial<LastDraft>;
+  } catch {
+    return jsonResponse({ error: "stored draft is not valid JSON" }, 400, req);
+  }
+  const body = typeof draft.body === "string" ? draft.body : "";
+  if (!body) return jsonResponse({ error: "stored draft is empty" }, 400, req);
+
+  let payload: Record<string, unknown> = {};
+  try {
+    const p = JSON.parse(row.payload_json);
+    if (p && typeof p === "object") payload = p as Record<string, unknown>;
+  } catch {
+    // tolerated: prospect fields below just come up null
+  }
+  const pstr = (k: string): string | null => (typeof payload[k] === "string" ? payload[k] : null);
+  // The profile the touch went to. `prospects.linkedin_url` holds whichever
+  // social profile a prospect was reached on (it has always carried X URLs).
+  // On X that is the handle the draft was addressed to (handle first, then
+  // the profile URL: draftXDm's order), recorded as its profile URL.
+  const xHandle = xHandleFrom(pstr("handle")) ?? xHandleFrom(pstr("twitterUrl"));
+  if (channel === "x" && !xHandle) {
+    return jsonResponse({ error: "this row has no X handle to have sent it to" }, 400, req);
+  }
+  const profileUrl = channel === "linkedin" ? pstr("linkedinUrl") : `https://x.com/${xHandle}`;
+
+  const prospectId = ledger.upsertProspect({
+    name: pstr("name"),
+    email: null,
+    linkedin_url: profileUrl,
+    source: row.play_name,
+    source_profile_url: profileUrl,
+  });
+  ledger.recordSequenceEvent({
+    prospectId,
+    playName: row.play_name,
+    stepIndex: 0,
+    channel,
+    status: "sent",
+    metadata: { body, ...playMetadata(row.play_name, payload) },
+  });
+  try {
+    ledger.setQueueProspectId(row.id, prospectId);
+  } catch {
+    // best-effort backfill. The marked send is already recorded
+  }
+  // A per-row human action (manually sent via another channel).
+  ledger.setQueueStatus({ id: row.id, status: "sent", decidedBy: "human" });
+  // No draft write on this path: close the reviewed draft's version by hand.
+  try {
+    ledger.closeQueueDraftVersion(row.id, "sent");
+  } catch {
+    // older ledgers / test doubles without draft versions. The send is recorded regardless
+  }
+  return jsonResponse({ ok: true, prospectId }, 200, req);
+}
+
+/**
+ * Every draft this row went through, newest first: what the founder
+ * regenerated or rotated away from, and what was finally sent.
+ */
+export function queueDraftVersionsRoute(req: Request, params: Record<string, string>): Response {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  const versions = ledger.draftVersionsFor({ queueId: id }).map(toDraftVersionView);
+  return jsonResponse({ versions }, 200, req);
+}
+
+/**
+ * Send the row's already-reviewed draft VERBATIM (no LLM re-roll) via
+ * `sendDraftedEmail`, then enroll the cadence and flip the row to `sent`.
+ * Requires a clean (lint-flag-free), not-yet-sent draft.
+ */
+export async function sendDraftRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  // Server is draining for shutdown: don't start a new send.
+  if (isDraining()) {
+    return jsonResponse({ error: "server restarting — retry in a moment" }, 503, req);
+  }
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  if (row.status === "sent") return jsonResponse({ error: "row already sent" }, 400, req);
+  if (row.status !== "approved") {
+    return jsonResponse({ error: `row is ${row.status}; approve it before sending` }, 409, req);
+  }
+  if (!row.last_draft_json) {
+    return jsonResponse({ error: "no draft to send — regenerate a draft first" }, 400, req);
+  }
+
+  let parsed: Partial<LastDraft>;
+  try {
+    parsed = JSON.parse(row.last_draft_json) as Partial<LastDraft>;
+  } catch {
+    return jsonResponse({ error: "stored draft is not valid JSON" }, 400, req);
+  }
+  const subject = typeof parsed.subject === "string" ? parsed.subject : "";
+  const body = typeof parsed.body === "string" ? parsed.body : "";
+  const flags = Array.isArray(parsed.flags) ? parsed.flags : [];
+  if (!subject || !body) {
+    return jsonResponse({ error: "stored draft is empty — regenerate first" }, 400, req);
+  }
+  // Soft review flags are founder-overridable here. This IS the
+  // review-then-send step. Only blocking flags refuse a manual send.
+  if (blockingFlags(flags).length > 0) {
+    return jsonResponse(
+      { error: "draft has lint flags — regenerate to clear them before sending" },
+      400,
+      req,
+    );
+  }
+  if (parsed.sent === true) return jsonResponse({ error: "draft already sent" }, 400, req);
+
+  // Atomic claim of the sending marker. Stale cutoff matches the cadence-send
+  // window (5 min); past that, a fresh click can reclaim. Cleared on success
+  // by setQueueStatus('sent'); explicitly in the catch on failure.
+  const QUEUE_SEND_MAX_AGE_MS = 5 * 60 * 1000;
+  const claimed = ledger.claimQueueSendingMarker({
+    id,
+    startedAtIso: new Date().toISOString(),
+    staleCutoffIso: new Date(Date.now() - QUEUE_SEND_MAX_AGE_MS).toISOString(),
+  });
+  if (!claimed) {
+    return jsonResponse(
+      { error: "already sending — wait for the in-flight send to complete" },
+      409,
+      req,
+    );
+  }
+  // The claim itself requires status='approved'. Re-read so an expiry that
+  // raced immediately after the claim is observed before provider dispatch.
+  const claimedRow = ledger.getQueueRow(id);
+  if (claimedRow?.status !== "approved") {
+    ledger.clearQueueSendingMarker(id);
+    return jsonResponse({ error: "row changed while sending; refresh and retry" }, 409, req);
+  }
+
+  let payload: Record<string, unknown> = {};
+  try {
+    const p = JSON.parse(row.payload_json);
+    if (p && typeof p === "object") payload = p as Record<string, unknown>;
+  } catch {
+    // fall through: handled by the missing-email check below
+  }
+  // LinkedIn row: the reviewed note goes out verbatim as a connection request
+  // through OneShot's invite route, from the account's owning workspace.
+  if (channelOf(row.channel) === "linkedin") {
+    const account = linkedInOutreachAccount();
+    if (!account) {
+      ledger.clearQueueSendingMarker(id);
+      return jsonResponse({ error: "connect LinkedIn on /setup before sending invites" }, 409, req);
+    }
+    try {
+      const out = await sendLinkedInInvite({
+        row: { id, playName: row.play_name, payload, notes: row.notes },
+        note: body,
+        sender: {
+          accountId: account.accountId,
+          workspace: account.workspace,
+          call: (operation) => callLinkedIn(account.workspace, operation),
+        },
+        workspace: currentWorkspaceName(),
+      });
+      if (!out.sent) {
+        ledger.clearQueueSendingMarker(id);
+        return jsonResponse({ error: out.flags.join("; "), flags: out.flags }, 409, req);
+      }
+      try {
+        ledger.setQueueProspectId(id, out.prospectId);
+      } catch {
+        // best-effort backfill. The invite is already recorded
+      }
+      ledger.setQueueStatus({ id, status: "sent", decidedBy: "human" });
+      try {
+        ledger.closeQueueDraftVersion(id, "sent");
+      } catch {
+        // older ledgers / test doubles without draft versions
+      }
+      return jsonResponse(
+        {
+          ok: true,
+          prospectId: out.prospectId,
+          invitationId: out.invitationId,
+          status: out.status,
+        },
+        200,
+        req,
+      );
+    } catch (err) {
+      ledger.clearQueueSendingMarker(id);
+      const message = (err as Error).message ?? "LinkedIn invite failed";
+      return jsonResponse({ error: message }, isSendDeferred(err) ? 429 : 502, req);
+    }
+  }
+
+  const str = (k: string): string | null => (typeof payload[k] === "string" ? payload[k] : null);
+  const email = str("email")?.trim() || str("founderEmail")?.trim();
+  if (!email) return jsonResponse({ error: "row has no recipient email" }, 400, req);
+
+  // Exactly one telemetry event per send attempt; declared after pre-send
+  // validation so bad-request returns don't count as executions.
+  const t0 = performance.now();
+  const done = (outcome: TelemetryOutcome, res: Response): Response => {
+    void reportServerExecution("server.queue.send", {
+      outcome,
+      durationMs: performance.now() - t0,
+    });
+    return res;
+  };
+
+  // sendDraftedEmail pushes dedup outcomes here: distinguishes a deliberate
+  // skip from a genuine send failure below.
+  const sendFlags: string[] = [];
+  let result: Awaited<ReturnType<typeof sendDraftedEmail>>;
+  try {
+    result = await sendDraftedEmail({
+      playName: row.play_name,
+      to: email,
+      draft: { subject, body },
+      flags: sendFlags,
+      prospectMeta: {
+        businessAddress: extractBusinessAddress(payload),
+        businessAddressSource: str("businessAddressSource") ?? row.source,
+        name: str("name") ?? str("founderName"),
+        email,
+        company: str("company"),
+        // Falls back to twitter/github URL. The column is the de-facto
+        // social-profile URL (mirrors the play's own prospectMeta).
+        linkedin_url: str("linkedinUrl") ?? str("twitterUrl") ?? str("githubUrl"),
+        phone: str("phone"),
+        source: row.play_name,
+        // Read generically so any finder that sets it gets it persisted.
+        source_profile_url: str("sourceProfileUrl") ?? str("githubUrl") ?? str("twitterUrl"),
+        // Stamped on the payload by the person-level ICP gate in the finders.
+        title: str("title"),
+      },
+      // The verdict from that same gate. Read generically, like `title`, so
+      // approving a row on /queue enforces and records it exactly as an
+      // unattended play run does.
+      ...(str("icpVerdict") === "pass" ||
+      str("icpVerdict") === "reject" ||
+      str("icpVerdict") === "unclear"
+        ? {
+            icp: {
+              verdict: str("icpVerdict") as "pass" | "reject" | "unclear",
+              reason: str("icpVerdictReason"),
+            },
+          }
+        : {}),
+      // Include evidence keys (repo, eventTitle, vendorStack, etc.); downstream
+      // step-0 readers depend on them.
+      metadata: playMetadata(row.play_name, payload),
+      dryRun: false,
+      // This route IS the review-then-send override for `contacted-elsewhere`.
+      allowContactedElsewhere: true,
+    });
+  } catch (err) {
+    // Release the marker so a retry needn't wait for the cold-boot sweep.
+    try {
+      ledger.clearQueueSendingMarker(id);
+    } catch {
+      /* sweeper safety net */
+    }
+    // Daily caps exhausted, not a failure; row stays approved.
+    if (isSendDeferred(err)) {
+      return done("ok", jsonResponse({ error: (err as Error).message, deferred: true }, 429, req));
+    }
+    // A race with a touch recorded mid-send is a hold, not a failure.
+    if (isRecentlyContacted(err)) {
+      return done("ok", jsonResponse({ error: (err as Error).message, held: true }, 409, req));
+    }
+    // The 400 body carries only the SDK's generic message; log the status +
+    // response body so the real reason is recoverable.
+    logTargetError({ playName: row.play_name, to: email, err });
+    return done(
+      "error",
+      jsonResponse({ error: (err as Error).message ?? "send failed" }, 400, req),
+    );
+  }
+  if (!result.sent) {
+    try {
+      ledger.clearQueueSendingMarker(id);
+    } catch {
+      /* sweeper safety net */
+    }
+    // Deliberate dedup skip: mark the row rejected with the reason so it
+    // leaves the actionable queue instead of inviting endless re-clicks.
+    const dedup = sendFlags.find((f) => f === "already-contacted" || f === "already-enrolled");
+    if (dedup) {
+      const reason =
+        dedup === "already-contacted"
+          ? "already contacted via another play"
+          : "already sent this play";
+      ledger.setQueueStatus({ id, status: "rejected", notes: `auto: ${reason} — not re-sent` });
+      return done(
+        "ok",
+        jsonResponse({ error: `${reason} — not re-sent`, skipped: true, reason: dedup }, 409, req),
+      );
+    }
+    if (sendFlags.includes("off-icp")) {
+      const hold = emailFitHold(payload);
+      return done(
+        "ok",
+        jsonResponse(
+          {
+            error: `Send held for fit review: ${hold?.reason ?? "Saved assessment says this person does not fit the target customer profile."} Review their fit before sending; regenerating the draft will not clear this hold.`,
+            held: true,
+            reason: "off-icp",
+          },
+          409,
+          req,
+        ),
+      );
+    }
+    return done("error", jsonResponse({ error: "send did not complete" }, 500, req));
+  }
+
+  const prospect = ledger.findProspectByEmail(email);
+  if (prospect) enrollInCadence({ prospectId: prospect.id, playName: row.play_name });
+  // The human read this draft and clicked Send. A per-row judgment.
+  ledger.setQueueStatus({ id, status: "sent", decidedBy: "human" });
+  ledger.setQueueDraft({
+    id,
+    draft: {
+      subject,
+      body,
+      flags: [],
+      sent: true,
+      receiptIds: result.receiptIds,
+      dryRun: false,
+      ...(parseDraftAngle(parsed.angle) ? { angle: parseDraftAngle(parsed.angle)! } : {}),
+    },
+    sentBy: "human",
+  });
+
+  return done("ok", jsonResponse({ sent: true, receiptIds: result.receiptIds }, 200, req));
+}
+
+/**
+ * Withdraw the LinkedIn invite a sent row went out with, through OneShot's
+ * withdraw route. Recorded as its own step-0 `withdrawn` event; the original
+ * send stays in the history. Never disconnects an accepted connection:
+ * OneShot answers `not_pending` for those.
+ */
+export async function withdrawInviteRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  if (channelOf(row.channel) !== "linkedin") {
+    return jsonResponse({ error: "only a LinkedIn row has an invite to withdraw" }, 400, req);
+  }
+  if (row.status !== "sent" || row.prospect_id == null) {
+    return jsonResponse({ error: "this row's invite hasn't been sent" }, 400, req);
+  }
+  // Oldest first. The newest sent invite is the live one (a person can be
+  // invited again after a withdrawal); it's withdrawn only if a withdrawal follows it.
+  const events = ledger.listLinkedInInviteEvents(row.prospect_id, row.play_name);
+  const sentAt = events.findLastIndex((e) => e.status === "sent");
+  const sent = sentAt >= 0 ? events[sentAt] : undefined;
+  if (events.slice(sentAt + 1).some((e) => e.status === "withdrawn")) {
+    return jsonResponse({ error: "invite already withdrawn" }, 409, req);
+  }
+  let invitationId: string | null = null;
+  let sentBy: { workspace: string; accountId: string } | null = null;
+  try {
+    const meta = JSON.parse(sent?.metadata_json ?? "{}") as {
+      invitationId?: unknown;
+      accountId?: unknown;
+      accountWorkspace?: unknown;
+    };
+    invitationId = typeof meta.invitationId === "string" ? meta.invitationId : null;
+    if (typeof meta.accountId === "string" && typeof meta.accountWorkspace === "string") {
+      sentBy = { workspace: meta.accountWorkspace, accountId: meta.accountId };
+    }
+  } catch {
+    invitationId = null;
+  }
+  if (!invitationId) {
+    return jsonResponse({ error: "no OneShot invitation id recorded for this row" }, 409, req);
+  }
+  // The account that sent the invite; invites recorded before that was
+  // stored fall back to the current outreach account.
+  const account = sentBy ?? linkedInOutreachAccount();
+  if (!account) {
+    return jsonResponse({ error: "connect LinkedIn on /setup to withdraw invites" }, 409, req);
+  }
+  try {
+    const result = (await callLinkedIn(account.workspace, {
+      kind: "withdraw",
+      accountId: account.accountId,
+      invitationId,
+      idempotencyKey: `gtm:${currentWorkspaceName()}:queue:${id}:withdraw:${invitationId}`,
+      playName: row.play_name,
+    })) as { status?: string };
+    // not_pending means the invite was accepted or is otherwise gone. Nothing
+    // was withdrawn, so nothing is recorded.
+    if (!isWithdrawnStatus(result.status)) {
+      return jsonResponse(
+        { error: `the invite is no longer pending (${result.status ?? "unknown"})` },
+        409,
+        req,
+      );
+    }
+    ledger.recordSequenceEvent({
+      prospectId: row.prospect_id,
+      playName: row.play_name,
+      stepIndex: 0,
+      channel: "linkedin",
+      status: "withdrawn",
+      metadata: { invitationId, withdrawStatus: result.status ?? null },
+    });
+    return jsonResponse({ ok: true, status: result.status ?? null }, 200, req);
+  } catch (err) {
+    return jsonResponse({ error: (err as Error).message ?? "withdraw failed" }, 502, req);
+  }
+}
+
+/**
+ * Move an unsent row to another outreach channel it has an address for. The
+ * old draft is dropped; Regenerate writes one for the new channel.
+ */
+export async function setQueueChannelRoute(
+  req: Request,
+  params: Record<string, string>,
+): Promise<Response> {
+  const id = Number.parseInt(params["id"] ?? "", 10);
+  if (!Number.isFinite(id)) return jsonResponse({ error: "bad id" }, 400, req);
+  let body: { channel?: unknown };
+  try {
+    body = (await req.json()) as { channel?: unknown };
+  } catch {
+    return jsonResponse({ error: "body must be {channel}" }, 400, req);
+  }
+  if (!isOutreachChannel(body.channel)) {
+    return jsonResponse({ error: "channel must be email, linkedin or x" }, 400, req);
+  }
+  const ledger = getLedger();
+  const row = ledger.getQueueRow(id);
+  if (!row) return jsonResponse({ error: `row #${id} not found` }, 404, req);
+  let payload: Record<string, unknown> = {};
+  try {
+    const p = JSON.parse(row.payload_json);
+    if (p && typeof p === "object") payload = p as Record<string, unknown>;
+  } catch {
+    // no addresses → refused below
+  }
+  if (!channelAddresses(payload).includes(body.channel)) {
+    return jsonResponse({ error: `this person has no ${body.channel} address` }, 400, req);
+  }
+  const switched = ledger.setQueueChannel(id, body.channel);
+  if (switched === "sent") return jsonResponse({ error: "row already sent" }, 409, req);
+  if (switched === "busy") {
+    return jsonResponse(
+      { error: "row is being drained or sent — try again in a few minutes" },
+      409,
+      req,
+    );
+  }
+  return jsonResponse({ ok: true, channel: body.channel }, 200, req);
+}

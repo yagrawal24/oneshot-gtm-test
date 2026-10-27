@@ -1,0 +1,762 @@
+export interface ReceiptRecord {
+  id: number;
+  play_name: string;
+  call_type: string;
+  cost_usd: number | null;
+  signed_receipt: string | null;
+  oneshot_request_id: string | null;
+  /** Which EmailIdentity sent this (email.send receipts only); null pre-rotation. */
+  sender_identity: string | null;
+  /** Human-readable call reason, mirrored from the call-time SDK `memo`. */
+  memo: string | null;
+  /** JSON of the call-time `decisionContext` blob. */
+  decision_context: string | null;
+  /**
+   * RoCS outcome value, JSON `{type, amount?, label?}`, set once a reply/deal
+   * lands (tagOutcomeValue). Mirrors what we PATCH to OneShot via tagReceiptValue.
+   */
+  value_tag: string | null;
+  value_tagged_at: string | null;
+  /** Cadence correlation key (mirrors decisionContext.goalId); groups a cadence's receipts. */
+  goal_id: string | null;
+  created_at: string;
+}
+
+/**
+ * One sending identity in the rotation pool. Either an OneShot wallet-owned
+ * domain or a Gmail/Workspace account (refresh token lives in the chmod-600
+ * gmail-tokens.json store, keyed by `id`. Never in this config).
+ */
+export interface EmailIdentity {
+  /** Stable key, e.g. "legacy-oneshot", "gmail:jn@freebutter.ai". Referenced by sender_assignments rows. Never rename a live id. */
+  id: string;
+  provider: "oneshot" | "gmail" | "smartlead";
+  label?: string | null;
+  /** OneShot only: wallet-owned From domain. */
+  sendingDomain?: string | null;
+  /** OneShot only: From localpart override (default: founder first name). */
+  mailbox?: string | null;
+  /**
+   * Gmail/Smartlead: the account address. For Gmail it is informational (the
+   * OAuth token decides the real From); for Smartlead it is the literal
+   * `fromEmail` the send API pins, so it must match a connected account.
+   */
+  address?: string | null;
+  /** Hard daily ceiling. Null = uncapped (only sensible for OneShot identities). */
+  maxPerDay: number | null;
+  /** Auto ramp from first send: cap(day) = start + floor(weeks)*increment, clamped to maxPerDay. Null = no ramp. */
+  warmup: { startPerDay: number; incrementPerWeek: number } | null;
+  /**
+   * Smartlead identities only: how a NEW (non-reply) email leaves. "provider"
+   * (default) = the provider's send API. "smtp" = straight through the
+   * mailbox's own SMTP with a deterministic Message-ID and an idempotency key,
+   * so a retry can never become a second copy. The provider still does warmup.
+   * The identity id is unchanged either way, so pins, caps and warmup carry on.
+   */
+  sendVia?: "provider" | "smtp";
+}
+
+/** One persisted inbound reply (inbox_replies, v21): column-shaped row. */
+export interface InboxReplyRecord {
+  /** Provider email id (Gmail message id / OneShot id). The idempotency key. */
+  id: string;
+  /** Same key as inbox_drafts / inbox_sent (thread_id, else email id). */
+  thread_key: string;
+  prospect_id: number;
+  play_name: string | null;
+  from_email: string;
+  subject: string | null;
+  body: string;
+  received_at: string;
+  source_identity_id: string | null;
+  thread_id: string | null;
+  message_id: string | null;
+  /** Reply classification (reply-classify.ts). NULL = pre-classifier row, read as 'human'. */
+  kind: string | null;
+  /** Sentiment/intent classification (intel/triage.ts TriageCategory). NULL = not yet triaged. */
+  intent: string | null;
+  /** One-sentence justification for `intent`, from the triage LLM call. */
+  intent_reason: string | null;
+  /** Classifier confidence in `intent` (0–1); NULL when the engine gives none. */
+  intent_confidence?: number | null;
+  /** JSON object of per-label probabilities (decisions engine only). */
+  intent_probs?: string | null;
+  /** Engine and model that produced `intent`, e.g. `decisions:<model>`. */
+  intent_classifier?: string | null;
+  intent_cost_micros?: number | null;
+  intent_classified_at?: string | null;
+  /** 1 when the confidence was under the workspace's review threshold. */
+  intent_review?: number | null;
+  created_at: string;
+}
+
+/** How a reply's intent was decided (ledger migration v9). */
+export interface InboxReplyIntentDetails {
+  confidence?: number | null;
+  probabilities?: Record<string, number> | null;
+  classifier?: string | null;
+  costMicros?: number | null;
+  review?: boolean;
+}
+
+/** Provider-neutral inbound engagement event. V1 records LinkedIn replies only. */
+export interface ChannelEventRecord {
+  id: number;
+  source: string;
+  external_event_id: string;
+  prospect_id: number;
+  channel: "linkedin";
+  event_type: "reply";
+  occurred_at: string;
+  /** Message text when the channel supplied one; null for older rows. */
+  body: string | null;
+  created_at: string;
+}
+
+/** One `deal_outcomes` row: column-shaped. Positives-only by construction
+ *  (the cadences modal offers only the three positive states), so a missing
+ *  row is never evidence of failure. */
+export interface DealOutcomeRecord {
+  id: number;
+  prospect_id: number;
+  play_name: string | null;
+  outcome: string;
+  amount_usd: number | null;
+  notes: string | null;
+  recorded_at: string;
+}
+
+export interface CadencePlanStep {
+  id: string;
+  dayOffset: number;
+  channel: "email" | "sms" | "voice" | "direct_mail" | "linkedin";
+  label?: string;
+}
+
+export interface ProspectRecord {
+  /** Shared person identity; id remains the workspace membership/history key. */
+  shared_person_id?: string | null;
+  businessAddressSource?: string;
+  businessAddress?: import("./direct-mail.ts").PostalAddress | null;
+  id: number;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  company: string | null;
+  /** Polymorphic social-profile column: profile-intro stores a LinkedIn, X or
+   *  GitHub URL here, so consumers must validate before treating it as LinkedIn. */
+  linkedin_url: string | null;
+  dossier_json: string | null;
+  source: string | null;
+  /** The profile URL the finder originally sourced this person from. Unlike
+   *  `linkedin_url` this is never repurposed, so it stays a usable key for
+   *  re-enrichment. */
+  source_profile_url: string | null;
+  /** Job title at contact time, from the person-level ICP gate. NULL on rows
+   *  contacted before the gate existed (pre 2026-08). */
+  title: string | null;
+  /** Person-level ICP verdict: 'pass' | 'reject' | 'unclear'. NULL = never
+   *  judged. 'unclear' means the gate looked and had nothing to judge on:
+   *  distinct from NULL, and PROVISIONAL: a re-audit re-judges unclear rows
+   *  (so role text arriving later is used) while leaving pass/reject alone.
+   *  Only 'reject' suppresses sending (packages/plays/src/_cadence.ts). */
+  icp_verdict: string | null;
+  /** Classifier's one-line reason for the verdict. */
+  icp_verdict_reason: string | null;
+  /**
+   * LLM synthesis of dossier + live public work + reply history (issue #355):
+   * a prose brief + hook plus a fixed evidence/relationship/valueMode schema.
+   * Distinct from `dossier_json` (raw research input) and from `yourEdge`
+   * (founder config, identical across every target in a run). NULL = never
+   * synthesized. See `packages/plays/src/angle.ts` for the shape.
+   */
+  angle_json: string | null;
+  /** ISO timestamp of the last `angle_json` write. NULL alongside it. */
+  angle_synthesized_at: string | null;
+  created_at: string;
+}
+
+export interface SequenceEventRecord {
+  id: number;
+  prospect_id: number;
+  play_name: string;
+  step_index: number;
+  channel: "email" | "sms" | "voice" | "linkedin" | "x" | "direct_mail";
+  status:
+    | "queued"
+    | "sent"
+    | "delivered"
+    | "replied"
+    | "bounced"
+    | "failed"
+    | "unsubscribed"
+    | "skipped"
+    /** A LinkedIn invite withdrawn after it was sent (its own step-0 event). */
+    | "withdrawn";
+  metadata_json: string | null;
+  created_at: string;
+  /**
+   * When a `replied` status was stamped (markLatestStepReplied), separate from
+   * `created_at`. A reply flips the ORIGINAL sent row in place, so created_at
+   * stays pinned to the SEND time. NULL on rows written before this column
+   * existed, or rows inserted directly with status `replied` (created_at is
+   * already the occurrence time in that case).
+   */
+  replied_at: string | null;
+  /**
+   * The provider's own bounce timestamp (DSN `bouncedAt`, from the message's
+   * `internalDate`), distinct from `created_at`. A fresh row IS inserted per
+   * bounce, but `created_at` is stamped at POLL/detection time, which can lag
+   * the real bounce by however long the mailbox went unpolled. NULL on rows
+   * written before this column existed, or any non-`bounced` row.
+   */
+  bounced_at: string | null;
+}
+
+/**
+ * Severity of a delivery failure, derived from the DSN's RFC 3463 status code.
+ *  - `hard`: permanent, address-level (5.1.1 no such user). Suppresses the
+ *              address: re-sending can only ever fail again and costs money.
+ *  - `block`: permanent, POLICY-level (5.7.x, spam/reputation rejection). The
+ *              reputation signal. Kept distinct from `hard` because it's about
+ *              the message or the sending domain, not the recipient. The same
+ *              address may well accept mail tomorrow, so it never suppresses.
+ *  - `soft`: transient (4.x.x mailbox full, greylisted). Recorded for context
+ *              only; no cadence or suppression effect.
+ */
+export type BounceKind = "hard" | "block" | "soft";
+
+export interface BounceRecord {
+  /** Provider message id of the DSN itself: PK, so re-sweeping is idempotent. */
+  message_id: string;
+  /** Identity whose mailbox received the DSN (= the identity that sent). Null pre-rotation. */
+  identity_id: string | null;
+  /** Canonical Final-Recipient. The address that failed, not the DSN sender. */
+  recipient: string;
+  kind: BounceKind;
+  /** RFC 3463 status, e.g. "5.1.1". Null when only prose was parseable. */
+  status_code: string | null;
+  /** Truncated Diagnostic-Code / remote SMTP response. */
+  diagnostic: string | null;
+  /** Matched prospect, or null when the address isn't one of ours. */
+  prospect_id: number | null;
+  /** When the DSN arrived (provider timestamp). */
+  bounced_at: string;
+  created_at: string;
+}
+
+/**
+ * Where a message actually landed in the receiving mailbox. This is the
+ * question DSN harvesting cannot answer: a message can be accepted (no bounce)
+ * and still be filtered into spam or buried in a tab, which for cold outreach
+ * is indistinguishable from never arriving.
+ */
+export type GmailPlacement =
+  | "inbox"
+  /** Delivered but tab-binned (Promotions/Social/Updates/Forums): effectively invisible for cold outreach. */
+  | "promotions"
+  | "tab"
+  | "spam"
+  /** Accepted but not in the inbox or any tab: filtered straight to a label/archive. */
+  | "archived"
+  /** Never showed up within the deadline. Inconclusive: silently dropped, or just slow. */
+  | "not_delivered";
+
+/** SPF/DKIM/DMARC verdict as reported by the RECEIVING server, not by a DNS lookup. */
+export type AuthVerdict = "pass" | "fail" | "softfail" | "neutral" | "none" | "unknown";
+
+export interface CanaryResultRecord {
+  id: number;
+  from_identity: string;
+  to_identity: string;
+  placement: GmailPlacement;
+  /** Raw Gmail labelIds, JSON: kept so a placement call can be re-litigated later. */
+  labels_json: string | null;
+  spf: AuthVerdict;
+  dkim: AuthVerdict;
+  dmarc: AuthVerdict;
+  subject: string | null;
+  /** Which play's real copy was replayed, or null when a generic sample was used. */
+  source_play: string | null;
+  /** True when both identities share a domain: internal routing skips most filtering. */
+  same_domain: number;
+  /** Send → observed, in ms. Null when never observed. */
+  latency_ms: number | null;
+  created_at: string;
+}
+
+export interface InterviewRecord {
+  id: number;
+  person: string;
+  transcript_path: string | null;
+  jtbd: string | null;
+  pain_quotes_json: string | null;
+  created_at: string;
+}
+
+export type MeetingOutcome = "held" | "no_show" | "cancelled" | "rescheduled";
+/** 'exact' (email-identity, auto-linked) | 'suggested'/'ambiguous' (fuzzy, review-only) | 'dismissed' (founder said no, sticks until the attendee set changes) | null (no candidate at all). */
+export type MeetingMatchStatus = "exact" | "suggested" | "ambiguous" | "dismissed" | null;
+export type MeetingMatchMethod = "name_domain" | "domain" | "name" | "description" | null;
+
+/** One `meetings` row (v34). A calendar event, possibly a prospect call. */
+export interface MeetingRecord {
+  calendar_id: string;
+  event_id: string;
+  ical_uid: string | null;
+  recurring_event_id: string | null;
+  status: string;
+  summary: string | null;
+  all_day: number;
+  starts_at: string | null;
+  ends_at: string | null;
+  event_timezone: string | null;
+  organizer_email: string | null;
+  /** The founder's own (self:true) attendee responseStatus, e.g. 'accepted' | 'declined' | 'tentative' | 'needsAction'. */
+  self_response: string | null;
+  external_attendee_count: number;
+  /** JSON array of external attendee emails, capped ~20. */
+  external_attendees_json: string | null;
+  attendees_omitted: number;
+  prospect_id: number | null;
+  suggested_prospect_id: number | null;
+  match_status: MeetingMatchStatus;
+  match_method: MeetingMatchMethod;
+  match_confidence: number | null;
+  outcome: MeetingOutcome | null;
+  outcome_note: string | null;
+  outcome_recorded_at: string | null;
+  outcome_prompted_at: string | null;
+  event_updated_at: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  attendees_fingerprint: string | null;
+}
+
+export interface ReplyClassifierConfig {
+  engine: "llm" | "decisions";
+  /** Decisions-engine model id (config data only; required for `decisions`). */
+  model?: string;
+  /** 0–1. Labels below it are stored with a review flag. Default 0.5. */
+  minConfidence?: number;
+}
+
+export interface OneShotConfig {
+  walletMode: "cdp" | "private-key";
+  llmProvider: "openrouter" | "openai" | "anthropic";
+  llmModel: string;
+  telemetryEnabled: boolean;
+  founderName: string | null;
+  founderEmail: string | null;
+  productOneLiner: string | null;
+  /**
+   * Brand/product domain appended to every generated email signature beneath
+   * the founder's name (e.g. "yourcompany.com"). Bare domain, no scheme.
+   * Null = no domain line (founderEmail can't stand in. It's often a personal
+   * inbox).
+   */
+  productDomain: string | null;
+  /**
+   * Domain the founder's agent wallet OWNS, used as the email From domain
+   * (sends as `<founder-first-name>@<sendingDomain>`). Distinct from
+   * productDomain (signature display): the send domain must be wallet-owned or
+   * the SDK 403s with `domain_not_owned`. Null = fall back to the SDK default
+   * (which only works for whoever owns that demo domain).
+   */
+  sendingDomain: string | null;
+  /**
+   * Which transport sends email. "oneshot" (default) = OneShot SDK from a
+   * wallet-owned sendingDomain; "gmail" = the founder's own Gmail / Google
+   * Workspace account via OAuth (GMAIL_* secrets, `gmail auth` CLI). In gmail
+   * mode the From address is the authenticated account (sendingDomain is
+   * ignored) and replies are read from Gmail instead of the OneShot inbox.
+   */
+  emailProvider: "oneshot" | "gmail";
+  /**
+   * Sender rotation pool. Null = legacy single-identity mode: behave exactly
+   * per `emailProvider` + `sendingDomain` (a synthetic identity is derived at
+   * runtime). Once set, `emailProvider` is ignored: routing is per-prospect
+   * sticky: the identity that sent the first touch sends every later email
+   * to that prospect.
+   */
+  emailIdentities: EmailIdentity[] | null;
+  /** Free-text ICP statement; the find layer's LLM filter uses it as a yes/no classifier. */
+  icpOneLiner: string | null;
+  /**
+   * Per-play cadence timing overrides, keyed by play name. Each value is an
+   * array of RELATIVE day offsets (one per follow-up step, in order) that
+   * replaces the code-default offsets when its length matches the play's step
+   * count. Null/absent = code defaults. Structure (which prompts fire,
+   * breakup position) is NOT overridable: timing only.
+   */
+  cadenceOverrides: Record<string, number[]> | null;
+  directMailMotions?: Record<string, import("./mail-policy.ts").MotionMailSettings | null> | null;
+  /**
+   * Default order of the /queue pending review list. "ranked" interleaves
+   * finders with score-within-finder + exploration slots (see find/_rank.ts);
+   * "newest" is the classic found_at DESC. Defaults to "newest": the
+   * 2026-09-01 heuristic-v2 measurement (luma AUC 0.59-0.63, gap +1) is under
+   * the Phase 2 acceptance bar for ranked-by-default. Per-request override:
+   * GET /api/queue?order=. Optional so pre-existing config literals and older
+   * config files stay valid; readers treat absent as "newest".
+   */
+  queueReviewOrder?: "ranked" | "newest";
+  /**
+   * How inbound human replies get their intent label (see REPLY_INTENTS in
+   * shared-types). `llm` is the triage prompt on `llmModel`; `decisions` is a
+   * typed decisions model on OpenRouter's decisions API (`model` names it), with
+   * the `llm` engine as fallback on any failure. Replies whose label confidence
+   * is under `minConfidence` (default 0.5) are stored with a review flag and
+   * never drive a positive action. Optional: absent means `{ engine: "llm" }`.
+   */
+  replyClassifier?: ReplyClassifierConfig;
+  /** Founder's résumé / credentials. The founder-trust social-proof beat. */
+  founderCredentials: string | null;
+  /** Products you've shipped. The peer-founder social-proof beat. */
+  productPortfolio: string | null;
+  /** Notable partners / customers. The brand-recognition social-proof beat. */
+  partners: string | null;
+  /**
+   * The founder's OWN accelerator batch tag ("yc-w23", "spc-2025-1"), and only
+   * when it is true. Null is the default and makes `accelerator-batch` draft as an outsider writing to a company whose
+   * batch is a public timing signal, never as a batchmate. It lives here rather
+   * than in trigger config on purpose: a per-trigger field that a readiness gate
+   * demanded is what produced fabricated "fellow YC" claims in the first place,
+   * and one config value is also read at draft time, so a stale cohort stamped
+   * into an old queue row can't resurrect the claim. Optional (like
+   * `queueReviewOrder`) so pre-existing config literals and older config files
+   * stay valid; readers treat absent exactly like null.
+   */
+  founderCohort?: string | null;
+  /**
+   * One true concession about the founder/product ("two people, no enterprise
+   * logos yet"). The prompt's optional damaging-admission beat. It is the ONLY
+   * material the model may draw an admission from; null means the beat is
+   * skipped, never improvised.
+   */
+  founderAdmission: string | null;
+  /**
+   * What the founder offers a prospect who has not adopted on their own, in
+   * plain terms (e.g. "four weeks building one workflow they pick, together").
+   * Set: the final follow-up of the builder plays offers it and closes the
+   * thread instead of the plain breakup. Optional like `founderCohort`;
+   * absent or null keeps the breakup, unchanged.
+   */
+  pilotOffer?: string | null;
+  /**
+   * Product knowledge the reply drafter may cite: concrete facts, architecture,
+   * pricing model, and canonical links (docs pages, repo). Free text, founder-
+   * edited on /setup (with a derive-from-sources helper). The reply prompt is
+   * only allowed to include links that appear verbatim here. This field is
+   * what makes a substantive, link-bearing reply possible without inventing
+   * artifacts.
+   */
+  productBrief: string | null;
+  /**
+   * The founder's own register, as a short card (MOVES / SENTENCES / NEVER /
+   * EXEMPLARS), written or pasted on /setup or drafted from their writing by
+   * `config voice`. Injected into every email draft as a VOICE block that
+   * controls tone and rhythm over generic style defaults; factual, audience,
+   * channel and lint constraints still apply. Shared structure is flexible.
+   * Null = no block, drafts unchanged. Capped at 1500 characters in use.
+   */
+  founderVoice?: string | null;
+  /**
+   * When true, the signature directive appends a literal "Sent from my iPhone"
+   * line below the domain. Proof-of-human artifact: reads as if the founder
+   * forgot to disable the default. Default false.
+   */
+  mobileSignature: boolean;
+  /**
+   * Slack incoming-webhook URL for operational notifications (reply received,
+   * bounce recorded, daily send summary). Null/empty = feature off. Delivery
+   * is best-effort: failures are logged via logEvent and never block or fail
+   * the triggering operation.
+   */
+  slackWebhookUrl: string | null;
+  /**
+   * IANA zone (e.g. "America/Los_Angeles") this install's dates are rendered in
+   * when nothing more specific is known. It is the LAST resort in the event
+   * date/time chain (explicit zone on the event → the event's city → this);
+   * null means fall back to `Intl.DateTimeFormat().resolvedOptions().timeZone`.
+   * See `timezone.ts`.
+   */
+  timezone: string | null;
+  /**
+   * Anonymous per-install UUID. Generated by loadConfig() on first sight; never
+   * exposed to the web layer or transmitted off-device today. Reserved for
+   * opt-in distribution telemetry once that lands: having it now means
+   * pre-launch installs aren't attribution-orphaned later.
+   */
+  clientId: string | null;
+  /**
+   * Install-wide daily USD spend ceiling (issue #481). Per-run caps
+   * (`maxCostUsd`/`maxSpendPerRun`) bound one finder or drain call; this
+   * bounds total spend across finder triggers and automatic drains over the
+   * local calendar day. Null means unlimited. Checked before each automated call
+   * via a reservation against `receipts.cost_usd` summed since local
+   * midnight; manual `/queue` sends (approve/reject/mark-sent/send-draft)
+   * never consult it. Set from `config spend-ceiling <amount>` or `/setup`.
+   */
+  dailySpendCeilingUsd: number | null;
+  /**
+   * The Gmail identity (pool `id`, e.g. `gmail:jn@freebutter.ai`) whose
+   * calendar the scheduler polls for past meetings needing an outcome
+   * (issue #577). Null = feature off, entirely inert: no poll, no logging,
+   * no `meetings` writes. Must be a `provider: 'gmail'` identity carrying
+   * the calendar.readonly scope; `removeIdentity` clears this back to null
+   * when the pointed-at identity is removed, and the poller itself tolerates
+   * a dangling id (skip, log once) in case this file is hand-edited.
+   */
+  calendarIdentityId: string | null;
+  /**
+   * Which calendar of `calendarIdentityId`'s account to poll. A Google
+   * Calendar id, e.g. "primary" or an email-shaped secondary-calendar id.
+   * Default "primary": most founders' bookings land on their main calendar,
+   * and the /setup picker shows a 7-day event count per calendar because a
+   * founder cannot reliably state which one their booking tool actually
+   * writes to. Only meaningful when `calendarIdentityId` is set.
+   */
+  calendarId: string;
+
+  /**
+   * Live LinkedIn profile reads. The OneShot browser profile the founder's
+   * LinkedIn session lives in: connected once on /setup, either by logging
+   * in through the platform's hosted browser (2FA included) or by importing
+   * a pasted `LINKEDIN_SESSION_COOKIE` (li_at), and when a task last
+   * verified that session. A login wall stamps `linkedinSessionInvalidAt`
+   * and pauses reads until a reconnect; `config linkedin-session` / the
+   * /setup buttons fill these in.
+   */
+  linkedinBrowserProfileId?: string | null;
+  /**
+   * A hosted login in progress: the fresh profile the founder is signing in
+   * to. Kept apart from `linkedinBrowserProfileId` so a login that is never
+   * finished (or finished before the sign-in completed) cannot replace a
+   * working session; it is promoted only once its feed verifies.
+   */
+  linkedinPendingProfileId?: string | null;
+  /** When the session was last confirmed logged in, and as whom. */
+  linkedinSessionCheckedAt?: string | null;
+  linkedinSessionName?: string | null;
+  /** Set when a read hit the login wall; reads stop until a fresh cookie is connected. */
+  linkedinSessionInvalidAt?: string | null;
+  /** Reads per local day before the tier skips with a reason (account safety). Default 80. */
+  linkedinReadsPerDay?: number;
+  /**
+   * Outreach channels finders may queue people on, in order of preference
+   * ("email", "linkedin", "x"). A trigger's own `channels` overrides it.
+   * Unset = email only.
+   */
+  channels?: string[];
+  /**
+   * Learning-loop v2 (issue #750): minimum number of human approve/reject
+   * queue decisions required before the background job will spend a model
+   * call proposing a tighter ICP one-liner. Optional so pre-existing config
+   * literals stay valid; unset reads as `DEFAULT_ICP_PROPOSAL_MIN_DECISIONS`
+   * (icp-proposals.ts). The proposal never changes the active ICP itself —
+   * only an explicit founder approval on `/queue` does that.
+   */
+  icpProposalMinDecisions?: number;
+}
+
+export type QueueStatus = "pending" | "approved" | "rejected" | "sent" | "expired";
+
+/** Per-component sub-scores of a `ProspectPriority`. Each is a clamped integer 0..100. */
+export interface ProspectPriorityComponents {
+  personFit: number;
+  accountFit: number;
+  intentStrength: number;
+  timingFreshness: number;
+  signalConfidence: number;
+  contactability: number;
+}
+
+/**
+ * Versioned, explainable priority artifact computed at enqueue time from the
+ * evidence already in the payload (issue #410, Phase 1). Shadow-mode only: it
+ * is persisted and displayed but never drives ordering, approval, drain, or
+ * send behavior. Missing evidence scores neutral, not zero; rows enqueued by
+ * legacy/manual producers carry null. Hard gates (ICP, role, dedupe,
+ * deliverability) are never rescued by a score.
+ */
+export interface ProspectPriority {
+  /**
+   * Mirrored union of shared-types' `PriorityVersion` (core can't import it:
+   * web depends on shared-types alone; the find version-sync test guards the
+   * two lists against drift).
+   */
+  version: "heuristic-v1" | "heuristic-v2";
+  /** Weighted total, clamped integer 0..100. */
+  total: number;
+  components: ProspectPriorityComponents;
+  /** Concise evidence strings, fixed order, no model chain-of-thought. */
+  reasons: string[];
+  /** The play/finder name the adapter scored under. */
+  finder: string;
+  /** ISO timestamp of scoring (injected clock: deterministic in tests). */
+  scoredAt: string;
+}
+
+/** A reviewed queue row, projected into an ICP classifier example. */
+export interface IcpDecisionExample {
+  candidate: unknown;
+  decision: boolean;
+  reason: string | null;
+}
+
+export interface QueueRow {
+  id: number;
+  play_name: string;
+  /** Outreach channel of this row's first touch (channels.ts); 'email' unless set. */
+  channel: string;
+  payload_json: string;
+  dedupe_key: string;
+  source: string;
+  status: QueueStatus;
+  found_at: string;
+  reviewed_at: string | null;
+  sent_at: string | null;
+  notes: string | null;
+  prospect_id: number | null;
+  /**
+   * Most-recent draft generated by the play for this row, persisted by the
+   * SSE /api/run endpoint after dispatch. JSON envelope:
+   * `{subject, body, flags, sent, receiptIds, dryRun, draftedAt}`. Null on
+   * rows that have never been drafted (or pre-v6 rows).
+   */
+  last_draft_json: string | null;
+  /** ISO timestamp of `last_draft_json`. Null when no draft persisted. */
+  last_drafted_at: string | null;
+  /**
+   * ISO timestamp when a Send-draft is in flight. Survives server restart so
+   * the `/queue` UI's spinner doesn't get stranded by a `bun --watch` reload
+   * mid-SDK-call. Claimed atomically by `claimQueueSendingMarker` before the
+   * send fires; cleared on success via `setQueueStatus('sent', …)`; cleared
+   * on failure or stale by the cold-boot `sweepStaleQueueSends` sweep.
+   */
+  send_started_at: string | null;
+  /**
+   * ISO timestamp of the drain's lease on this row (`dequeueApproved`, 15 min
+   * by default): set when a drain batch claims it, so a second drain skips
+   * it and a move can tell the row is mid-send. Null when never drained or
+   * the lease is stale. Present on every row (`SELECT *`) since the drain
+   * lease was added; older test fakes may omit it.
+   */
+  drain_claimed_at?: string | null;
+  /**
+   * Serialized `ProspectPriority` (shadow-mode score, v25) or null on rows
+   * from manual/legacy producers, auto-rejections, and pre-v25 rows.
+   */
+  priority_json: string | null;
+  /**
+   * Decision provenance (v26): the decision itself, durable against expiry
+   * and re-open: `status` alone is lossy history. NULL on undecided and
+   * pre-v26-unbackfillable rows. See core/labels.ts.
+   */
+  decision: "approve" | "reject" | "auto_reject" | null;
+  decided_at: string | null;
+  /** 'human' (per-row click) | 'human_bulk' (approve-all batch) | 'machine'. */
+  decided_by: "human" | "human_bulk" | "machine" | null;
+}
+
+/** Who decided a queue row: `human` groups per-row and bulk clicks; `none` = undecided. */
+export type QueueSearchDecidedBy = "human" | "machine" | "none";
+export type QueueSearchSort = "found_at" | "decided_at" | "name";
+
+/** Filters for `Ledger.searchQueue`. The /prospects browse view. */
+export interface QueueSearchOpts {
+  /** Free text; whitespace-split terms are AND-ed, each a case-insensitive substring. */
+  q?: string;
+  /** Empty or absent = every status. */
+  statuses?: QueueStatus[];
+  playName?: string;
+  decidedBy?: QueueSearchDecidedBy;
+  sort?: QueueSearchSort;
+  dir?: "asc" | "desc";
+  limit: number;
+  offset: number;
+  /**
+   * Skip the COUNT(*) pass and return `total: null`. The /prospects route
+   * already runs the per-status facet query under the same filters, and the
+   * total is the sum of the selected statuses' counts. A third scan of the
+   * haystack buys nothing.
+   */
+  withTotal?: boolean;
+}
+
+/**
+ * A queue row joined to the prospect it resolved to: by `prospect_id`, else
+ * by the payload's email. `p_*` columns are null when no prospect exists (the
+ * common case: `prospects` only holds people who were actually emailed).
+ */
+export interface QueueSearchRow extends QueueRow {
+  p_id: number | null;
+  p_name: string | null;
+  p_email: string | null;
+  p_company: string | null;
+  p_title: string | null;
+  p_icp_verdict: string | null;
+  p_icp_verdict_reason: string | null;
+  p_has_dossier: 0 | 1;
+  /** 1 when the link came from the email fallback rather than `prospect_id`. */
+  p_linked_by_email: 0 | 1;
+}
+
+/**
+ * One sent queue row joined to its outcome evidence (Phase 3 of #410).
+ * Produced by `Ledger.listSentOutcomeRows`; labeled by find/_outcomes.ts.
+ */
+export interface SentOutcomeRawRow {
+  id: number;
+  play_name: string;
+  dedupe_key: string;
+  priority_json: string | null;
+  sent_at: string;
+  decision: QueueRow["decision"];
+  decided_by: QueueRow["decided_by"];
+  /** prospect_id, falling back to an email join; NULL = unjoinable. */
+  joined_prospect_id: number | null;
+  payload_email: string | null;
+  /** Earliest human-classified email reply (COALESCE(kind,'human')). */
+  first_email_reply_at: string | null;
+  /**
+   * Sentiment intent of that earliest human email reply (issue #480):
+   * `interested` / `not_now` / `wrong_person` / `objection` / `question` /
+   * `unsubscribe` / `auto_reply` / `other`, or NULL when not yet triaged (or
+   * there was no email reply at all). `_outcomes.ts` uses this to stop
+   * labeling a decline (`not_now`) the same `positive` as an interested lead.
+   */
+  first_email_reply_intent: string | null;
+  /** Earliest LinkedIn reply (channel_events, never machine-classified). */
+  first_channel_reply_at: string | null;
+  /** Max deal_outcomes rank: 4 won / 3 qualified / 2 meeting; NULL = none. */
+  deal_rank: number | null;
+}
+
+export interface TriggerRow {
+  name: string;
+  last_polled_at: string | null;
+  last_run_summary: string | null;
+  enabled: number;
+  config_json: string | null;
+  /**
+   * ISO timestamp set by `fireTriggerNow` before backgrounding the work and
+   * cleared by `updateTriggerLastPoll` on completion. Survives server
+   * restart so a watch-restart-killed run can be detected and swept by the
+   * boot-time `sweepStaleRunningTriggers` call.
+   */
+  running_started_at: string | null;
+  /**
+   * Monotonic counter, incremented by exactly 1 every time
+   * `updateTriggerLastPoll` records a completed run (issue #708 correction).
+   * `hiring-signal`/`job-change`'s company-batch rotation cursor reads this
+   * PRE-run value rather than `last_polled_at`: a wall-clock timestamp's
+   * value modulo the batch count can repeat across successive runs (e.g.
+   * whenever the batch count divides the elapsed milliseconds, or trivially
+   * whenever the batch count is 1), so it does not guarantee the starting
+   * batch advances. A counter that steps by 1 each run visits every batch
+   * index in turn before repeating, regardless of run timing.
+   */
+  company_batch_seq: number;
+}
