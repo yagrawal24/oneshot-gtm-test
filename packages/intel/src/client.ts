@@ -10,6 +10,8 @@ export interface LlmCompleteInput {
   messages: LlmMessage[];
   temperature?: number;
   maxTokens?: number;
+  /** Per-call model override; defaults to the configured `llmModel`. */
+  model?: string;
   /**
    * Accept a response cut off at max_tokens instead of throwing. For callers
    * that consume PROSE (weekly review, advise), where a truncated report is
@@ -193,6 +195,7 @@ export async function complete(input: LlmCompleteInput): Promise<LlmCompleteOutp
   }
 
   const expanded: LlmCompleteInput = { ...input, messages: injectHumanizer(input.messages) };
+  const model = input.model ?? cfg.llmModel;
 
   // `??` treats 0 as "supplied", and 0 (or a negative value) would abort every
   // attempt before it reaches the provider. Only clamp when a value was
@@ -204,7 +207,7 @@ export async function complete(input: LlmCompleteInput): Promise<LlmCompleteOutp
   const startedAt = Date.now();
   logEvent("llm.start", {
     provider: cfg.llmProvider,
-    model: cfg.llmModel,
+    model,
     message_count: expanded.messages.length,
     max_tokens: expanded.maxTokens ?? null,
     max_attempts: maxAttempts,
@@ -218,7 +221,7 @@ export async function complete(input: LlmCompleteInput): Promise<LlmCompleteOutp
 
   for (let attempt = 1; ; attempt++) {
     try {
-      result = await dispatch(cfg.llmProvider, cfg.llmModel, key, expanded, timeoutMs);
+      result = await dispatch(cfg.llmProvider, model, key, expanded, timeoutMs);
       attempts = attempt;
       break;
     } catch (err) {
@@ -234,7 +237,7 @@ export async function complete(input: LlmCompleteInput): Promise<LlmCompleteOutp
         retryAfterMs > MAX_RETRY_AFTER_MS;
       const ctx = {
         provider: cfg.llmProvider,
-        model: cfg.llmModel,
+        model,
         duration_ms: Date.now() - startedAt,
         error_class: (err as Error).constructor.name,
         message_120: ((err as Error).message ?? "").slice(0, 120),
@@ -265,7 +268,7 @@ export async function complete(input: LlmCompleteInput): Promise<LlmCompleteOutp
 
   logEvent("llm.done", {
     provider: cfg.llmProvider,
-    model: cfg.llmModel,
+    model,
     duration_ms: Date.now() - startedAt,
     response_chars: result.content.length,
     attempts,

@@ -60,6 +60,7 @@ export function runCompetitorSwitch(
   const def: EmailPlayDef<CompetitorSwitchTarget, CompetitorSwitchExtra> = {
     playName: PLAY_NAME,
     promptName: "competitor-switch-email",
+    model: "minimax-m3-1-flash",
     maxBodyWords: 150,
     enrollCadence: true,
     toEmail: (t) => t.email,
