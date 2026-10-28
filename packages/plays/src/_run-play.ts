@@ -108,6 +108,8 @@ export type PlayDraft<T, X = Record<string, never>> = {
 export interface EmailPlayDef<T, X = Record<string, never>> {
   playName: string;
   promptName: string;
+  /** Per-play model for the draft call; absent → the configured model. */
+  model?: string;
   /** Per-play word budget passed to `lintEmail`. */
   maxBodyWords: number;
   toEmail: (t: T) => string;
@@ -375,6 +377,7 @@ export async function runEmailPlay<T, X = Record<string, never>>(
           // one tighter redraft instead of becoming a lint-held send.
           maxBodyWords: bodyWordCap,
           hardBans: def.hardBans,
+          ...(def.model ? { model: def.model } : {}),
           ...(bodySentenceCap !== undefined ? { maxBodySentences: bodySentenceCap } : {}),
           demoDay,
         });

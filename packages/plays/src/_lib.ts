@@ -921,6 +921,8 @@ interface DraftCallOpts {
   promptName: string;
   temperature?: number;
   maxTokens?: number;
+  /** Per-call model override; absent → the configured model. */
+  model?: string;
 }
 
 /**
@@ -934,6 +936,7 @@ export async function draftEmailFromPrompt(opts: {
   inputBlock: string;
   temperature?: number;
   maxTokens?: number;
+  model?: string;
   /**
    * The play's body cap (what `lintEmail` will hold the draft at). When set,
    * a draft that comes back over it earns ONE redraft with a tighter budget
@@ -1126,6 +1129,7 @@ async function draftOnce(messages: DraftMessages, opts: DraftCallOpts): Promise<
       messages,
       temperature: opts.temperature ?? 0.65,
       maxTokens: opts.maxTokens ?? 500,
+      ...(opts.model ? { model: opts.model } : {}),
     });
     const draft = parseSubjectBody(res.content);
     if (draft) {
